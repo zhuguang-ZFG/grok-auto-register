@@ -18,6 +18,13 @@ screenshots/
 config.json
 config.local.json
 
+# grok2api token pool (contains sso credentials)
+token.json
+
+# quota watch runtime state
+.quota_watch_state.json
+.quota_watch_state.json.tmp
+
 *.log
 .DS_Store
 .idea/
@@ -25,3 +32,12 @@ config.local.json
 DrissionPage/
 autoPortData/
 .browser_profiles/
+
+# local deploy artifacts
+.arts/
+
+# MCP / browser test artifacts
+.playwright-mcp/
+
+logs/
+

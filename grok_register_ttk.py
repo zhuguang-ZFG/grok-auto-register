@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -83,6 +83,14 @@ DEFAULT_CONFIG = {
     "browser_use_custom_ua": False,
     "log_level": "info",
     "speed_log_interval_sec": 60,
+    "auto_pipeline": True,
+    "auto_loop": False,
+    "auto_loop_count": 1,
+    "auto_loop_pause_sec": 45,
+    "auto_loop_max_rounds": 0,
+    "local_grok_auth_auto": False,
+    "local_grok_auth_path": "",
+    "preferred_model": "grok-4.5",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -360,15 +368,41 @@ def cloudflare_apply_auth_params(params=None):
 
 
 def cloudflare_next_default_domain():
-    """按配置轮换选择 Cloudflare 临时邮箱域名。"""
+    """选择 Cloudflare 临时邮箱域名。
+
+    优先按池中各域名已有账号数做负载均衡（选最少的），避免单域名堆积触发风控。
+    池数据不可用时回退到轮询。
+    """
     global _cf_domain_index
     domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
     if not domains:
         return ""
-    with _cf_domain_lock:
-        domain = domains[_cf_domain_index % len(domains)]
-        _cf_domain_index += 1
-        return domain
+    if len(domains) == 1:
+        return domains[0]
+
+    # Count existing CPA files per domain (anti-accumulation)
+    try:
+        from pathlib import Path
+        counts: dict[str, int] = {d: 0 for d in domains}
+        cpa_dir = Path(str(config.get("cpa_auth_dir") or "cpa_auths"))
+        if cpa_dir.is_dir():
+            for p in cpa_dir.glob("xai-*.json"):
+                name = p.stem.replace("xai-", "")
+                if "@" in name:
+                    dom = name.split("@", 1)[1]
+                    if dom in counts:
+                        counts[dom] += 1
+        # Pick the domain with the fewest accounts (ties broken randomly)
+        min_count = min(counts.values())
+        candidates = [d for d, c in counts.items() if c == min_count]
+        import random as _rnd
+        return _rnd.choice(candidates)
+    except Exception:
+        # Fallback: round-robin
+        with _cf_domain_lock:
+            domain = domains[_cf_domain_index % len(domains)]
+            _cf_domain_index += 1
+            return domain
 
 
 def cloudflare_is_admin_create_path(path):
@@ -685,6 +719,40 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
         if log_callback:
             log_callback(f"[cpa] CPA xAI 导出失败: {exc}")
         return {"ok": False, "error": str(exc)}
+
+
+def write_local_grok_from_cpa(cpa_result, log_callback=None):
+    """Write CPA OIDC tokens into ~/.grok/auth.json for local grok CLI."""
+    if not config.get("local_grok_auth_auto", False):
+        return {"ok": False, "skipped": True, "reason": "disabled"}
+    try:
+        from local_grok_auth import write_from_config_and_cpa_result
+        return write_from_config_and_cpa_result(
+            config,
+            cpa_result if cpa_result else {},
+            log=log_callback,
+        )
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 本机 Grok auth 写入失败: {exc}")
+        return {"ok": False, "error": str(exc)}
+
+
+def run_post_register_pipeline(sso, email, log_callback=None, cpa_result=None):
+    """Full auto path after one successful registration.
+
+    1) tokens.txt
+    2) grok2api local/remote pools
+    3) local grok auth.json (when CPA result available)
+    """
+    results = {}
+    results["token_file"] = add_token_to_token_only_file(sso, log_callback=log_callback)
+    add_token_to_grok2api_pools(sso, email=email, log_callback=log_callback)
+    if cpa_result is not None:
+        results["local_grok"] = write_local_grok_from_cpa(
+            cpa_result, log_callback=log_callback
+        )
+    return results
 
 
 def create_browser_options():
@@ -3578,6 +3646,7 @@ class GrokRegisterGUI:
             log_callback=log_fn, cancel_callback=self.should_stop
         )
         _cpa_page = _get_page()
+        cpa_result = None
         if config.get("cpa_export_enabled", True):
             cpa_async = bool(config.get("cpa_mint_async", True))
             if cpa_async:
@@ -3592,6 +3661,7 @@ class GrokRegisterGUI:
                         )
                         if r.get("ok"):
                             log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
+                            write_local_grok_from_cpa(r, log_callback=log_fn)
                         elif not r.get("skipped"):
                             log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
                     except Exception as e:
@@ -3625,8 +3695,9 @@ class GrokRegisterGUI:
                     f.write(line)
         except Exception as file_exc:
             log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
-        add_token_to_grok2api_pools(sso, email=email, log_callback=log_fn)
-        add_token_to_token_only_file(sso, log_callback=log_fn)
+        run_post_register_pipeline(
+            sso, email, log_callback=log_fn, cpa_result=cpa_result
+        )
         with _stats_lock:
             self.success_count += 1
         log_fn(f"[+] 注册成功: {email}")
@@ -3805,6 +3876,7 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
         log_callback=log_fn, cancel_callback=stop_fn
     )
     _cpa_page = _get_page()
+    cpa_result = None
     if config.get("cpa_export_enabled", True):
         cpa_async = bool(config.get("cpa_mint_async", True))
         if cpa_async:
@@ -3819,6 +3891,7 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
                     )
                     if r.get("ok"):
                         log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
+                        write_local_grok_from_cpa(r, log_callback=log_fn)
                     elif not r.get("skipped"):
                         log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
                 except Exception as e:
@@ -3850,8 +3923,9 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
                 f.write(line)
     except Exception as file_exc:
         log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
-    add_token_to_grok2api_pools(sso, email=email, log_callback=log_fn)
-    add_token_to_token_only_file(sso, log_callback=log_fn)
+    run_post_register_pipeline(
+        sso, email, log_callback=log_fn, cpa_result=cpa_result
+    )
     log_fn(f"[+] 注册成功: {email}")
 
 
@@ -4067,25 +4141,99 @@ def run_registration_cli(count):
         cli_log(f"[*] 任务结束。成功 {ok} | 失败 {bad}")
 
 
+def run_registration_cli_loop(count_per_round):
+    """Continuous registration until Ctrl+C or max rounds."""
+    pause_base = float(config.get("auto_loop_pause_sec", 30) or 30)
+    max_rounds = int(config.get("auto_loop_max_rounds", 0) or 0)
+    # Anti-detection: randomize interval so registration doesn't look mechanical.
+    # Default: base ±50% (e.g. 60s base -> 30-90s, configurable via auto_loop_jitter).
+    jitter = float(config.get("auto_loop_jitter", 0.5) or 0.5)
+    round_i = 0
+    controller = CliStopController()
+    prev_handler = _install_cli_sigint_handler(controller)
+    try:
+        while not controller.should_stop():
+            round_i += 1
+            if max_rounds > 0 and round_i > max_rounds:
+                cli_log(f"[*] 已达 max_rounds={max_rounds}，结束自动循环")
+                break
+            cli_log(
+                f"[*] ===== 自动循环第 {round_i} 轮 | 本轮目标 {count_per_round} ====="
+            )
+            run_registration_cli(count_per_round)
+            if controller.should_stop():
+                break
+            import random as _rnd
+            pause = pause_base * (1.0 + _rnd.uniform(-jitter, jitter))
+            pause = max(10.0, pause)
+            cli_log(
+                f"[*] 本轮结束，{pause:.0f}s 后开始下一轮（Ctrl+C 停止）"
+            )
+            sleep_with_cancel(pause, controller.should_stop)
+    finally:
+        _restore_sigint_handler(prev_handler)
+
+
 def main_cli():
     load_config()
     count = int(config.get("register_count", 1) or 1)
+    auto_start = False
+    force_loop = False
+    force_once = False
+    if len(sys.argv) > 1:
+        args = [a.strip().lower() for a in sys.argv[1:]]
+        if "auto" in args or "--auto" in args or "loop" in args:
+            auto_start = True
+            force_loop = True
+            config["auto_loop"] = True
+        if "start" in args or "--start" in args:
+            auto_start = True
+            # `start` is always one-shot even if config.auto_loop is true
+            if not force_loop:
+                force_once = True
+                config["auto_loop"] = False
     cli_log("[*] CLI 已加载配置")
-    cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
-    cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
-    try:
-        command = input("> ").strip().lower()
-    except KeyboardInterrupt:
-        cli_log("[!] 已取消")
-        return
-    if command != "start":
-        cli_log("[!] 未输入 start，已退出")
-        return
-    run_registration_cli(count)
+    cli_log(
+        f"[*] 邮箱: {config.get('email_provider', 'duckmail')} | 单轮数量: {count} "
+        f"| auto_loop={bool(config.get('auto_loop'))} | remote_pool={bool(config.get('grok2api_auto_add_remote'))}"
+    )
+    if not auto_start:
+        cli_log("[*] 输入 start 开始；auto 开启持续循环；Ctrl+C 停止")
+        try:
+            command = input("> ").strip().lower()
+        except KeyboardInterrupt:
+            cli_log("[!] 已取消")
+            return
+        if command in ("auto", "loop"):
+            config["auto_loop"] = True
+            force_loop = True
+            auto_start = True
+        elif command == "start":
+            config["auto_loop"] = False
+            force_once = True
+            auto_start = True
+        else:
+            cli_log("[!] 未输入 start/auto，已退出")
+            return
+    # Prefer explicit CLI intent over stale config.auto_loop
+    use_loop = bool(config.get("auto_loop")) and not force_once
+    if force_loop:
+        use_loop = True
+    if use_loop:
+        run_registration_cli_loop(count)
+    else:
+        run_registration_cli(count)
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
+    if len(sys.argv) > 1 and sys.argv[1].strip().lower() in (
+        "start",
+        "cli",
+        "--cli",
+        "auto",
+        "--auto",
+        "loop",
+    ):
         main_cli()
         return
     root = tk.Tk()

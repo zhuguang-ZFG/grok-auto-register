@@ -132,6 +132,8 @@ cp config.example.json config.json
 
 这是项目的默认路线。没有特殊需求时，保持下面配置即可：
 
+> 从零部署一套「免费域名 + Cloudflare 临时邮箱」收信基础设施的完整步骤（含 DNSHE ccwu.cc 域名、worker 部署、Email Routing）见 [DEPLOY.md](DEPLOY.md)。
+
 ```json
 {
   "email_provider": "cloudflare",
@@ -299,6 +301,7 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
 ├── config.example.json    # 配置示例
 ├── requirements.txt       # Python 依赖
+├── DEPLOY.md              # 域名邮箱（ccwu.cc + Cloudflare）部署与交接文档
 └── README.md
 ```
 

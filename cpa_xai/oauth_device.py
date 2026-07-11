@@ -297,3 +297,77 @@ def poll_device_token(
         log(f"oauth poll unexpected HTTP {status}: {body!r}")
         time.sleep(sleep_for)
     raise OAuthDeviceError("device auth timed out waiting for user approval")
+
+
+def refresh_access_token(
+    refresh_token: str,
+    *,
+    client_id: str = CLIENT_ID,
+    timeout: float = 30.0,
+    proxy: str | None = None,
+    retries: int = 2,
+    retry_sleep: float = 1.5,
+) -> TokenResult:
+    """用 grant_type=refresh_token 向 TOKEN_URL 换新 token。
+
+    返回新的 TokenResult（含新的 access_token / refresh_token / expires_in）。
+    refresh_token 无效/过期（HTTP 400/401 且 invalid_grant）时抛
+    OAuthDeviceError("refresh token invalid/expired")，由调用方决定是否换号。
+    瞬时网络错误按 retries 重试。
+    """
+    refresh_token = (refresh_token or "").strip()
+    if not refresh_token:
+        raise OAuthDeviceError("refresh_access_token: empty refresh_token")
+
+    last: BaseException | None = None
+    for i in range(max(int(retries), 0) + 1):
+        try:
+            status, body = _post_form(
+                TOKEN_URL,
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": client_id,
+                },
+                timeout=timeout,
+                proxy=proxy,
+                retries=0,
+            )
+        except BaseException as e:  # noqa: BLE001
+            last = e
+            if not _is_transient_net_error(e) or i >= retries:
+                raise
+            time.sleep(retry_sleep * (i + 1))
+            continue
+
+        if status == 200 and isinstance(body, dict) and body.get("access_token"):
+            access = str(body["access_token"]).strip()
+            new_refresh = str(body.get("refresh_token") or refresh_token).strip()
+            return TokenResult(
+                access_token=access,
+                refresh_token=new_refresh,
+                id_token=(str(body["id_token"]).strip() if body.get("id_token") else None),
+                token_type=str(body.get("token_type") or "Bearer"),
+                expires_in=int(body.get("expires_in") or 21600),
+                raw=body,
+            )
+
+        err = ""
+        desc = ""
+        if isinstance(body, dict):
+            err = str(body.get("error") or "")
+            desc = str(body.get("error_description") or "")
+        # invalid_grant = refresh token expired/revoked — definitive, do not retry
+        if err == "invalid_grant" or (status in (400, 401) and err):
+            raise OAuthDeviceError(
+                f"refresh token invalid/expired: {err}: {desc or body}"
+            )
+        # transient 5xx / soft errors — retry if budget remains
+        if i < retries and (status >= 500 or not isinstance(body, dict)):
+            time.sleep(retry_sleep * (i + 1))
+            continue
+        raise OAuthDeviceError(
+            f"refresh token HTTP {status}: {err}: {desc or body!r}"
+        )
+    assert last is not None
+    raise last
