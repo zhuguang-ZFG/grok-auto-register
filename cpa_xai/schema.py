@@ -24,6 +24,10 @@ DEFAULT_CLIENT_HEADERS: dict[str, str] = {
 }
 
 
+OIDC_ISSUER = "https://auth.x.ai"
+OIDC_CLIENT_ID = CLIENT_ID  # must match the OAuth client_id used in token requests
+
+
 def _build_cpa_native_payload(
     *,
     email: str,
@@ -53,6 +57,8 @@ def _build_cpa_native_payload(
         "redirect_uri": redirect_uri,
         "token_endpoint": token_endpoint,
         "auth_kind": "oauth",
+        "oidc_issuer": OIDC_ISSUER,
+        "oidc_client_id": OIDC_CLIENT_ID,
     }
     if id_token:
         payload["id_token"] = id_token

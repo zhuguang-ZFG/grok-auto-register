@@ -44,4 +44,12 @@ autoPortData/
 .playwright-mcp/
 
 logs/
-
+# pool runtime / dead accounts
+cpa_auths_dead/
+.domain_rr_index
+pool_index.json
+*.bak-sync*
+grok_register_ttk.py.bak*
+config.json.bak*
+# local community dump (not for publish)
+_community_ref/

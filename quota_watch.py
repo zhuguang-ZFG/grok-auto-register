@@ -42,18 +42,17 @@ DEFAULT_QUOTA_PATTERNS = [
     r"you've reached",
     r"you have reached",
     r"monthly limit",
-    r"free tier",
+    r"free.?tier.*(limit|exhaust|reach)",
     r"insufficient.?quota",
+    r"free-usage-exhausted",
+    r"usage-exhausted",
     r"auth 401 attribution",
     r"sampler 401",
-    r"unauthorized",
-    r"token.?expired",
-    r"invalid.?token",
-    r"refresh.?failed",
     r"agent response failed",
 ]
 
-# Drop lines that look like third-party NewAPI / community mid-layer noise.
+# Drop lines that look like third-party NewAPI / community mid-layer noise,
+# or self-inflicted auth errors (CLI refresh failures caused by our own writes).
 DEFAULT_EXCLUDE_PATTERNS = [
     r"new_api_error",
     r"system cpu ove",
@@ -64,20 +63,30 @@ DEFAULT_EXCLUDE_PATTERNS = [
     r"gptper",
     r"20\.196\.139\.201",
     r"cpu overload",
+    # CLI self-refresh failures — these are auth-config issues, not quota exhaustion.
+    # Rotating on these creates a feedback loop (wrong OIDC → refresh fail → rotate → repeat).
+    r"oidc.{0,20}refresh.{0,20}(fail|skip|error)",
+    r"try_refresh.{0,10}(skipped|missing)",
+    r"refresh.{0,10}(token|grant).{0,10}(invalid|expired|revoked)",
+    r"\"issuer\":\s*null",
+    r"\"client_id\":\s*null",
+    r"missing.{0,10}(issuer|client_id|oidc)",
+    r"ignoring legacy WebLogin",
 ]
 
 DEFAULT_CFG: dict[str, Any] = {
     "quota_watch_enabled": True,
-    "quota_watch_poll_sec": 20,
+    "quota_watch_poll_sec": 5,
     "quota_watch_cooldown_sec": 1800,
-    "quota_watch_rotate_cooldown_sec": 30,
-    "quota_watch_max_triggers_per_day": 20,
+    "quota_watch_rotate_cooldown_sec": 5,
+    "quota_watch_post_rotate_grace_sec": 30,
+    "quota_watch_max_triggers_per_day": 50,
     "quota_watch_log_path": "",
     "quota_watch_state_path": "",
     "quota_watch_patterns": DEFAULT_QUOTA_PATTERNS,
     "quota_watch_exclude_patterns": DEFAULT_EXCLUDE_PATTERNS,
-    "quota_watch_min_hits": 2,
-    "quota_watch_hit_window_sec": 120,
+    "quota_watch_min_hits": 1,
+    "quota_watch_hit_window_sec": 60,
     "quota_watch_probe_enabled": True,
     "quota_watch_probe_interval_sec": 300,
     "quota_watch_probe_on_start": True,
@@ -106,7 +115,8 @@ def _log(log: LogFn | None, msg: str) -> None:
     if log:
         log(msg)
     else:
-        print(msg, flush=True)
+        enc = sys.stdout.encoding or "utf-8"
+        print(msg.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
 
 
 def _now_iso() -> str:
@@ -390,6 +400,7 @@ def pool_token_is_expired(payload: dict[str, Any]) -> bool:
     """读 CPA 文件 access_token 的 JWT exp，过期返回 True。
 
     无 token / 解析失败返回 False（交给 probe 判断，不误杀）。
+    Inline JWT parsing — no cpa_xai dependency (avoids _socket issue).
     """
     if not isinstance(payload, dict):
         return False
@@ -397,8 +408,13 @@ def pool_token_is_expired(payload: dict[str, Any]) -> bool:
     if not token:
         return False
     try:
-        from cpa_xai.schema import jwt_payload
-        claims = jwt_payload(token)
+        import base64 as _b64
+        parts = token.split(".")
+        if len(parts) < 2:
+            return False
+        seg = parts[1]
+        seg += "=" * (-len(seg) % 4)
+        claims = json.loads(_b64.urlsafe_b64decode(seg))
         exp = int(claims.get("exp") or 0)
         if exp <= 0:
             return False
@@ -443,24 +459,133 @@ def list_cpa_pool(cfg: dict[str, Any], *, drop_expired: bool = False) -> list[Pa
     return out
 
 
+def purge_dead_pool(
+    cfg: dict[str, Any],
+    *,
+    log: LogFn | None = None,
+    max_per_run: int = 20,
+) -> dict[str, Any]:
+    """扫描过期凭证，尝试 refresh；失败的移入 cpa_auths_dead/。
+
+    每次最多处理 max_per_run 个，避免阻塞主循环太久。
+    返回 {refreshed: int, purged: int, errors: int}。
+    """
+    pool = list_cpa_pool(cfg)
+    pool_dir = resolve_path(cfg.get("cpa_auth_dir"), ROOT / "cpa_auths")
+    dead_dir = pool_dir.parent / "cpa_auths_dead"
+    stats = {"refreshed": 0, "purged": 0, "errors": 0, "scanned": 0}
+
+    _use_subprocess = False
+    try:
+        from cpa_xai.oauth_device import refresh_access_token, OAuthDeviceError
+    except Exception:
+        try:
+            import importlib.util
+            _od_path = str(ROOT / "cpa_xai" / "oauth_device.py")
+            _spec = importlib.util.spec_from_file_location("cpa_xai.oauth_device", _od_path)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            refresh_access_token = _mod.refresh_access_token
+            OAuthDeviceError = _mod.OAuthDeviceError
+        except Exception as exc2:
+            _log(log, f"[pool-purge] in-process import failed ({exc2}), using subprocess fallback")
+            _use_subprocess = True
+            OAuthDeviceError = Exception  # type: ignore[misc,assignment]
+
+            def refresh_access_token(rt: str, *, proxy: str | None = None, **_kw: Any) -> Any:  # type: ignore[misc]
+                """Subprocess fallback: call _refresh_token.py in a clean Python."""
+                import subprocess as _sp
+                python = str(cfg.get("quota_watch_python") or sys.executable)
+                script = str(ROOT / "_refresh_token.py")
+                cmd = [python, script, rt]
+                if proxy:
+                    cmd.append(proxy)
+                try:
+                    proc = _sp.run(cmd, capture_output=True, text=True, timeout=30)
+                    data = json.loads(proc.stdout.strip()) if proc.stdout.strip() else {}
+                except Exception as e:
+                    raise Exception(f"subprocess refresh failed: {e}") from e
+                if not data.get("ok"):
+                    err_msg = data.get("error", "unknown")
+                    if data.get("dead"):
+                        raise OAuthDeviceError(err_msg)
+                    raise Exception(f"refresh error: {err_msg}")
+                from types import SimpleNamespace
+                return SimpleNamespace(
+                    access_token=data["access_token"],
+                    refresh_token=data["refresh_token"],
+                    expires_in=data.get("expires_in", 21600),
+                )
+
+    proxy = str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip() or None
+    processed = 0
+
+    for p in pool:
+        if processed >= max_per_run:
+            break
+        payload = load_json(p)
+        if not pool_token_is_expired(payload):
+            continue
+        processed += 1
+        stats["scanned"] += 1
+
+        rt = str(payload.get("refresh_token") or "").strip()
+        if not rt:
+            dead_dir.mkdir(parents=True, exist_ok=True)
+            dest = dead_dir / p.name
+            try:
+                p.rename(dest)
+                stats["purged"] += 1
+            except Exception:
+                stats["errors"] += 1
+            continue
+
+        try:
+            result = refresh_access_token(rt, proxy=proxy, timeout=15.0, retries=1)
+            payload["access_token"] = result.access_token
+            payload["refresh_token"] = result.refresh_token
+            payload["expires_in"] = result.expires_in
+            from cpa_xai.schema import expired_from_access_token
+            exp_s, _, _ = expired_from_access_token(result.access_token)
+            payload["expired"] = exp_s
+            from datetime import datetime, timezone
+            payload["last_refresh"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            stats["refreshed"] += 1
+        except OAuthDeviceError:
+            dead_dir.mkdir(parents=True, exist_ok=True)
+            dest = dead_dir / p.name
+            try:
+                p.rename(dest)
+                stats["purged"] += 1
+            except Exception:
+                stats["errors"] += 1
+        except Exception:
+            stats["errors"] += 1
+
+    if stats["scanned"] > 0:
+        _log(log, f"[pool-purge] scanned={stats['scanned']} refreshed={stats['refreshed']} purged={stats['purged']} errors={stats['errors']}")
+    return stats
+
+
 def try_rotate_from_pool(
     cfg: dict[str, Any],
     state: WatchState,
     *,
     log: LogFn | None = None,
 ) -> dict[str, Any]:
-    """Pick an unused CPA file, probe it, write auth.json if OK.
+    """Pick an unused CPA file and write auth.json immediately (write-first).
 
-    The used-blacklist is reset each call — we only skip the CURRENT exhausted
-    credential (the one in auth.json right now). Other pool files may have
-    recovered quota since last check, so we re-evaluate them every time.
+    Skips the synchronous probe to minimize rotation latency (<1s vs 30s).
+    Only local checks are applied: JWT expiry and quota recovery window.
+    If the written token turns out dead, the next poll cycle will detect
+    failure and rotate again — with 5s poll interval this is acceptable.
     """
     auth_path = resolve_path(cfg.get("local_grok_auth_path"), default_auth_path())
     current = current_auth_email(auth_path)
-    # Fresh blacklist: only exclude the currently-exhausted credential
     used: set[str] = set()
     if current:
-        # mark current email's file as used so we don't re-pick the same exhausted acct
         for p in list_cpa_pool(cfg):
             if current in p.name:
                 used.add(str(p.resolve()))
@@ -486,11 +611,9 @@ def try_rotate_from_pool(
         token = str(payload.get("access_token") or "").strip()
         if not token:
             continue
-        # 跳过 JWT 已过期的死号（不加入 used，让它们自然被新文件挤掉）
         if pool_token_is_expired(payload):
             _log(log, f"[quota] pool skip expired: {path.name}")
             continue
-        # 跳过 24h 额度尚未恢复的号（rolling window）
         try:
             from cpa_xai.usage import is_account_recovered, recover_in_sec
             if not is_account_recovered(path):
@@ -498,19 +621,8 @@ def try_rotate_from_pool(
                 _log(log, f"[quota] pool skip exhausted (recovers in {remain_h:.1f}h): {path.name}")
                 continue
         except Exception:
-            pass  # usage module not available, skip check
-        _log(log, f"[quota] pool candidate: {path.name} ({email or 'no-email'})")
-        probe = probe_token(cfg, token)
-        if not probe.get("ok"):
-            _log(
-                log,
-                f"[quota] pool probe fail {path.name}: status={probe.get('status')} err={str(probe.get('error') or '')[:160]}",
-            )
-            # still mark as tried so we don't spin on dead tokens forever this day
-            # (403 endpoint-denial is NOT counted — those tokens are still good)
-            if probe.get("quota_like") or int(probe.get("status") or 0) in (401, 429):
-                used.add(key)
-            continue
+            pass
+        _log(log, f"[quota] pool write-first: {path.name} ({email or 'no-email'})")
         result = write_from_cpa_file(path, auth_path=auth_path, log=log)
         if result.get("ok"):
             used.add(key)
@@ -518,7 +630,6 @@ def try_rotate_from_pool(
             state.last_email = email
             state.last_action = f"pool_rotate:{path.name}"
             state.last_error = ""
-            # Clear any stale exhausted mark — this account is healthy now
             try:
                 from cpa_xai.usage import clear_exhausted_mark
                 clear_exhausted_mark(path)
@@ -530,7 +641,6 @@ def try_rotate_from_pool(
                 "path": str(path),
                 "email": email,
                 "auth_path": str(auth_path),
-                "probe": probe,
             }
         return {"ok": False, "error": result.get("error") or "write failed", "path": str(path)}
 
@@ -648,18 +758,23 @@ def topup_pool(
     """
     min_pool = int(cfg.get("quota_watch_min_pool") or 3)
     target_pool = int(cfg.get("quota_watch_target_pool") or max(min_pool, 20))
-    # 用「有效数」(未过期) 而非文件总数判断水位
+    # 水位只看自有域名（defaultDomains），打野凭证不计入补池判断
     pool = list_cpa_pool(cfg)
-    valid_n = sum(1 for p in pool if not pool_token_is_expired(load_json(p)))
+    own_domains = [d.strip() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
+    if own_domains:
+        own_pool = [p for p in pool if any(d in p.name for d in own_domains)]
+    else:
+        own_pool = pool
+    valid_n = sum(1 for p in own_pool if not pool_token_is_expired(load_json(p)))
     if valid_n >= target_pool:
-        return {"ok": True, "skipped": True, "reason": f"pool_at_target(valid={valid_n}>={target_pool})"}
+        return {"ok": True, "skipped": True, "reason": f"pool_at_target(own_valid={valid_n}>={target_pool})"}
     if valid_n >= min_pool:
         # Above floor but below target — top up slowly toward target.
         # The cooldown (topup_cooldown_sec) gates how fast we approach target.
         _log(log, f"[quota] pool topping toward target: valid={valid_n} (min={min_pool}, target={target_pool})")
     elif pool:
-        expired_n = len(pool) - valid_n
-        _log(log, f"[quota] pool low: valid={valid_n}<{min_pool} (total={len(pool)}, expired={expired_n}) — topping up")
+        own_expired_n = len(own_pool) - valid_n
+        _log(log, f"[quota] pool low: own_valid={valid_n}<{min_pool} (own={len(own_pool)}, own_expired={own_expired_n}, total={len(pool)}) — topping up")
     else:
         _log(log, f"[quota] pool low: valid={valid_n}<{min_pool} (empty) — topping up")
 
@@ -674,7 +789,7 @@ def topup_pool(
         remain = int(cooldown - (now - state.last_pool_topup_at))
         return {"ok": False, "skipped": True, "reason": f"topup cooldown {remain}s"}
 
-    _log(log, f"[quota] pool low ({len(pool)}<{min_pool}) — topping up")
+    _log(log, f"[quota] spawning register: own_valid={valid_n}<{min_pool} (own={len(own_pool)}, total={len(pool)})")
 
     if dry_run:
         return {"ok": True, "dry_run": True, "reason": "pool_topup"}
@@ -710,8 +825,10 @@ def topup_pool(
 
     state.last_pool_topup_at = now
     if result.get("ok"):
-        after_valid = sum(1 for p in list_cpa_pool(cfg) if not pool_token_is_expired(load_json(p)))
-        _log(log, f"[quota] pool topped up: valid {valid_n} -> {after_valid} ({result.get('email')})")
+        after_valid = sum(1 for p in list_cpa_pool(cfg)
+                         if not pool_token_is_expired(load_json(p))
+                         and (not own_domains or any(d in p.name for d in own_domains)))
+        _log(log, f"[quota] pool topped up (own): valid {valid_n} -> {after_valid} ({result.get('email')})")
     else:
         _log(log, f"[quota] pool topup register failed: {result.get('error')}")
     state.save()
@@ -892,7 +1009,25 @@ def once(
                 break
         report["log_hits"] = len(hits)
         report["log_samples"] = hits[:5]
-        if len(hits) >= min_hits or force:
+
+        # CRITICAL: a single 429 free-usage-exhausted / rate_limited is 100%
+        # definitive — rotate IMMEDIATELY without waiting for min_hits.
+        _IMMEDIATE_TRIGGERS = ("free-usage-exhausted", "usage-exhausted", "rate_limited")
+        immediate = any(
+            any(t in h.lower() for t in _IMMEDIATE_TRIGGERS) for h in hits
+        )
+
+        # Post-rotation grace period: after switching credentials, CLI may still
+        # flush buffered log lines from the OLD credential. Only definitive 429
+        # triggers (free-usage-exhausted) should act during the grace window.
+        grace_sec = float(cfg.get("quota_watch_post_rotate_grace_sec") or 30)
+        in_grace = state.last_trigger_at and (time.time() - state.last_trigger_at) < grace_sec
+        if in_grace and not immediate:
+            _log(log, f"[quota] suppressed {len(hits)} hit(s) during post-rotation grace ({grace_sec:.0f}s)")
+            state.save()
+            return report
+
+        if immediate or len(hits) >= min_hits or force:
             # Mark the current credential as exhausted (24h rolling window)
             current = current_auth_email(auth_path)
             if current and not dry_run:
@@ -1017,10 +1152,20 @@ def once(
                     state.last_refresh_at = now
                     _log(log, f"[quota] proactive refresh error: {exc}")
 
+    # --- pool cleanup: refresh expired tokens or move dead ones out ---
+    if not dry_run:
+        purge_dead_pool(cfg, log=log, max_per_run=20)
+
     # --- pool water-level maintenance: top up cpa_auths/ without touching auth.json ---
     min_pool = int(cfg.get("quota_watch_min_pool") or 0)
     if min_pool > 0 and not dry_run:
-        pool_n = sum(1 for p in list_cpa_pool(cfg) if not pool_token_is_expired(load_json(p)))
+        _all_pool = list_cpa_pool(cfg)
+        _own_doms = [d.strip() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
+        if _own_doms:
+            _own_pool = [p for p in _all_pool if any(d in p.name for d in _own_doms)]
+        else:
+            _own_pool = _all_pool
+        pool_n = sum(1 for p in _own_pool if not pool_token_is_expired(load_json(p)))
         if pool_n < min_pool:
             topup = topup_pool(cfg, state, log=log)
             if topup.get("ok") and not topup.get("skipped"):

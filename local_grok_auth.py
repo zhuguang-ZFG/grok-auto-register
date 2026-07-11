@@ -25,6 +25,12 @@ LogFn = Callable[[str], None]
 AUTH_ENTRY_KEY = "https://accounts.x.ai/sign-in"
 # CLI 0.2.x rejects WebLogin as legacy; CPA device/OIDC tokens use oidc.
 DEFAULT_AUTH_MODE = "oidc"
+# xAI OIDC endpoints — the grok CLI needs these in the auth entry to self-refresh.
+# Without issuer + client_id, the CLI logs "oidc try_refresh skipped: missing fields".
+# MUST be auth.x.ai (the OIDC provider), NOT accounts.x.ai (the login UI).
+# client_id MUST match the OAuth client_id used in device-code grant requests.
+OIDC_ISSUER = "https://auth.x.ai"
+OIDC_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 
 
 def default_auth_path() -> Path:
@@ -184,6 +190,9 @@ def build_auth_entry(
         "expires": expires,
         "expires_at": expires,
         "expired": expires,
+        # OIDC fields required by grok CLI for self-refresh
+        "issuer": OIDC_ISSUER,
+        "client_id": OIDC_CLIENT_ID,
     }
     if refresh:
         entry["refresh"] = refresh

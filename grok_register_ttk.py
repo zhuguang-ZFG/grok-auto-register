@@ -58,6 +58,7 @@ DEFAULT_CONFIG = {
     "clash_rotate_per_account": True,
     "clash_api": "http://127.0.0.1:9097",
     "clash_secret": "set-your-secret",
+    "capsolver_api_key": "",
     "grok2api_auto_add_local": True,
     "grok2api_local_token_file": "",
     "grok2api_pool_name": "ssoBasic",
@@ -107,6 +108,30 @@ _thread_fp = [None]  # type: ignore[var-annotated]
 tz_env = [None]  # type: ignore[var-annotated]
 _cf_domain_index = 0
 _cf_domain_lock = threading.Lock()
+_cf_email_api_base = {}  # email -> api_base used at create time
+_CF_DOMAIN_INDEX_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".domain_rr_index"
+)
+
+
+def _load_domain_rr_index():
+    global _cf_domain_index
+    try:
+        with open(_CF_DOMAIN_INDEX_FILE, "r", encoding="utf-8") as f:
+            _cf_domain_index = max(int((f.read() or "0").strip() or "0"), 0)
+    except Exception:
+        _cf_domain_index = 0
+
+
+def _save_domain_rr_index():
+    try:
+        with open(_CF_DOMAIN_INDEX_FILE, "w", encoding="utf-8") as f:
+            f.write(str(int(_cf_domain_index)))
+    except Exception:
+        pass
+
+
+_load_domain_rr_index()
 _io_lock = threading.Lock()
 _stats_lock = threading.Lock()
 _cpa_threads_lock = threading.Lock()
@@ -378,14 +403,138 @@ def cloudflare_apply_auth_params(params=None):
     return merged
 
 
+def _parse_domain_list(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(x).strip() for x in raw]
+    else:
+        text = str(raw or "").replace(";", ",").replace("\n", ",")
+        items = [x.strip() for x in text.replace(" ", ",").split(",")]
+    out, seen = [], set()
+    for item in items:
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def get_mail_backends():
+    """多邮件后端（四域名负载均衡）。未配置 mail_backends 时回退单后端。"""
+    raw = config.get("mail_backends")
+    backends = []
+    if isinstance(raw, list) and raw:
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            base = str(item.get("api_base") or "").strip().rstrip("/")
+            if not base:
+                continue
+            backends.append(
+                {
+                    "api_base": base,
+                    "domains": _parse_domain_list(item.get("domains") or []),
+                    "path_accounts": str(
+                        item.get("path_accounts")
+                        or item.get("cloudflare_path_accounts")
+                        or "/api/new_address"
+                    ).strip(),
+                    "path_messages": str(
+                        item.get("path_messages")
+                        or item.get("cloudflare_path_messages")
+                        or "/api/mails"
+                    ).strip(),
+                    "auth_mode": str(
+                        item.get("auth_mode") or item.get("cloudflare_auth_mode") or "none"
+                    ),
+                    "api_key": str(
+                        item.get("api_key") or item.get("cloudflare_api_key") or ""
+                    ),
+                }
+            )
+    if not backends:
+        base = get_cloudflare_api_base()
+        if base:
+            backends.append(
+                {
+                    "api_base": base,
+                    "domains": _parse_domain_list(config.get("defaultDomains", "")),
+                    "path_accounts": get_cloudflare_path(
+                        "cloudflare_path_accounts", "/api/new_address"
+                    ),
+                    "path_messages": get_cloudflare_path(
+                        "cloudflare_path_messages", "/api/mails"
+                    ),
+                    "auth_mode": get_cloudflare_auth_mode(),
+                    "api_key": get_cloudflare_api_key(),
+                }
+            )
+    return backends
+
+
+def _rebuild_domain_backend_map():
+    m = {}
+    ordered = []
+    seen = set()
+    for be in get_mail_backends():
+        for d in be.get("domains") or []:
+            key = d.lower()
+            if key not in m:
+                m[key] = be
+            if key not in seen:
+                seen.add(key)
+                ordered.append(d)
+    for d in _parse_domain_list(config.get("defaultDomains", "")):
+        key = d.lower()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(d)
+            if key not in m and get_mail_backends():
+                m[key] = get_mail_backends()[0]
+    config["_cf_domain_backend_map"] = m
+    config["_cf_domains_cache"] = ordered
+    return ordered, m
+
+
+def resolve_backend_for_domain(domain: str):
+    domain = (domain or "").strip().lower()
+    m = config.get("_cf_domain_backend_map") or {}
+    if not m:
+        _, m = _rebuild_domain_backend_map()
+    if domain in m:
+        return m[domain]
+    _, m = _rebuild_domain_backend_map()
+    if domain in m:
+        return m[domain]
+    backends = get_mail_backends()
+    return backends[0] if backends else None
+
+
+def resolve_api_base_for_email(email: str) -> str:
+    email = (email or "").strip().lower()
+    if email in _cf_email_api_base:
+        return _cf_email_api_base[email]
+    if "@" in email:
+        be = resolve_backend_for_domain(email.split("@", 1)[1])
+        if be:
+            return be["api_base"]
+    return get_cloudflare_api_base()
+
+
 def cloudflare_next_default_domain():
     """选择 Cloudflare 临时邮箱域名。
 
     优先按池中各域名已有账号数做负载均衡（选最少的），避免单域名堆积触发风控。
-    池数据不可用时回退到轮询。
+    池数据不可用时回退到轮询。支持 mail_backends 多后端域名列表。
     """
     global _cf_domain_index
-    domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
+    domains, _ = _rebuild_domain_backend_map()
+    if not domains:
+        domains = _parse_domain_list(config.get("defaultDomains", ""))
     if not domains:
         return ""
     if len(domains) == 1:
@@ -396,6 +545,8 @@ def cloudflare_next_default_domain():
         from pathlib import Path
         counts: dict[str, int] = {d: 0 for d in domains}
         cpa_dir = Path(str(config.get("cpa_auth_dir") or "cpa_auths"))
+        if not cpa_dir.is_absolute():
+            cpa_dir = Path(os.path.dirname(os.path.abspath(__file__))) / cpa_dir
         if cpa_dir.is_dir():
             for p in cpa_dir.glob("xai-*.json"):
                 name = p.stem.replace("xai-", "")
@@ -403,22 +554,22 @@ def cloudflare_next_default_domain():
                     dom = name.split("@", 1)[1]
                     if dom in counts:
                         counts[dom] += 1
-        # Pick the domain with the fewest accounts (ties broken randomly)
         min_count = min(counts.values())
         candidates = [d for d, c in counts.items() if c == min_count]
         import random as _rnd
         return _rnd.choice(candidates)
     except Exception:
-        # Fallback: round-robin
         with _cf_domain_lock:
             domain = domains[_cf_domain_index % len(domains)]
             _cf_domain_index += 1
+            _save_domain_rr_index()
             return domain
 
 
 def cloudflare_is_admin_create_path(path):
     """判断当前创建邮箱路径是否为 cloudflare_temp_email 管理员创建接口。"""
-    return str(path or "").rstrip("/").lower() == "/admin/new_address"
+    p = str(path or "").rstrip("/").lower()
+    return p.endswith("/admin/new_address") or p == "/admin/new_address"
 
 
 def _pick_list_payload(data):
@@ -440,33 +591,110 @@ def _pick_list_payload(data):
     return []
 
 
-def cloudflare_create_temp_address(api_base):
-    """适配 cloudflare_temp_email 新建地址接口并兼容 admin 创建模式。"""
-    path = get_cloudflare_path("cloudflare_path_accounts", "/api/new_address")
-    url = f"{api_base}{path}"
-    domain = cloudflare_next_default_domain()
-    is_admin_create = cloudflare_is_admin_create_path(path)
-    if is_admin_create:
+def _backend_headers(backend: dict, content_type: bool = True) -> dict:
+    headers = {"Content-Type": "application/json"} if content_type else {}
+    key = str(backend.get("api_key") or "").strip()
+    mode = str(backend.get("auth_mode") or "none").lower()
+    if key:
+        if mode == "x-api-key":
+            headers["X-API-Key"] = key
+        elif mode == "x-admin-auth":
+            headers["x-admin-auth"] = key
+        elif mode != "none":
+            headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def _create_address_on_backend(backend: dict, domain: str):
+    path = str(backend.get("path_accounts") or "/api/new_address").strip()
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{backend['api_base']}{path}"
+    is_admin = cloudflare_is_admin_create_path(path)
+    headers = _backend_headers(backend, content_type=True)
+    if str(backend.get("auth_mode") or "none").lower() == "none":
+        headers = {"Content-Type": "application/json"}
+    if is_admin:
         payload = {"name": generate_username(10), "enablePrefix": True}
         if domain:
             payload["domain"] = domain
-        headers = cloudflare_build_headers(content_type=True)
     else:
-        payload = {}
+        payload = {"name": generate_username(10), "enablePrefix": True}
         if domain:
             payload["domain"] = domain
-        headers = {"Content-Type": "application/json"}
     resp = http_post(url, json=payload, headers=headers)
-    resp.raise_for_status()
+    status = int(getattr(resp, "status_code", 0) or 0)
+    body = ""
+    try:
+        body = resp.text[:300]
+    except Exception:
+        body = ""
+    if status >= 400:
+        if "Invalid domain" in body or "invalid domain" in body.lower():
+            raise ValueError(f"Invalid domain: {domain}")
+        resp.raise_for_status()
     try:
         data = resp.json()
     except Exception:
-        raise Exception(f"Cloudflare {path} 返回非JSON: {resp.text[:300]}")
+        raise Exception(f"Cloudflare {path} 返回非JSON: {body}")
     address = data.get("address")
     jwt = data.get("jwt")
     if not address or not jwt:
         raise Exception(f"Cloudflare {path} 缺少 address/jwt: {data}")
     return address, jwt
+
+
+def cloudflare_create_temp_address(api_base=None):
+    """多后端 + 多域名负载均衡创建临时邮箱。
+
+    1) 按池内最少域名选 domain（防堆积）
+    2) 路由到该域名所属 mail_backend 创建
+    3) 记录 email->api_base，收信走同一后端
+    失败时轮询其它域名/后端。
+    """
+    global _cf_domain_index
+    domains, _ = _rebuild_domain_backend_map()
+    if not domains:
+        # 兼容旧调用：单 api_base
+        base = (api_base or get_cloudflare_api_base() or "").rstrip("/")
+        if not base:
+            raise Exception("无可用邮箱后端/域名")
+        domains = _parse_domain_list(config.get("defaultDomains", "")) or [""]
+
+    # 首选最少域名，再准备 fallback 顺序
+    preferred = cloudflare_next_default_domain() or domains[0]
+    ordered = [preferred] + [d for d in domains if d != preferred]
+
+    last_err = None
+    for domain in ordered:
+        backend = resolve_backend_for_domain(domain)
+        if not backend:
+            if api_base:
+                backend = {
+                    "api_base": str(api_base).rstrip("/"),
+                    "path_accounts": get_cloudflare_path(
+                        "cloudflare_path_accounts", "/api/new_address"
+                    ),
+                    "auth_mode": get_cloudflare_auth_mode(),
+                    "api_key": get_cloudflare_api_key(),
+                }
+            else:
+                last_err = f"{domain}: no backend"
+                continue
+        try:
+            address, jwt = _create_address_on_backend(backend, domain)
+            with _cf_domain_lock:
+                _cf_domain_index += 1
+                _save_domain_rr_index()
+            _cf_email_api_base[str(address).lower()] = backend["api_base"]
+            return address, jwt
+        except ValueError as exc:
+            last_err = str(exc)
+            continue
+        except Exception as exc:
+            last_err = f"{domain}@{backend.get('api_base')}: {exc}"
+            continue
+    raise Exception(f"创建邮箱失败（多域名负载均衡）: {last_err}")
 
 
 def get_user_agent():
@@ -791,6 +1019,7 @@ def create_browser_options():
     for flag in (
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
     ):
         options.set_argument(flag)
     # 仅显式配置 proxy 时写入；TUN 模式保持空
@@ -1250,33 +1479,10 @@ def get_email_and_token(api_key=None):
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
-        api_base = get_cloudflare_api_base()
-        if not api_base:
-            raise Exception("Cloudflare API Base 未配置")
-        try:
-            # cloudflare_temp_email 专用模式
-            return cloudflare_create_temp_address(api_base)
-        except Exception as primary_exc:
-            # 兜底回退到 Mail.tm 风格
-            key = api_key or get_cloudflare_api_key()
-            domains = cloudflare_get_domains(api_base, api_key=key)
-            if not domains:
-                raise Exception(f"Cloudflare 创建邮箱失败: {primary_exc}")
-            verified = [d for d in domains if d.get("isVerified")]
-            target = verified[0] if verified else domains[0]
-            domain = target.get("domain")
-            if not domain:
-                raise Exception("Cloudflare 域名数据格式错误，缺少 domain 字段")
-            username = generate_username(10)
-            address = f"{username}@{domain}"
-            password = secrets.token_urlsafe(12)
-            cloudflare_create_account(
-                api_base, address, password, api_key=key, expires_in=0
-            )
-            token = cloudflare_get_token(api_base, address, password, api_key=key)
-            if not token:
-                raise Exception("获取 Cloudflare 邮箱 token 失败")
-            return address, token
+        if not get_mail_backends() and not get_cloudflare_api_base():
+            raise Exception("Cloudflare API Base / mail_backends 未配置")
+        # 多后端四域名负载均衡（mail_backends + 池内最少域名优先）
+        return cloudflare_create_temp_address()
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -1411,9 +1617,12 @@ def cloudflare_get_oai_code(
     cancel_callback=None,
     resend_callback=None,
 ):
-    api_base = get_cloudflare_api_base()
+    # 多后端：收信必须走创建该邮箱时的 api_base
+    api_base = resolve_api_base_for_email(email) or get_cloudflare_api_base()
     if not api_base:
         raise Exception("Cloudflare API Base 未配置")
+    if log_callback:
+        log_callback(f"[Debug] 收信后端: {api_base} email={email}")
     deadline = time.time() + timeout
     # 同一封邮件正文可能延迟可读，允许多次重试解析，避免偶发漏码
     seen_attempts = {}
@@ -2727,13 +2936,135 @@ return 'clicked';
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
+def solve_turnstile_capsolver(website_url=None, sitekey=None, log_callback=None, cancel_callback=None):
+    """通过 CapSolver API 解决 Turnstile 验证码"""
+    api_key = config.get("capsolver_api_key", "").strip()
+    if not api_key:
+        raise Exception("capsolver_api_key 未配置")
+
+    if not website_url:
+        website_url = SIGNUP_URL
+
+    if not sitekey and _get_page():
+        try:
+            sitekey = _get_page().run_js(
+                """
+try {
+  const el = document.querySelector('[data-sitekey]');
+  if (el) return el.getAttribute('data-sitekey');
+  const iframes = document.querySelectorAll('iframe[src*="turnstile"]');
+  for (const f of iframes) {
+    const m = f.src.match(/[?&]k=([^&]+)/);
+    if (m) return m[1];
+  }
+  return '';
+} catch(e) { return ''; }
+                """
+            )
+        except Exception:
+            sitekey = ""
+
+    if not sitekey:
+        sitekey = "0x4AAAAAAAhr9JGVDZbrZOo0"
+
+    if log_callback:
+        log_callback(f"[*] CapSolver: 创建任务 sitekey={sitekey[:16]}...")
+
+    import urllib.request
+    import urllib.error
+
+    proxy = config.get("proxy", "")
+
+    create_payload = json.dumps({
+        "clientKey": api_key,
+        "task": {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": website_url,
+            "websiteKey": sitekey,
+        }
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.capsolver.com/createTask",
+        data=create_payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+    except Exception as e:
+        raise Exception(f"CapSolver createTask 失败: {e}")
+
+    if result.get("errorId", 0) != 0:
+        raise Exception(f"CapSolver 错误: {result.get('errorDescription', result)}")
+
+    task_id = result.get("taskId")
+    if not task_id:
+        raise Exception(f"CapSolver 未返回 taskId: {result}")
+
+    if log_callback:
+        log_callback(f"[*] CapSolver: 任务已创建 taskId={task_id[:12]}... 等待结果")
+
+    poll_payload = json.dumps({
+        "clientKey": api_key,
+        "taskId": task_id,
+    }).encode()
+
+    for i in range(60):
+        raise_if_cancelled(cancel_callback)
+        time.sleep(2)
+
+        req2 = urllib.request.Request(
+            "https://api.capsolver.com/getTaskResult",
+            data=poll_payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req2, timeout=15) as resp2:
+                status = json.loads(resp2.read())
+        except Exception:
+            continue
+
+        if status.get("errorId", 0) != 0:
+            raise Exception(f"CapSolver 轮询错误: {status.get('errorDescription', status)}")
+
+        if status.get("status") == "ready":
+            token = status.get("solution", {}).get("token", "")
+            if token and len(token) >= 80:
+                if log_callback:
+                    log_callback(f"[*] CapSolver: 成功获取 token, 长度={len(token)}")
+                return token
+            raise Exception(f"CapSolver 返回无效 token: len={len(token)}")
+
+        if status.get("status") == "failed":
+            raise Exception(f"CapSolver 任务失败: {status.get('errorDescription', '')}")
+
+    raise Exception("CapSolver 超时(120s)")
+
+
 def getTurnstileToken(log_callback=None, cancel_callback=None):
     if _get_page() is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
     try:
         _get_page().run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
+            """
+try {
+  const inp = document.querySelector('input[name="cf-turnstile-response"]');
+  const oldVal = inp ? String(inp.value || '').trim() : '';
+  const oldResp = (window.turnstile && typeof turnstile.getResponse === 'function') ? String(turnstile.getResponse() || '').trim() : '';
+  window.__stale_turnstile_token = oldVal || oldResp || '';
+  if (window.__orig_turnstile_getResponse && window.turnstile) {
+    turnstile.getResponse = window.__orig_turnstile_getResponse;
+    delete window.__orig_turnstile_getResponse;
+  }
+  if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset();
+  if (inp) inp.value = '';
+  delete window.__capsolver_token;
+} catch(e) {}
+            """
         )
     except Exception:
         pass
@@ -2744,10 +3075,12 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
             token = _get_page().run_js(
                 """
 try {
+  const stale = window.__stale_turnstile_token || '';
   const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
-  if (byInput) return byInput;
+  if (byInput && byInput !== stale) return byInput;
   if (window.turnstile && typeof turnstile.getResponse === 'function') {
-    return String(turnstile.getResponse() || '').trim();
+    const resp = String(turnstile.getResponse() || '').trim();
+    if (resp && resp !== stale) return resp;
   }
   return '';
 } catch(e) { return ''; }
@@ -2802,6 +3135,59 @@ if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
         except Exception:
             pass
         sleep_with_cancel(1, cancel_callback)
+
+    # 浏览器方式失败，尝试 CapSolver 作为后备
+    api_key = config.get("capsolver_api_key", "")
+    if api_key:
+        if log_callback:
+            log_callback("[*] 浏览器解 Turnstile 失败，尝试 CapSolver...")
+        try:
+            sitekey = _get_page().run_js(
+                """
+try {
+  const el = document.querySelector('[data-sitekey]');
+  if (el) return el.getAttribute('data-sitekey');
+  const iframes = document.querySelectorAll('iframe[src*="turnstile"]');
+  for (const f of iframes) {
+    const m = f.src.match(/[?&]k=([^&]+)/);
+    if (m) return m[1];
+  }
+  return '';
+} catch(e) { return ''; }
+                """
+            )
+            sitekey = str(sitekey or "").strip()
+            if not sitekey:
+                sitekey = "0x4AAAAAAAhr9JGVDZbrZOo0"  # x.ai 已知 sitekey
+
+            page_url = _get_page().url or SIGNUP_URL
+            token = solve_turnstile_capsolver(website_url=page_url, sitekey=sitekey, log_callback=log_callback, cancel_callback=cancel_callback)
+            if token:
+                # 注入 token 到页面
+                _get_page().run_js(
+                    f"""
+const inp = document.querySelector('input[name="cf-turnstile-response"]');
+if (inp) {{
+  inp.value = {json.dumps(token)};
+  inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+  inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+}}
+if (window.turnstile && typeof turnstile.getResponse === 'function') {{
+  window.__capsolver_token = {json.dumps(token)};
+  if (!window.__orig_turnstile_getResponse) {{
+    window.__orig_turnstile_getResponse = turnstile.getResponse;
+  }}
+  const orig = window.__orig_turnstile_getResponse;
+  turnstile.getResponse = function() {{ return window.__capsolver_token || orig.call(this); }};
+}}
+                    """
+                )
+                if log_callback:
+                    log_callback(f"[*] CapSolver Turnstile 成功，token长度={len(token)}")
+                return token
+        except Exception as e:
+            if log_callback:
+                log_callback(f"[!] CapSolver 失败: {e}")
 
     raise Exception("Turnstile 获取 token 失败")
 
@@ -3163,18 +3549,45 @@ return 'final-page-clicked-submit';
                                     """
 const token = String(arguments[0] || '').trim();
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-if (!cfInput || !token) return false;
+if (!cfInput || !token) return 'no-input';
 const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
 if (nativeSetter) nativeSetter.call(cfInput, token);
 else cfInput.value = token;
 cfInput.dispatchEvent(new Event('input', { bubbles: true }));
 cfInput.dispatchEvent(new Event('change', { bubbles: true }));
-return String(cfInput.value || '').trim().length;
+
+// 触发 Turnstile success callback
+try {
+  const container = document.querySelector('.cf-turnstile, [data-sitekey]');
+  if (container) {
+    const cbName = container.getAttribute('data-callback');
+    if (cbName && typeof window[cbName] === 'function') window[cbName](token);
+  }
+} catch(e) {}
+
+// 注入后立刻尝试提交
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button, [role="button"], input[type="submit"]')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+const submitBtn = buttons.find((node) => {
+    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('signup') || t.includes('createaccount');
+});
+if (submitBtn) { submitBtn.focus(); submitBtn.click(); }
+
+return 'injected-len=' + String(cfInput.value || '').trim().length + (submitBtn ? ',submitted' : ',no-btn');
                                     """,
                                     token,
                                 )
                                 if log_callback:
-                                    log_callback(f"[*] 最终页 Turnstile 二次复用完成，回填长度={synced}")
+                                    log_callback(f"[*] 最终页 Turnstile 二次复用完成: {synced}")
                         except Exception as cf_exc:
                             if log_callback:
                                 log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
