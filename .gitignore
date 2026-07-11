@@ -25,6 +25,10 @@ token.json
 .quota_watch_state.json
 .quota_watch_state.json.tmp
 
+# clash proxy node scoring
+.clash_node_stats.json
+.clash_node_stats.json.tmp
+
 *.log
 .DS_Store
 .idea/

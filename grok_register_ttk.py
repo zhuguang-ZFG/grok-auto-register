@@ -52,6 +52,12 @@ DEFAULT_CONFIG = {
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "anti_detect_ua_pool": True,
+    "anti_detect_viewport": True,
+    "anti_detect_tz_locale": True,
+    "clash_rotate_per_account": True,
+    "clash_api": "http://127.0.0.1:9097",
+    "clash_secret": "set-your-secret",
     "grok2api_auto_add_local": True,
     "grok2api_local_token_file": "",
     "grok2api_pool_name": "ssoBasic",
@@ -94,6 +100,11 @@ DEFAULT_CONFIG = {
 }
 
 config = DEFAULT_CONFIG.copy()
+
+# Anti-detect thread-local fingerprint + timezone (set by create_browser_options,
+# read by request/cookie layers to keep UA / sec-ch-ua / Accept-Language consistent).
+_thread_fp = [None]  # type: ignore[var-annotated]
+tz_env = [None]  # type: ignore[var-annotated]
 _cf_domain_index = 0
 _cf_domain_lock = threading.Lock()
 _io_lock = threading.Lock()
@@ -797,6 +808,36 @@ def create_browser_options():
                 options.set_user_agent(ua)
             except Exception:
                 options.set_argument(f"--user-agent={ua}")
+    # 反检测：随机指纹（UA + 平台 + viewport + 时区 + 语言）
+    if config.get("anti_detect_ua_pool", True):
+        try:
+            from anti_detect import pick_fingerprint, TZ_OFFSETS
+            fp = pick_fingerprint()
+            # UA + sec-ch-ua 客户端提示
+            try:
+                options.set_user_agent(fp.user_agent)
+            except Exception:
+                options.set_argument(f"--user-agent={fp.user_agent}")
+            options.set_argument(f"--user-agent={fp.user_agent}")
+            # sec-ch-ua / platform 提示（Cloudflare 校验 UA 与 sec-ch-ua 一致性）
+            for header_val in (
+                f"sec-ch-ua={fp.sec_ch_ua}",
+                f"sec-ch-ua-platform=\"{fp.platform}\"",
+                f"sec-ch-ua-mobile=?0",
+                f"accept-language={fp.accept_language}",
+            ):
+                # 这些是 HTTP 头，不能直接作为 Chromium flag；保存到线程局部供请求层使用
+                pass
+            # 视口（Canvas/WebGL 指纹输入）
+            if config.get("anti_detect_viewport", True):
+                options.set_argument(f"--window-size={fp.window_size}")
+            # 时区 + 语言（影响 Date / Intl / navigator.language）
+            if config.get("anti_detect_tz_locale", True):
+                options.set_argument(f"--lang={fp.lang_code}")
+                tz_env[0] = fp.timezone
+            _thread_fp[0] = fp
+        except Exception:
+            pass
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -3599,10 +3640,41 @@ class GrokRegisterGUI:
         dev_token = ""
         code = ""
         mail_ok = False
+        clash_node = None
+        # Anti-detection: rotate Clash proxy node before each registration
+        if config.get("clash_rotate_per_account", True):
+            try:
+                from clash_proxy import rotate_node, is_available
+                if is_available():
+                    clash_node = rotate_node(
+                        log=log_fn,
+                        verify_ip=bool(config.get("clash_verify_ip", False)),
+                    )
+                    if clash_node:
+                        log_fn(f"[*] 出口节点: {clash_node}")
+            except Exception as exc:
+                log_fn(f"[*] Clash 轮换跳过: {exc}")
+        try:
+            return self._register_one_account_body(log_fn, worker_id, local_success, clash_node)
+        except Exception:
+            try:
+                from clash_proxy import report_fail
+                report_fail(clash_node)
+            except Exception:
+                pass
+            raise
+
+    def _register_one_account_body(self, log_fn, worker_id=0, local_success=0, clash_node=None):
+        email = ""
+        dev_token = ""
+        code = ""
+        mail_ok = False
         max_mail_retry = 3
         for mail_try in range(1, max_mail_retry + 1):
             log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
             open_signup_page(log_callback=log_fn, cancel_callback=self.should_stop)
+            # Human-like pause between page open and email create
+            sleep_with_cancel(random.uniform(0.8, 2.5), self.should_stop)
             log_fn("[*] 2. 创建邮箱并提交")
             email, dev_token = fill_email_and_submit(
                 log_callback=log_fn, cancel_callback=self.should_stop
@@ -3701,6 +3773,12 @@ class GrokRegisterGUI:
         with _stats_lock:
             self.success_count += 1
         log_fn(f"[+] 注册成功: {email}")
+        # Community proxy_pool pattern: credit the exit node on success
+        try:
+            from clash_proxy import report_success
+            report_success(clash_node)
+        except Exception:
+            pass
 
     def _run_single_worker(self, count, worker_id=0):
         _set_worker_id(worker_id)
@@ -3829,10 +3907,45 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
     dev_token = ""
     code = ""
     mail_ok = False
+    clash_node = None
+    # Anti-detection: rotate Clash proxy node before each registration
+    if config.get("clash_rotate_per_account", True):
+        try:
+            from clash_proxy import rotate_node, is_available
+            if is_available():
+                clash_node = rotate_node(
+                    log=log_fn,
+                    verify_ip=bool(config.get("clash_verify_ip", False)),
+                )
+                if clash_node:
+                    log_fn(f"[*] 出口节点: {clash_node}")
+        except Exception as exc:
+            log_fn(f"[*] Clash 轮换跳过: {exc}")
+    max_mail_retry = 3
+    try:
+        return _register_one_account_cli_body(
+            log_fn, stop_fn, accounts_output_file, clash_node
+        )
+    except Exception:
+        try:
+            from clash_proxy import report_fail
+            report_fail(clash_node)
+        except Exception:
+            pass
+        raise
+
+
+def _register_one_account_cli_body(log_fn, stop_fn, accounts_output_file, clash_node=None):
+    email = ""
+    dev_token = ""
+    code = ""
+    mail_ok = False
     max_mail_retry = 3
     for mail_try in range(1, max_mail_retry + 1):
         log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
         open_signup_page(log_callback=log_fn, cancel_callback=stop_fn)
+        # Human-like pause between page open and email create
+        sleep_with_cancel(random.uniform(0.8, 2.5), stop_fn)
         log_fn("[*] 2. 创建邮箱并提交")
         email, dev_token = fill_email_and_submit(
             log_callback=log_fn, cancel_callback=stop_fn
@@ -3927,6 +4040,12 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
         sso, email, log_callback=log_fn, cpa_result=cpa_result
     )
     log_fn(f"[+] 注册成功: {email}")
+    # Community proxy_pool pattern: credit the exit node on success
+    try:
+        from clash_proxy import report_success
+        report_success(clash_node)
+    except Exception:
+        pass
 
 
 def _cli_worker_loop(worker_id, task_queue, total_count, controller, accounts_output_file, stats):

@@ -86,5 +86,9 @@
   "quota_watch_refresh_interval_sec": 600,
   "quota_watch_refresh_margin_sec": 1800,
   "quota_watch_rotate_cooldown_sec": 30,
-  "auto_loop_jitter": 0.5
+  "auto_loop_jitter": 0.5,
+  "quota_watch_target_pool": 50,
+  "anti_detect_ua_pool": true,
+  "anti_detect_viewport": true,
+  "anti_detect_tz_locale": true
 }

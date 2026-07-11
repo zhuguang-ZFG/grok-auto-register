@@ -84,9 +84,10 @@ DEFAULT_CFG: dict[str, Any] = {
     "quota_watch_probe_kind": "models",
     "quota_watch_prefer_pool": True,
     "quota_watch_register_on_miss": True,
-    "quota_watch_min_pool": 3,
-    "quota_watch_pool_topup_cooldown_sec": 600,
-    "quota_watch_pool_topup_max_per_day": 30,
+    "quota_watch_min_pool": 15,
+    "quota_watch_target_pool": 50,
+    "quota_watch_pool_topup_cooldown_sec": 1200,
+    "quota_watch_pool_topup_max_per_day": 40,
     "quota_watch_refresh_enabled": True,
     "quota_watch_refresh_interval_sec": 600,
     "quota_watch_refresh_margin_sec": 1800,
@@ -646,12 +647,17 @@ def topup_pool(
     grok CLI session keeps running on its existing valid credential.
     """
     min_pool = int(cfg.get("quota_watch_min_pool") or 3)
+    target_pool = int(cfg.get("quota_watch_target_pool") or max(min_pool, 20))
     # 用「有效数」(未过期) 而非文件总数判断水位
     pool = list_cpa_pool(cfg)
     valid_n = sum(1 for p in pool if not pool_token_is_expired(load_json(p)))
+    if valid_n >= target_pool:
+        return {"ok": True, "skipped": True, "reason": f"pool_at_target(valid={valid_n}>={target_pool})"}
     if valid_n >= min_pool:
-        return {"ok": True, "skipped": True, "reason": f"pool_full(valid={valid_n}>={min_pool})"}
-    if pool:
+        # Above floor but below target — top up slowly toward target.
+        # The cooldown (topup_cooldown_sec) gates how fast we approach target.
+        _log(log, f"[quota] pool topping toward target: valid={valid_n} (min={min_pool}, target={target_pool})")
+    elif pool:
         expired_n = len(pool) - valid_n
         _log(log, f"[quota] pool low: valid={valid_n}<{min_pool} (total={len(pool)}, expired={expired_n}) — topping up")
     else:
