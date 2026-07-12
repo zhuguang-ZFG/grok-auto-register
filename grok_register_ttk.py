@@ -383,6 +383,9 @@ def rotate_egress_proxy(log_fn=None):
     prefer_http = bool(config.get("http_proxy_prefer_over_clash"))
     http_url = None
     clash_node = None
+    # When throttle skips this round, we must NOT fall back to the HTTP pool
+    # (overseas-only, unreachable from CN host) — keep the current egress as-is.
+    clash_throttled = {"v": False}
 
     def _try_http():
         nonlocal http_url
@@ -406,6 +409,17 @@ def rotate_egress_proxy(log_fn=None):
         nonlocal clash_node
         if not config.get("clash_rotate_per_account", True):
             return
+        # Frequency throttle: rotate only every N accounts to reduce host impact.
+        every_n = int(config.get("clash_rotate_every_n", 1) or 1)
+        if every_n > 1:
+            cnt = int(config.get("_clash_rotate_counter", 0)) + 1
+            config["_clash_rotate_counter"] = cnt
+            if cnt % every_n != 0:
+                # Keep current exit; signal "handled" so we don't fall to HTTP pool.
+                clash_throttled["v"] = True
+                if log_fn:
+                    log_fn(f"[*] 出口沿用当前节点 (每{every_n}号换一次, {cnt%every_n}/{every_n})")
+                return
         try:
             from clash_proxy import rotate_node, is_available
 
@@ -413,6 +427,10 @@ def rotate_egress_proxy(log_fn=None):
                 clash_node = rotate_node(
                     log=log_fn,
                     verify_ip=bool(config.get("clash_verify_ip", False)),
+                    # Isolation: dedicated group + no global-mode / no conn flush.
+                    selector=(config.get("clash_selector") or None),
+                    force_global=bool(config.get("clash_force_global", False)),
+                    close_conns=bool(config.get("clash_close_conns", False)),
                 )
                 if clash_node:
                     out["clash_node"] = clash_node
@@ -430,8 +448,9 @@ def rotate_egress_proxy(log_fn=None):
             _try_clash()
     else:
         _try_clash()
-        # If clash missing/failed and HTTP pool configured, fall back
-        if not clash_node:
+        # If clash missing/failed and HTTP pool configured, fall back — but NOT
+        # when throttle intentionally skipped this round (keep current exit).
+        if not clash_node and not clash_throttled["v"]:
             _try_http()
         elif config.get("http_proxy_also_with_clash"):
             _try_http()
@@ -4961,24 +4980,28 @@ def run_registration_cli(count):
 
 def run_registration_cli_loop(count_per_round):
     """Continuous registration until Ctrl+C or max rounds."""
-    pause_base = float(config.get("auto_loop_pause_sec", 30) or 30)
-    max_rounds = int(config.get("auto_loop_max_rounds", 0) or 0)
     # Anti-detection: randomize interval so registration doesn't look mechanical.
     # Default: base ±50% (e.g. 60s base -> 30-90s, configurable via auto_loop_jitter).
-    jitter = float(config.get("auto_loop_jitter", 0.5) or 0.5)
     round_i = 0
     controller = CliStopController()
     prev_handler = _install_cli_sigint_handler(controller)
     try:
         while not controller.should_stop():
+            # Reload config each round so speed/concurrency tweaks apply without restart.
+            load_config()
+            pause_base = float(config.get("auto_loop_pause_sec", 30) or 30)
+            max_rounds = int(config.get("auto_loop_max_rounds", 0) or 0)
+            jitter = float(config.get("auto_loop_jitter", 0.5) or 0.5)
+            count_this = int(config.get("register_count", count_per_round) or count_per_round)
             round_i += 1
             if max_rounds > 0 and round_i > max_rounds:
                 cli_log(f"[*] 已达 max_rounds={max_rounds}，结束自动循环")
                 break
             cli_log(
-                f"[*] ===== 自动循环第 {round_i} 轮 | 本轮目标 {count_per_round} ====="
+                f"[*] ===== 自动循环第 {round_i} 轮 | 本轮目标 {count_this} "
+                f"| 并发 {int(config.get('concurrent_count', 1) or 1)} ====="
             )
-            run_registration_cli(count_per_round)
+            run_registration_cli(count_this)
             if controller.should_stop():
                 break
             import random as _rnd

@@ -8,6 +8,11 @@ from .mint import mint_and_export
 from .probe import probe_mini_response, probe_models
 from .oauth_device import refresh_access_token
 from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
+
+try:
+    from .authcode_mint import mint_with_sso_authcode
+except Exception:  # pragma: no cover
+    mint_with_sso_authcode = None  # type: ignore[assignment]
 from .schema import (
     CLIENT_ID,
     DEFAULT_BASE_URL,
@@ -42,6 +47,7 @@ __all__ = [
     "extract_sso_from_cookies",
     "mint_and_export",
     "mint_with_sso_protocol",
+    "mint_with_sso_authcode",
     "parse_accounts_file",
     "probe_mini_response",
     "probe_models",

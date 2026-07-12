@@ -24,7 +24,24 @@ from pathlib import Path
 from typing import Any, Callable
 
 FREE_TIER_LIMIT = 2_000_000  # tokens per rolling 24h window
-RESET_WINDOW_SEC = 24 * 3600  # 24 hours
+# Grok free-tier quota recovers on a ROLLING window (community/LINUX DO: tokens
+# free up gradually by the hour, not a single 24h flush). Marking a hit account
+# unusable for a full 24h keeps too many accounts sidelined and forces CLIProxy
+# session-affinity to reselect (prompt-cache miss). A shorter window lets probed-
+# recovered accounts return to the ready pool sooner; the per-request 429 guard
+# still re-disables any account that is genuinely still exhausted.
+# Override via env GROK_POOL_RECOVER_HOURS (float).
+def _recover_window_sec() -> float:
+    try:
+        h = float(os.environ.get("GROK_POOL_RECOVER_HOURS", "") or 0)
+        if h > 0:
+            return h * 3600.0
+    except Exception:
+        pass
+    return 6 * 3600.0  # default: 6h (was 24h)
+
+
+RESET_WINDOW_SEC = 6 * 3600  # default recovery window (see _recover_window_sec)
 
 LogFn = Callable[[str], None]
 
@@ -90,7 +107,7 @@ def mark_account_exhausted(
             # still within existing recovery window — only refresh reason/tokens
             pass
         else:
-            qs["recover_after"] = now + RESET_WINDOW_SEC
+            qs["recover_after"] = now + _recover_window_sec()
         if tokens_used:
             qs["tokens_used"] = tokens_used
         qs["limit"] = FREE_TIER_LIMIT
@@ -165,13 +182,15 @@ def reenable_recovered_accounts(
     auth_dir: Path,
     *,
     log: LogFn | None = None,
-    max_per_run: int = 50,
+    max_per_run: int = 200,
 ) -> dict[str, Any]:
     """Scan auth-dir; re-enable CPA files past recover_after.
 
     Returns counts for logging. Safe to call frequently.
+    Never re-enables terminal dead reasons (revoked RT / missing RT / bad json).
     """
-    stats = {"scanned": 0, "reenabled": 0, "still_exhausted": 0}
+    stats = {"scanned": 0, "reenabled": 0, "still_exhausted": 0, "skipped_terminal": 0}
+    _TERMINAL = frozenset({"refresh_revoked", "missing_refresh_token", "bad_json"})
     if not auth_dir.is_dir():
         return stats
     n = 0
@@ -182,6 +201,10 @@ def reenable_recovered_accounts(
         except Exception:
             continue
         qs = data.get("quota_state") or {}
+        reason = str(qs.get("reason") or "")
+        if reason in _TERMINAL:
+            stats["skipped_terminal"] += 1
+            continue
         recover_after = float(qs.get("recover_after") or 0)
         disabled = bool(data.get("disabled"))
         if not recover_after and not disabled:

@@ -53,13 +53,22 @@ def atomic_write(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def needs_refresh(path: Path, *, within_sec: float, expired_only: bool) -> bool:
+def needs_refresh(
+    path: Path,
+    *,
+    within_sec: float,
+    expired_only: bool,
+    include_disabled: bool = False,
+) -> bool:
     try:
         d = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    if d.get("disabled") and not expired_only:
-        # still allow refresh of disabled if expired_only false? skip disabled by default
+    if d.get("disabled") and not include_disabled and not expired_only:
+        # skip disabled by default (silent pre-expiry only touches live pool)
+        return False
+    qs = d.get("quota_state") or {}
+    if str(qs.get("reason") or "") in ("refresh_revoked", "missing_refresh_token", "bad_json"):
         return False
     at = str(d.get("access_token") or "")
     exp = jwt_exp(at)
@@ -77,7 +86,13 @@ def refresh_one(
     proxy: str | None,
     purge_dead: bool,
     dead_dir: Path,
+    soft_disable_dead: bool = True,
 ) -> dict[str, Any]:
+    """Refresh one CPA file. Never probes chat; optional soft-disable on dead RT.
+
+    Community (sticky/cache): avoid hard MOVE/unlink — CLIProxy treats
+    os.replace churn as REMOVE and breaks session-affinity.
+    """
     from cpa_xai.oauth_device import OAuthDeviceError, refresh_access_token
     from cpa_xai.schema import expired_from_access_token
 
@@ -85,6 +100,14 @@ def refresh_one(
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"file": path.name, "ok": False, "error": f"read:{exc}"}
+    # Terminal dead — do not re-hit token endpoint every cycle
+    qs = payload.get("quota_state") or {}
+    if payload.get("disabled") and str(qs.get("reason") or "") in (
+        "refresh_revoked",
+        "missing_refresh_token",
+        "bad_json",
+    ):
+        return {"file": path.name, "ok": False, "error": "terminal_disabled", "skipped": True}
     rt = str(payload.get("refresh_token") or "").strip()
     if not rt:
         return {"file": path.name, "ok": False, "error": "no_refresh_token", "dead": True}
@@ -116,7 +139,20 @@ def refresh_one(
     except OAuthDeviceError as exc:
         msg = str(exc)
         dead = "invalid_grant" in msg.lower() or "400" in msg or "401" in msg
-        if dead and purge_dead:
+        if dead and soft_disable_dead:
+            # Prefer soft-disable over MOVE (sticky-safe)
+            payload["disabled"] = True
+            payload["quota_state"] = {
+                **(payload.get("quota_state") or {}),
+                "reason": "refresh_revoked",
+                "recover_after": time.time() + 24 * 3600,
+                "marked_at": time.time(),
+            }
+            try:
+                atomic_write(path, payload)
+            except Exception:
+                pass
+        elif dead and purge_dead:
             dead_dir.mkdir(parents=True, exist_ok=True)
             dest = dead_dir / path.name
             if dest.exists():
@@ -128,6 +164,103 @@ def refresh_one(
         return {"file": path.name, "ok": False, "error": msg[:200], "dead": dead}
     except Exception as exc:
         return {"file": path.name, "ok": False, "error": str(exc)[:200]}
+
+
+def silent_refresh_pool(
+    *,
+    auth_dir: Path | None = None,
+    within_hours: float = 2.0,
+    max_files: int = 40,
+    workers: int = 2,
+    proxy: str | None = None,
+    include_disabled: bool = False,
+    log: Any = None,
+) -> dict[str, Any]:
+    """Silent pre-expiry refresh for sticky-friendly pools (no probe, no hard purge).
+
+    Community practice: renew access_token before JWT dies mid-session so
+    CLIProxy session-affinity does not reselect on 401.
+    """
+    def _log(msg: str) -> None:
+        if callable(log):
+            log(msg)
+
+    cfg = load_cfg()
+    d = auth_dir or Path(str(cfg.get("cpa_auth_dir") or "cpa_auths"))
+    if not d.is_absolute():
+        d = (ROOT / d).resolve()
+    if not d.is_dir():
+        return {"ok": False, "error": "no_auth_dir", "refreshed": 0, "failed": 0, "skipped": 0}
+
+    proxy = proxy if proxy is not None else (
+        str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip() or None
+    )
+    within_sec = max(0.0, float(within_hours) * 3600.0)
+    candidates: list[Path] = []
+    # Prefer soonest-to-expire first (sticky-friendly: save sessions about to die)
+    scored: list[tuple[int, Path]] = []
+    for p in d.glob("xai-*.json"):
+        if needs_refresh(
+            p,
+            within_sec=within_sec,
+            expired_only=False,
+            include_disabled=include_disabled,
+        ):
+            try:
+                at = str(json.loads(p.read_text(encoding="utf-8")).get("access_token") or "")
+                exp = jwt_exp(at) or 0
+            except Exception:
+                exp = 0
+            scored.append((exp or 0, p))
+    scored.sort(key=lambda x: x[0])  # earliest exp first
+    candidates = [p for _, p in scored]
+    if max_files and len(candidates) > max_files:
+        candidates = candidates[:max_files]
+
+    stats = {"refreshed": 0, "failed": 0, "skipped": 0, "dead": 0, "candidates": len(candidates)}
+    if not candidates:
+        return {"ok": True, **stats}
+
+    dead_dir = d.parent / "cpa_auths_dead"
+    workers = max(1, min(int(workers or 1), 4))
+
+    def _job(path: Path) -> dict[str, Any]:
+        return refresh_one(
+            path,
+            proxy=proxy,
+            purge_dead=False,
+            dead_dir=dead_dir,
+            soft_disable_dead=True,
+        )
+
+    results: list[dict[str, Any]] = []
+    if workers == 1:
+        results = [_job(p) for p in candidates]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_job, p): p for p in candidates}
+            for fut in as_completed(futs):
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    results.append({"ok": False, "error": str(exc)[:120]})
+
+    for r in results:
+        if r.get("skipped"):
+            stats["skipped"] += 1
+        elif r.get("ok"):
+            stats["refreshed"] += 1
+        else:
+            stats["failed"] += 1
+            if r.get("dead"):
+                stats["dead"] += 1
+
+    _log(
+        f"[pool-refresh] candidates={stats['candidates']} refreshed={stats['refreshed']} "
+        f"failed={stats['failed']} dead={stats['dead']} skipped={stats['skipped']} "
+        f"within_h={within_hours}"
+    )
+    return {"ok": True, **stats}
 
 
 def main(argv: list[str] | None = None) -> int:

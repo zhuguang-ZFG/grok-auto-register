@@ -244,13 +244,26 @@ def rotate_node(
     prefer_low_delay: bool = True,
     max_delay_ms: int = 800,
     avoid: Optional[str] = None,
-    force_global: bool = True,
-    close_conns: bool = True,
+    force_global: bool = False,
+    close_conns: bool = False,
     verify_ip: bool = False,
     proxy_port: int = DEFAULT_PROXY_PORT,
+    selector: Optional[str] = None,
     log=None,
 ) -> Optional[str]:
-    """Switch to a different healthy node; return its name or None."""
+    """Switch to a different healthy node; return its name or None.
+
+    Isolation notes (avoid disrupting the host's own network):
+      - ``force_global`` default False: never rewrite Clash mode.
+      - ``close_conns`` default False: do NOT drop the host's live TCP
+        connections (that also kills CLIProxy's in-flight Kimi requests).
+        curl_cffi opens fresh connections per request, so a selector switch
+        applies to new registration traffic without a global connection flush.
+      - ``selector``: rotate ONLY this Clash selector group (e.g. a dedicated
+        "注册专用" group). The host keeps using GLOBAL / other groups, so the
+        exit IP for the machine's own traffic is untouched. Falls back to the
+        main selector when not given.
+    """
     global _LAST_NODE, _LAST_EXIT_IP
     try:
         if force_global:
@@ -259,10 +272,19 @@ def rotate_node(
             except Exception:
                 pass
 
-        sel = _find_main_selector(api, secret)
+        sel = selector or _find_main_selector(api, secret)
         if not sel:
             _safe_log(log, "[clash] no main selector found")
             return None
+        # Validate an explicitly-requested selector actually exists.
+        if selector:
+            try:
+                real_chk, _ = _list_real_nodes(api, secret, selector)
+                if not real_chk:
+                    _safe_log(log, f"[clash] selector {selector!r} empty/missing; fallback main")
+                    sel = _find_main_selector(api, secret) or selector
+            except Exception:
+                pass
         real, infos = _list_real_nodes(api, secret, sel)
         if not real:
             _safe_log(log, "[clash] no real proxy nodes available")

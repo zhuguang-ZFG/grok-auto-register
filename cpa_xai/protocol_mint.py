@@ -46,11 +46,19 @@ def _is_transient_tls_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     needles = (
         "curl: (35)",
+        "curl: (56)",
+        "curl: (28)",
+        "curl: (7)",
         "tls connect error",
         "ssl",
         "openssl",
         "connection reset",
         "connection aborted",
+        "connection closed",
+        "closed abruptly",
+        "network error",
+        "recv failure",
+        "send failure",
         "timed out",
         "timeout",
         "broken pipe",
@@ -58,6 +66,11 @@ def _is_transient_tls_error(exc: BaseException) -> bool:
         "unexpected_eof",
         "proxy",
         "temporarily unavailable",
+        # device code race under multi-worker mint — retry full protocol flow
+        "invalid_grant",
+        "unknown device code",
+        "authorization_pending",
+        "slow_down",
     )
     return any(n in msg for n in needles)
 

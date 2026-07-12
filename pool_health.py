@@ -201,7 +201,46 @@ def sync_cli_live_dir(live_items: list[Path], live_dir: Path, auth_dir: Path | N
     )
 
 
-def quarantine(path: Path, dead_dir: Path, reason: str) -> None:
+def soft_disable(path: Path, reason: str, *, hours: float = 24.0) -> None:
+    """Mark auth disabled in-place so CLIProxy drops it without deleting the file.
+
+    Hard moves break session-affinity mid-chat (file REMOVE → sticky rebind → cache miss).
+    Prefer soft-disable for probe/refresh soft failures; hard quarantine only for
+    revoked refresh tokens / bad JSON.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    data["disabled"] = True
+    recover_after = datetime.now(timezone.utc) + timedelta(hours=hours)
+    data["quota_state"] = {
+        "reason": "probe_or_refresh_fail",
+        "detail": str(reason)[:300],
+        "recover_after": recover_after.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "marked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def quarantine(path: Path, dead_dir: Path, reason: str, *, hard: bool = False) -> None:
+    """Drop a bad auth from the live pool.
+
+    Default is soft-disable (sticky-safe). hard=True moves file to dead_dir
+    (revoked RT / corrupt JSON).
+    """
+    if not hard:
+        try:
+            soft_disable(path, reason)
+            return
+        except Exception:
+            pass
     dead_dir.mkdir(parents=True, exist_ok=True)
     dest = dead_dir / path.name
     try:
@@ -261,7 +300,10 @@ def main() -> int:
     min_live = args.min_live
     if min_live is None:
         min_live = int(cfg.get("pool_min_live", 5) or 5)
-    do_probe = args.probe or bool(cfg.get("pool_probe_on_health", True))
+    # Default OFF: mass /models probing burns free quota and soft/hard-drops sticky
+    # auths mid-session (CLIProxy session-affinity reselect → prompt cache miss).
+    # Enable explicitly with --probe or config pool_probe_on_health=true.
+    do_probe = args.probe or bool(cfg.get("pool_probe_on_health", False))
 
     proxy = resolve_proxy(cfg)
     now = datetime.now(timezone.utc)
@@ -285,7 +327,7 @@ def main() -> int:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
             print(f"[!] 坏文件 quarantine: {path.name} {e}")
-            quarantine(path, dead_dir, f"bad_json: {e}")
+            quarantine(path, dead_dir, f"bad_json: {e}", hard=True)
             stats["quarantined"] += 1
             continue
 

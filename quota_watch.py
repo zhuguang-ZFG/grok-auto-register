@@ -112,6 +112,13 @@ DEFAULT_CFG: dict[str, Any] = {
     "quota_watch_refresh_enabled": True,
     "quota_watch_refresh_interval_sec": 600,
     "quota_watch_refresh_margin_sec": 1800,
+    # Silent pool JWT refresh (community sticky): renew expiring access tokens
+    # without chat probe / hard purge so session-affinity is not broken mid-turn.
+    "quota_watch_pool_refresh_enabled": True,
+    "quota_watch_pool_refresh_interval_sec": 900,
+    "quota_watch_pool_refresh_within_hours": 2.0,
+    "quota_watch_pool_refresh_max": 40,
+    "quota_watch_pool_refresh_workers": 2,
     "quota_watch_register_timeout_sec": 900,
     "quota_watch_python": "",
     "quota_watch_register_args": ["start"],
@@ -296,6 +303,7 @@ class WatchState:
     last_error: str = ""
     last_pool_topup_at: float = 0.0
     last_refresh_at: float = 0.0
+    last_pool_refresh_at: float = 0.0
     last_sample_probe_at: float = 0.0
     last_sample_live_ratio: float = 1.0
 
@@ -318,6 +326,7 @@ class WatchState:
         st.last_error = str(raw.get("last_error") or "")
         st.last_pool_topup_at = float(raw.get("last_pool_topup_at") or 0)
         st.last_refresh_at = float(raw.get("last_refresh_at") or 0)
+        st.last_pool_refresh_at = float(raw.get("last_pool_refresh_at") or 0)
         st.last_sample_probe_at = float(raw.get("last_sample_probe_at") or 0)
         st.last_sample_live_ratio = float(raw.get("last_sample_live_ratio") or 1.0)
         return st
@@ -339,6 +348,7 @@ class WatchState:
                 "last_error": self.last_error,
                 "last_pool_topup_at": self.last_pool_topup_at,
                 "last_refresh_at": self.last_refresh_at,
+                "last_pool_refresh_at": self.last_pool_refresh_at,
                 "last_sample_probe_at": self.last_sample_probe_at,
                 "last_sample_live_ratio": self.last_sample_live_ratio,
                 "updated_at": _now_iso(),
@@ -547,6 +557,18 @@ def purge_dead_pool(
 
     proxy = str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip() or None
     processed = 0
+    # Terminal soft-disable reasons: never re-write these files every poll.
+    # atomic_write/os.replace is seen by CLIProxy as REMOVE+CREATE and blows up
+    # session-affinity reselect (community sticky cache miss pattern).
+    _TERMINAL_REASONS = frozenset(
+        {
+            "refresh_revoked",
+            "missing_refresh_token",
+            "bad_json",
+        }
+    )
+    stats["skipped_terminal"] = 0
+    stats["skipped_disabled"] = 0
 
     for p in pool:
         if processed >= max_per_run:
@@ -554,17 +576,33 @@ def purge_dead_pool(
         payload = load_json(p)
         if not pool_token_is_expired(payload):
             continue
+
+        qs = payload.get("quota_state") or {}
+        reason = str(qs.get("reason") or "")
+        # Already known-dead RT: do not rewrite / re-hit token endpoint.
+        if payload.get("disabled") and reason in _TERMINAL_REASONS:
+            stats["skipped_terminal"] += 1
+            continue
+
         processed += 1
         stats["scanned"] += 1
 
         rt = str(payload.get("refresh_token") or "").strip()
         if not rt:
-            dead_dir.mkdir(parents=True, exist_ok=True)
-            dest = dead_dir / p.name
-            if dest.exists():
-                dest = dead_dir / f"{p.stem}.{int(time.time())}{p.suffix}"
+            # Soft-disable instead of MOVE: hard REMOVE breaks CLIProxy session-affinity
+            # (community: sticky binding dies on auth file delete → cache miss).
+            if payload.get("disabled") and reason == "missing_refresh_token":
+                stats["skipped_terminal"] += 1
+                continue
+            payload["disabled"] = True
+            payload["quota_state"] = {
+                **qs,
+                "reason": "missing_refresh_token",
+                "recover_after": time.time() + 24 * 3600,
+                "marked_at": time.time(),
+            }
             try:
-                p.rename(dest)
+                atomic_write_json(p, payload)
                 stats["purged"] += 1
             except Exception:
                 stats["errors"] += 1
@@ -580,23 +618,37 @@ def purge_dead_pool(
             payload["expired"] = exp_s
             from datetime import datetime, timezone
             payload["last_refresh"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # Keep existing disabled/quota_state if this was a free-tier hold;
+            # only refresh tokens so the account is ready when recover_after hits.
             atomic_write_json(p, payload)
             stats["refreshed"] += 1
         except OAuthDeviceError:
-            dead_dir.mkdir(parents=True, exist_ok=True)
-            dest = dead_dir / p.name
-            if dest.exists():
-                dest = dead_dir / f"{p.stem}.{int(time.time())}{p.suffix}"
+            # Revoked RT: soft-disable once; never rewrite every cycle.
+            if payload.get("disabled") and reason == "refresh_revoked":
+                stats["skipped_terminal"] += 1
+                continue
+            payload["disabled"] = True
+            payload["quota_state"] = {
+                **qs,
+                "reason": "refresh_revoked",
+                "recover_after": time.time() + 24 * 3600,
+                "marked_at": time.time(),
+            }
             try:
-                p.rename(dest)
+                atomic_write_json(p, payload)
                 stats["purged"] += 1
             except Exception:
                 stats["errors"] += 1
         except Exception:
             stats["errors"] += 1
 
-    if stats["scanned"] > 0:
-        _log(log, f"[pool-purge] scanned={stats['scanned']} refreshed={stats['refreshed']} purged={stats['purged']} errors={stats['errors']}")
+    if stats["scanned"] > 0 or stats.get("skipped_terminal"):
+        _log(
+            log,
+            f"[pool-purge] scanned={stats['scanned']} refreshed={stats['refreshed']} "
+            f"purged={stats['purged']} errors={stats['errors']} "
+            f"skipped_terminal={stats.get('skipped_terminal', 0)}",
+        )
     return stats
 
 
@@ -1386,9 +1438,43 @@ def once(
                     state.last_refresh_at = now
                     _log(log, f"[quota] proactive refresh error: {exc}")
 
-    # --- pool cleanup: refresh expired tokens or move dead ones out ---
+    # --- pool cleanup: refresh expired tokens or soft-disable dead RTs ---
     if not dry_run:
         purge_dead_pool(cfg, log=log, max_per_run=20)
+
+    # --- silent pre-expiry refresh of live pool JWTs (sticky-friendly) ---
+    # Community: renew access_token before exp so CLIProxy does not 401→reselect.
+    # No chat probe, no hard purge; skips terminal refresh_revoked files.
+    if cfg.get("quota_watch_pool_refresh_enabled", True) and not dry_run:
+        interval = float(cfg.get("quota_watch_pool_refresh_interval_sec") or 900)
+        now = time.time()
+        if force or (now - float(state.last_pool_refresh_at or 0)) >= interval:
+            try:
+                from refresh_pool import silent_refresh_pool
+
+                auth_dir = resolve_path(
+                    cfg.get("cpa_auth_dir") or "cpa_auths", ROOT / "cpa_auths"
+                )
+                pr = silent_refresh_pool(
+                    auth_dir=auth_dir,
+                    within_hours=float(
+                        cfg.get("quota_watch_pool_refresh_within_hours") or 2.0
+                    ),
+                    max_files=int(cfg.get("quota_watch_pool_refresh_max") or 40),
+                    workers=int(cfg.get("quota_watch_pool_refresh_workers") or 2),
+                    proxy=str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip()
+                    or None,
+                    include_disabled=False,
+                    log=lambda m: _log(log, m),
+                )
+                state.last_pool_refresh_at = now
+                state.save()
+                if pr.get("refreshed") or pr.get("failed") or pr.get("candidates"):
+                    report["pool_refresh"] = pr
+            except Exception as exc:
+                state.last_pool_refresh_at = now
+                state.save()
+                _log(log, f"[quota] pool silent refresh error: {exc}")
 
     # --- sync CLIProxy .cds cooldown files into disabled:true ---
     if cfg.get("quota_watch_cliproxy_mark_on_429", True) and not dry_run:

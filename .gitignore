@@ -62,3 +62,8 @@ grok_register_ttk.py.bak*
 config.json.bak*
 # local community dump (not for publish)
 _community_ref/
+
+# local import / community ref dumps (may contain tokens)
+_import_*/
+_sso_ref/
+.proxy_health.json
