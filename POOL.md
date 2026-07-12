@@ -4,6 +4,18 @@
 
 稳定小批量补号，域名轮换，控制节奏，本地始终有可用 `cpa_auths`。
 
+## 加固基线（必读）
+
+完整约定见 **[docs/HARDEN.md](docs/HARDEN.md)**（铸造三层、soft-disable、sticky、Clash 不掐连接、性能默认）。
+
+要点速查：
+
+- 铸造：`device → authcode → browser`；`cpa_probe_after_write=false`
+- 耗尽：只 `disabled`，**不删** CPA 文件；恢复默认 6h 滚动
+- CLIProxy：`session-affinity=true` + 较长 TTL；`set_cliproxy_routing.py cache`
+- Clash：`clash_close_conns=false`、`clash_force_global=false`
+- 号池大时：`concurrent_count=1`，`quota_watch_poll_sec≥15`
+
 ## 当前域名（config.defaultDomains）
 
 ```
@@ -94,7 +106,9 @@ Get-ScheduledTask | ? TaskName -like 'Grok*'
 | GrokRegisterAuto | 登录常驻 | 后台 auto 补号 |
 | CLIProxyAPI-Local | 登录常驻 | 本地 8317 |
 
-`pool_maintain` 已内置：临期 token 刷新 + 吊销 RT 清理（`pool_maintain_purge_dead`）。
+`pool_maintain` 已内置：临期 token 刷新。  
+**加固默认** `pool_maintain_purge_dead=false`（硬删会触发 CLIProxy REMOVE 风暴）；吊销 RT 用 soft-disable。  
+静默刷新也可由 `quota_watch` 周期调用 `refresh_pool.silent_refresh_pool`（见 `quota_watch_pool_refresh_*`）。
 
 ### 电源 / 睡眠 / 代理（补闭环缺口）
 

@@ -434,7 +434,10 @@ def print_human(snap: dict[str, Any]) -> None:
                     real.append(f"{n}:{r.get('pid')}")
             print(f"[*] 进程 {name}: {', '.join(real) if real else '未运行'}")
 
-    print("[*] 维持建议: 单批 2 并发补号；水位见 quota_watch_min/target_pool")
+    print(
+        "[*] 维持建议: 号池充足时 1 并发补号（见 docs/HARDEN.md）；"
+        "水位见 quota_watch_min/target_pool"
+    )
     print("[*] 路由切换: python set_cliproxy_routing.py status|pool|cache")
     print("[*] JSON: python pool_status.py --json [--procs]")
 

@@ -56,8 +56,11 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持将 SSO token 写入 grok2api 本地或远端池。
 - 支持注册后尝试开启 NSFW。
 - 支持 CPA xAI 凭证异步导出（默认独立 mint 浏览器，不占用注册页）。
+- 支持协议铸造：Device Flow → Auth-code PKCE fallback → 浏览器兜底。
+- 支持号池 soft-disable、静默 JWT 刷新、CLIProxy sticky 对接。
 - 支持日志级别（`quiet` / `info` / `debug`）与每分钟创建速度统计。
 - 支持页面卡住检测、当前账号重试、每账号浏览器重启和内存清理。
+- 自用加固基线见 [docs/HARDEN.md](docs/HARDEN.md)、号池运维见 [POOL.md](POOL.md)。
 
 ## 环境要求
 
@@ -222,14 +225,14 @@ Ctrl+C
 
 CLI 模式适合长时间批量运行。每个账号结束后会完整重启浏览器；另外每成功注册 5 个账号会做一次运行时内存清理。
 
-并发示例（在 `config.json` 中设置）：
+并发示例（在 `config.json` 中设置；号池已大时建议 1 并发，见 [docs/HARDEN.md](docs/HARDEN.md)）：
 
 ```json
 {
-  "register_count": 20,
-  "concurrent_count": 3,
+  "register_count": 4,
+  "concurrent_count": 1,
   "log_level": "info",
-  "speed_log_interval_sec": 60
+  "speed_log_interval_sec": 120
 }
 ```
 

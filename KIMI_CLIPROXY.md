@@ -14,12 +14,25 @@
 ```
 本机注册机 → cpa_auths / cli_live (xai-*.json)
                  ↓
-          CLIProxyAPI (:8317)  ← 多账号自动轮换/负载
+          CLIProxyAPI (:8317)  ← sticky + 额度 failover
                  ↓
      （可选）VPS NewAPI / 反代
                  ↓
           Kimi Code CLI  provider
 ```
+
+### CLIProxy 加固（本机 config.yaml）
+
+```yaml
+routing:
+  strategy: round-robin
+  session-affinity: true          # 粘会话，利于长对话
+  session-affinity-ttl: "4h"
+```
+
+切换：`python set_cliproxy_routing.py cache|pool|status`  
+号池侧配套：**soft-disable、禁止硬删 CPA**（见 [docs/HARDEN.md](docs/HARDEN.md)）。  
+Kimi 默认模型建议：`local-cpa/grok-4.5` → `http://127.0.0.1:8317/v1`。
 
 社区项目：[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)  
 Kimi Provider 文档：[Providers and Models](https://moonshotai.github.io/kimi-cli/en/configuration/providers.html)
