@@ -962,6 +962,8 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
 
 def write_local_grok_from_cpa(cpa_result, log_callback=None):
     """Write CPA OIDC tokens into ~/.grok/auth.json for local grok CLI."""
+    if str(os.environ.get("GROK_SKIP_LOCAL_AUTH", "")).strip() in ("1", "true", "yes", "on"):
+        return {"ok": False, "skipped": True, "reason": "GROK_SKIP_LOCAL_AUTH"}
     if not config.get("local_grok_auth_auto", False):
         return {"ok": False, "skipped": True, "reason": "disabled"}
     try:
@@ -2571,7 +2573,7 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         filled = _get_page().run_js(
-            """
+            r"""
 const email = arguments[0];
 function isVisible(node) {
     if (!node) return false;
@@ -3308,17 +3310,13 @@ return 'filled-no-submit';
                 token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                 if log_callback:
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
-                if token_len == "0":
-                    pause_seconds = random.uniform(1, 3)
-                    if log_callback:
-                        log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
-                    sleep_with_cancel(pause_seconds, cancel_callback)
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
-                # 卡住后自动二次复用 Turnstile 组件
-                if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                    if log_callback:
+                # Community-tuned: trigger Turnstile quickly (~1.2s) instead of
+                # idle-waiting 12s. Keep CapSolver/stale-token safeguards in getTurnstileToken.
+                if now - last_cf_retry_at >= 1.2:
+                    if log_callback and (now - wait_cf_since) >= 1.2:
                         log_callback("[*] Cloudflare 验证卡住，开始二次复用 Turnstile...")
                     try:
                         token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
@@ -3343,7 +3341,7 @@ return String(cfInput.value || '').trim().length;
                         if log_callback:
                             log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
                     last_cf_retry_at = now
-                sleep_with_cancel(0.8, cancel_callback)
+                sleep_with_cancel(0.45, cancel_callback)
                 continue
 
             if filled in ("ready-to-submit", "filled-no-submit"):
@@ -3408,8 +3406,8 @@ return 'submitted';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
-            if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
-                if log_callback:
+            if now - last_cf_retry_at >= 1.2:
+                if log_callback and (now - wait_cf_since) >= 1.2:
                     log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
                 try:
                     token = getTurnstileToken(log_callback=log_callback, cancel_callback=cancel_callback)
@@ -3434,7 +3432,7 @@ return String(cfInput.value || '').trim().length;
                     if log_callback:
                         log_callback(f"[Debug] Turnstile 二次复用失败: {cf_exc}")
                 last_cf_retry_at = now
-            sleep_with_cancel(0.8, cancel_callback)
+            sleep_with_cancel(0.45, cancel_callback)
             continue
 
         if submit_state == "submitted":
@@ -4064,9 +4062,11 @@ class GrokRegisterGUI:
                         verify_ip=bool(config.get("clash_verify_ip", False)),
                     )
                     if clash_node:
-                        log_fn(f"[*] 出口节点: {clash_node}")
+                        safe = str(clash_node).encode("ascii", "backslashreplace").decode("ascii")
+                        log_fn(f"[*] 出口节点: {safe}")
             except Exception as exc:
-                log_fn(f"[*] Clash 轮换跳过: {exc}")
+                safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+                log_fn(f"[*] Clash 轮换跳过: {safe}")
         try:
             return self._register_one_account_body(log_fn, worker_id, local_success, clash_node)
         except Exception:
@@ -4331,9 +4331,11 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
                     verify_ip=bool(config.get("clash_verify_ip", False)),
                 )
                 if clash_node:
-                    log_fn(f"[*] 出口节点: {clash_node}")
+                    safe = str(clash_node).encode("ascii", "backslashreplace").decode("ascii")
+                    log_fn(f"[*] 出口节点: {safe}")
         except Exception as exc:
-            log_fn(f"[*] Clash 轮换跳过: {exc}")
+            safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+            log_fn(f"[*] Clash 轮换跳过: {safe}")
     max_mail_retry = 3
     try:
         return _register_one_account_cli_body(

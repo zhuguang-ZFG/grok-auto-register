@@ -1,6 +1,6 @@
 ' Hidden launch quota_watch.py (python.exe window style 0)
 Option Explicit
-Dim sh, fso, root, py, script, procs, p, cl, cmd
+Dim sh, fso, root, py, script, procs, p, cl, cmd, logf
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 root = fso.GetParentFolderName(WScript.ScriptFullName)
@@ -18,6 +18,7 @@ For Each p In procs
 Next
 On Error GoTo 0
 sh.CurrentDirectory = root
-cmd = """" & py & """ -u """ & script & """"
+logf = root & "\logs\quota_watch.out.log"
+cmd = "cmd.exe /c """"" & py & """ -u """ & script & """ >> """ & logf & """ 2>&1"""
 sh.Run cmd, 0, False
 WScript.Quit 0

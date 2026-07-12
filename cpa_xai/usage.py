@@ -60,8 +60,16 @@ def mark_account_exhausted(
         data = json.loads(cpa_file.read_text(encoding="utf-8"))
         qs = data.setdefault("quota_state", {})
         now = time.time()
-        qs["exhausted_at"] = now
-        qs["recover_after"] = now + RESET_WINDOW_SEC
+        # Keep original recover window so repeated 429/probe marks cannot push
+        # recover_after forever into the future.
+        prev_recover = float(qs.get("recover_after") or 0)
+        if not qs.get("exhausted_at"):
+            qs["exhausted_at"] = now
+        if prev_recover and prev_recover > now:
+            # still within existing recovery window — only refresh reason/tokens
+            pass
+        else:
+            qs["recover_after"] = now + RESET_WINDOW_SEC
         if tokens_used:
             qs["tokens_used"] = tokens_used
         qs["limit"] = FREE_TIER_LIMIT
@@ -72,9 +80,11 @@ def mark_account_exhausted(
         _atomic_write_json(cpa_file, data)
         if log:
             email = data.get("email", cpa_file.name)
-            log(f"[quota] marked {email} exhausted+disabled (recovers in ~24h)")
-    except Exception:
-        pass
+            remain = int(max(0, float(qs.get("recover_after") or 0) - now))
+            log(f"[quota] marked {email} exhausted+disabled (recovers in ~{remain // 3600}h)")
+    except Exception as exc:
+        if log:
+            log(f"[quota] mark exhausted failed for {cpa_file.name}: {exc}")
 
 
 def is_account_recovered(cpa_file: Path) -> bool:

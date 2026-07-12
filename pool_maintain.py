@@ -91,20 +91,29 @@ def main() -> int:
 
         if need_refill:
             print(f"[*] refill start count={refill_count} concurrency={concurrency}")
-            # 无人值守：补号失败最多再试 1 次（网络抖动）
-            code = 1
-            for attempt in range(1, 3):
-                code = run(
-                    [
-                        py,
-                        str(ROOT / "grok_register_ttk.py"),
-                        "start",
-                    ],
-                    log,
-                )
-                print(f"[*] refill attempt={attempt} exit={code}")
-                if code == 0:
-                    break
+            # 注意：grok_register_ttk start 只读 config.register_count（通常为 1）。
+            # 以前 refill_count 只打印不用，导致 --force-refill 8 也只跑 1 次。
+            # 这里按 refill_count 连续调用 start；单次失败再重试 1 次。
+            ok_n = 0
+            fail_n = 0
+            for i in range(1, max(1, refill_count) + 1):
+                code = 1
+                for attempt in range(1, 3):
+                    code = run(
+                        [
+                            py,
+                            str(ROOT / "grok_register_ttk.py"),
+                            "start",
+                        ],
+                        log,
+                    )
+                    print(f"[*] refill {i}/{refill_count} attempt={attempt} exit={code}")
+                    if code == 0:
+                        ok_n += 1
+                        break
+                else:
+                    fail_n += 1
+            print(f"[*] refill summary ok={ok_n} fail={fail_n}")
             # 补完再健康同步一次
             if not args.skip_health:
                 code2 = run([py, str(ROOT / "pool_health.py")], log)

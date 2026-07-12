@@ -1332,5 +1332,11 @@ def mint_with_browser(
             except Exception:
                 pass
         if own_browser is not None:
-            close_standalone(own_browser)
-            release_mint_browser(owned=False, success=success, force_quit=True, log=log)
+            # owned=True: one-shot browser, always close.
+            # owned=False: TLS-reused mint browser — only count success and
+            # recycle when recycle_every is hit; do NOT force-quit every mint.
+            if owned:
+                close_standalone(own_browser)
+                release_mint_browser(owned=True, success=success, force_quit=True, log=log)
+            else:
+                release_mint_browser(owned=False, success=success, force_quit=False, log=log)

@@ -339,6 +339,13 @@ def write_from_config_and_cpa_result(
     *,
     log: LogFn | None = None,
 ) -> dict[str, Any]:
+    if str(os.environ.get("GROK_SKIP_LOCAL_AUTH", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return {"ok": False, "skipped": True, "reason": "GROK_SKIP_LOCAL_AUTH"}
     if not config.get("local_grok_auth_auto", False):
         return {"ok": False, "skipped": True, "reason": "disabled"}
     if not cpa_result or not cpa_result.get("ok"):

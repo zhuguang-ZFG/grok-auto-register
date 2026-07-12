@@ -194,10 +194,15 @@ def export_cpa_xai_for_account(
             cpa_dir.mkdir(parents=True, exist_ok=True)
             src = Path(result["path"])
             dst = cpa_dir / src.name
-            shutil.copy2(src, dst)
-            os.chmod(dst, 0o600)
-            result["cpa_path"] = str(dst)
-            log(f"[cpa] hotload copy -> {dst}")
+            if src.resolve() == dst.resolve():
+                # out_dir == hotload dir: already in place, skip self-copy
+                result["cpa_path"] = str(dst)
+                log(f"[cpa] hotload copy skipped (same file): {dst}")
+            else:
+                shutil.copy2(src, dst)
+                os.chmod(dst, 0o600)
+                result["cpa_path"] = str(dst)
+                log(f"[cpa] hotload copy -> {dst}")
         except Exception as e:  # noqa: BLE001
             log(f"[cpa] hotload copy failed: {e}")
             result["cpa_copy_error"] = str(e)

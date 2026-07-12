@@ -36,6 +36,20 @@ _LAST_NODE: Optional[str] = None
 _LAST_EXIT_IP: Optional[str] = None
 
 
+def _safe_log(log, msg: str) -> None:
+    """Avoid GBK console / pipe crashes on emoji node names."""
+    if not log:
+        return
+    try:
+        log(msg)
+    except Exception:
+        try:
+            log(str(msg).encode("ascii", "backslashreplace").decode("ascii"))
+        except Exception:
+            pass
+
+
+
 def _api_get(api: str, secret: str, path: str, timeout: float = 5.0) -> dict:
     h = {"Authorization": "Bearer " + secret} if secret else {}
     req = urllib.request.Request(api + path, headers=h)
@@ -247,13 +261,11 @@ def rotate_node(
 
         sel = _find_main_selector(api, secret)
         if not sel:
-            if log:
-                log("[clash] no main selector found")
+            _safe_log(log, "[clash] no main selector found")
             return None
         real, infos = _list_real_nodes(api, secret, sel)
         if not real:
-            if log:
-                log("[clash] no real proxy nodes available")
+            _safe_log(log, "[clash] no real proxy nodes available")
             return None
 
         if avoid is None:
@@ -294,8 +306,7 @@ def rotate_node(
 
         ok = _api_put(api, secret, "/proxies/" + urllib.request.quote(sel), {"name": chosen})
         if not ok:
-            if log:
-                log(f"[clash] failed to rotate to {chosen}")
+            _safe_log(log, f"[clash] failed to rotate to {chosen}")
             return None
 
         if close_conns:
@@ -309,18 +320,17 @@ def rotate_node(
             exit_ip = probe_exit_ip(proxy_port)
             if exit_ip:
                 _LAST_EXIT_IP = exit_ip
-                if log:
-                    log(f"[clash] rotated -> {chosen} (exit {exit_ip})")
-            elif log:
-                log(f"[clash] rotated -> {chosen} (exit IP verify failed)")
+                _safe_log(log, f"[clash] rotated -> {chosen} (exit {exit_ip})")
+            else:
+                _safe_log(log, f"[clash] rotated -> {chosen} (exit IP verify failed)")
         else:
-            if log:
-                log(f"[clash] rotated -> {chosen}")
+            _safe_log(log, f"[clash] rotated -> {chosen}")
 
         return chosen
     except Exception as exc:
-        if log:
-            log(f"[clash] rotate error: {exc}")
+        # Windows console may be GBK; node names often contain emoji flags.
+        msg = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+        _safe_log(log, f"[clash] rotate error: {msg}")
         return None
 
 

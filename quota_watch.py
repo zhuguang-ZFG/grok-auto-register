@@ -438,13 +438,16 @@ def pool_token_is_expired(payload: dict[str, Any]) -> bool:
 
 
 def count_valid_pool(cfg: dict[str, Any], *, probe: bool = False) -> int:
-    """数 cpa_auths/ 里未过期(JWT exp)的文件数。
+    """数 cpa_auths/ 里可用号：未 disabled、未过期(JWT exp)。
 
     probe=True 时再调 probe_token 验证一遍（较慢，默认关）。
+    disabled/quota-exhausted 账号不计入水位，否则 CLIProxy 出池后仍被当成活号。
     """
     valid = 0
     for p in list_cpa_pool(cfg):
         payload = load_json(p)
+        if payload.get("disabled"):
+            continue
         if pool_token_is_expired(payload):
             continue
         if probe:
@@ -547,6 +550,8 @@ def purge_dead_pool(
         if not rt:
             dead_dir.mkdir(parents=True, exist_ok=True)
             dest = dead_dir / p.name
+            if dest.exists():
+                dest = dead_dir / f"{p.stem}.{int(time.time())}{p.suffix}"
             try:
                 p.rename(dest)
                 stats["purged"] += 1
@@ -564,12 +569,13 @@ def purge_dead_pool(
             payload["expired"] = exp_s
             from datetime import datetime, timezone
             payload["last_refresh"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+            atomic_write_json(p, payload)
             stats["refreshed"] += 1
         except OAuthDeviceError:
             dead_dir.mkdir(parents=True, exist_ok=True)
             dest = dead_dir / p.name
+            if dest.exists():
+                dest = dead_dir / f"{p.stem}.{int(time.time())}{p.suffix}"
             try:
                 p.rename(dest)
                 stats["purged"] += 1
@@ -665,7 +671,12 @@ def try_rotate_from_pool(
     return {"ok": False, "skipped": True, "reason": "no_healthy_pool_entry"}
 
 
-def run_one_registration(cfg: dict[str, Any], *, log: LogFn | None = None) -> dict[str, Any]:
+def run_one_registration(
+    cfg: dict[str, Any],
+    *,
+    log: LogFn | None = None,
+    env_extra: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Spawn one register round with local_grok_auth_auto forced on."""
     if not cfg.get("quota_watch_register_on_miss", True):
         return {"ok": False, "skipped": True, "reason": "register_disabled"}
@@ -689,6 +700,11 @@ def run_one_registration(cfg: dict[str, Any], *, log: LogFn | None = None) -> di
     env = os.environ.copy()
     # Child process reloads config.json; ensure local write is on there (caller should set).
     env["GROK_QUOTA_WATCH_TRIGGER"] = "1"
+    if env_extra:
+        for k, v in env_extra.items():
+            if v is None:
+                continue
+            env[str(k)] = str(v)
     cmd = [py, str(script), *clean_args]
     timeout = float(cfg.get("quota_watch_register_timeout_sec") or 900)
     _log(log, f"[quota] spawning register: {' '.join(cmd)} (timeout={timeout:.0f}s)")
@@ -782,19 +798,15 @@ def topup_pool(
         own_pool = [p for p in pool if any(d in p.name for d in own_domains)]
     else:
         own_pool = pool
-    valid_n = sum(1 for p in own_pool if not pool_token_is_expired(load_json(p)))
+    def _is_usable(path: Path) -> bool:
+        payload = load_json(path)
+        if payload.get("disabled"):
+            return False
+        return not pool_token_is_expired(payload)
+
+    valid_n = sum(1 for p in own_pool if _is_usable(p))
     if valid_n >= target_pool:
         return {"ok": True, "skipped": True, "reason": f"pool_at_target(own_valid={valid_n}>={target_pool})"}
-    if valid_n >= min_pool:
-        # Above floor but below target — top up slowly toward target.
-        # The cooldown (topup_cooldown_sec) gates how fast we approach target.
-        _log(log, f"[quota] pool topping toward target: valid={valid_n} (min={min_pool}, target={target_pool})")
-    elif pool:
-        own_expired_n = len(own_pool) - valid_n
-        _log(log, f"[quota] pool low: own_valid={valid_n}<{min_pool} (own={len(own_pool)}, own_expired={own_expired_n}, total={len(pool)}) — topping up")
-    else:
-        _log(log, f"[quota] pool low: valid={valid_n}<{min_pool} (empty) — topping up")
-
     state.roll_day()
     max_day = int(cfg.get("quota_watch_pool_topup_max_per_day") or 30)
     if state.triggers_today >= max_day:
@@ -806,46 +818,60 @@ def topup_pool(
         remain = int(cooldown - (now - state.last_pool_topup_at))
         return {"ok": False, "skipped": True, "reason": f"topup cooldown {remain}s"}
 
+    if valid_n >= min_pool:
+        # Above floor but below target — top up slowly toward target.
+        _log(log, f"[quota] pool topping toward target: valid={valid_n} (min={min_pool}, target={target_pool})")
+    elif pool:
+        own_expired_n = len(own_pool) - valid_n
+        _log(log, f"[quota] pool low: own_valid={valid_n}<{min_pool} (own={len(own_pool)}, own_expired={own_expired_n}, total={len(pool)}) — topping up")
+    else:
+        _log(log, f"[quota] pool low: valid={valid_n}<{min_pool} (empty) — topping up")
+
     _log(log, f"[quota] spawning register: own_valid={valid_n}<{min_pool} (own={len(own_pool)}, total={len(pool)})")
 
     if dry_run:
         return {"ok": True, "dry_run": True, "reason": "pool_topup"}
 
-    # Snapshot the current auth.json so we can restore it after register.
-    auth_path = resolve_path(cfg.get("local_grok_auth_path"), default_auth_path())
-    auth_snapshot = None
-    if auth_path.is_file():
-        try:
-            auth_snapshot = auth_path.read_bytes()
-        except Exception:
-            auth_snapshot = None
+    # Snapshot pool size so success is judged by new cpa_auths files, not auth.json
+    # (topup intentionally avoids touching local grok CLI credential).
+    before_names = {p.name for p in list_cpa_pool(cfg)}
 
-    # Temporarily disable local_grok_auth_auto in config.json so the child
-    # register process does NOT overwrite auth.json. CPA export + grok2api pool
-    # writes still happen normally.
-    cfg_path = DEFAULT_CONFIG
-    cfg_backup = load_json(cfg_path)
-    cfg_patched = dict(cfg_backup)
-    cfg_patched["local_grok_auth_auto"] = False
-    atomic_write_json(cfg_path, cfg_patched)
+    # Tell the child register process to skip writing C:\Users\zhugu\.grok\auth.json
+    # via env flag — do NOT mutate shared config.json (race / hard-kill residue).
+    child_cfg = dict(cfg)
+    child_cfg["local_grok_auth_auto"] = False
+    env_extra = {"GROK_SKIP_LOCAL_AUTH": "1", "GROK_QUOTA_WATCH_TOPUP": "1"}
 
-    try:
-        result = run_one_registration(cfg_patched, log=log)
-    finally:
-        # Restore config.json + auth.json regardless of register outcome.
-        atomic_write_json(cfg_path, cfg_backup)
-        if auth_snapshot is not None:
-            try:
-                auth_path.write_bytes(auth_snapshot)
-            except Exception:
-                pass
+    result = run_one_registration(child_cfg, log=log, env_extra=env_extra)
+
+    after_paths = list_cpa_pool(cfg)
+    new_files = [p for p in after_paths if p.name not in before_names]
+    after_valid = sum(
+        1
+        for p in after_paths
+        if (not own_domains or any(d in p.name for d in own_domains)) and _is_usable(p)
+    )
+    # Success = new usable pool file appeared (auth.json is intentionally unchanged).
+    if new_files:
+        result = dict(result)
+        result["ok"] = True
+        result["email"] = result.get("email") or new_files[-1].name
+        result["new_files"] = [p.name for p in new_files]
+        result["error"] = ""
+    elif result.get("ok"):
+        # Child claimed ok only because old auth.json still had a token — demote.
+        result = dict(result)
+        result["ok"] = False
+        result["error"] = result.get("error") or "topup produced no new cpa_auths file"
 
     state.last_pool_topup_at = now
+    state.triggers_today = int(state.triggers_today or 0) + 1
     if result.get("ok"):
-        after_valid = sum(1 for p in list_cpa_pool(cfg)
-                         if not pool_token_is_expired(load_json(p))
-                         and (not own_domains or any(d in p.name for d in own_domains)))
-        _log(log, f"[quota] pool topped up (own): valid {valid_n} -> {after_valid} ({result.get('email')})")
+        _log(
+            log,
+            f"[quota] pool topped up (own): valid {valid_n} -> {after_valid} "
+            f"({result.get('email')}) new={result.get('new_files')}",
+        )
     else:
         _log(log, f"[quota] pool topup register failed: {result.get('error')}")
     state.save()
@@ -979,7 +1005,38 @@ def mark_exhausted_from_hits(
         by_email[p.name.lower()] = p
 
     targets: list[Path] = []
-    if prefer_email:
+    # Always prefer emails / filenames mentioned in the hit text first.
+    # prefer_email (local grok CLI auth.json) is only a last resort and only
+    # when hits look like local-CLI errors, not CLIProxy pool-level cooldown.
+    email_re = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+    file_re = re.compile(r"xai-[a-zA-Z0-9._%+\-@]+\.json", re.I)
+    found: set[str] = set()
+    for h in hits:
+        for m in email_re.findall(h):
+            found.add(m.lower())
+        for m in file_re.findall(h):
+            found.add(m.lower())
+    for em in found:
+        if em in by_email:
+            targets.append(by_email[em])
+        else:
+            for p in pool:
+                if em in p.name.lower():
+                    targets.append(p)
+                    break
+
+    # Pool-level phrases must never disable the local auth email by default.
+    pool_level_markers = (
+        "all credentials for model",
+        "model_cooldown",
+        "cooling down",
+        "no available auth",
+        "no available credential",
+    )
+    hits_blob = "\n".join(hits).lower()
+    pool_level = any(m in hits_blob for m in pool_level_markers)
+
+    if not targets and prefer_email and not pool_level:
         pe = prefer_email.strip().lower()
         for p in pool:
             if pe and pe in p.name.lower():
@@ -987,20 +1044,6 @@ def mark_exhausted_from_hits(
                 break
         if not targets and pe in by_email:
             targets.append(by_email[pe])
-
-    if not targets:
-        email_re = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-        found: set[str] = set()
-        for h in hits:
-            for m in email_re.findall(h):
-                found.add(m.lower())
-        for em in found:
-            if em in by_email:
-                targets.append(by_email[em])
-            else:
-                for p in pool:
-                    if em in p.name.lower():
-                        targets.append(p)
 
     seen: set[str] = set()
     for p in targets:
@@ -1325,7 +1368,11 @@ def once(
             _own_pool = [p for p in _all_pool if any(d in p.name for d in _own_doms)]
         else:
             _own_pool = _all_pool
-        pool_n = sum(1 for p in _own_pool if not pool_token_is_expired(load_json(p)))
+        pool_n = sum(
+            1
+            for p in _own_pool
+            if not load_json(p).get("disabled") and not pool_token_is_expired(load_json(p))
+        )
         if pool_n < min_pool:
             topup = topup_pool(cfg, state, log=log)
             if topup.get("ok") and not topup.get("skipped"):
