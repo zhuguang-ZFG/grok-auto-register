@@ -31,6 +31,57 @@ def _load_cfg() -> dict[str, Any]:
         return {}
 
 
+def _mint_log_stats(log_path: Path, *, max_bytes: int = 400_000) -> dict[str, Any]:
+    """Count protocol/browser mint signals since last RESTART marker."""
+    out: dict[str, Any] = {
+        "log": str(log_path),
+        "ok": False,
+        "since_marker": None,
+        "mint_start": 0,
+        "protocol_ok": 0,
+        "protocol_fail": 0,
+        "egress_rotated": 0,
+        "browser_allow": 0,
+        "export_ok_protocol": 0,
+        "export_ok_browser": 0,
+    }
+    if not log_path.is_file():
+        out["error"] = "missing"
+        return out
+    try:
+        raw = log_path.read_bytes()
+        if len(raw) > max_bytes:
+            raw = raw[-max_bytes:]
+        text = raw.decode("utf-8", errors="replace")
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+    marker = "===== RESTART"
+    idx = text.rfind(marker)
+    if idx >= 0:
+        # capture marker line for human display
+        line_end = text.find("\n", idx)
+        out["since_marker"] = text[idx : line_end if line_end > idx else idx + 80].strip()[:120]
+        chunk = text[idx:]
+    else:
+        chunk = text
+        out["since_marker"] = "(no RESTART marker; whole tail)"
+    low = chunk.lower()
+    out["mint_start"] = low.count("mint start:")
+    out["protocol_ok"] = low.count("protocol mint ok")
+    out["protocol_fail"] = low.count("protocol mint failed")
+    out["egress_rotated"] = low.count("mint egress rotated")
+    out["browser_allow"] = chunk.count("clicked REAL exact")
+    out["export_ok_protocol"] = low.count("export ok method=protocol") + low.count(
+        "method=protocol path="
+    )
+    out["export_ok_browser"] = low.count("export ok method=browser") + low.count(
+        "method=browser path="
+    )
+    out["ok"] = True
+    return out
+
+
 def _list_procs(pattern: str) -> list[dict[str, Any]]:
     """Match process command lines on Windows via CIM (python only)."""
     ps = (
@@ -81,12 +132,22 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
             "defaultDomains": cfg.get("defaultDomains"),
             "quota_watch_min_pool": cfg.get("quota_watch_min_pool"),
             "quota_watch_target_pool": cfg.get("quota_watch_target_pool"),
+            "own_register_target": cfg.get("own_register_target")
+            or cfg.get("quota_watch_target_pool"),
             "cpa_mint_workers": cfg.get("cpa_mint_workers"),
+            "cpa_prefer_protocol": cfg.get("cpa_prefer_protocol"),
+            "cpa_mint_rotate_egress": cfg.get("cpa_mint_rotate_egress"),
+            "cpa_mint_rotate_on_tls": cfg.get("cpa_mint_rotate_on_tls"),
+            "cpa_protocol_attempts": cfg.get("cpa_protocol_attempts"),
             "anti_detect_viewport": cfg.get("anti_detect_viewport"),
             "anti_detect_tz_locale": cfg.get("anti_detect_tz_locale"),
             "anti_detect_ua_pool": cfg.get("anti_detect_ua_pool"),
+            "pool_prefer_mode": cfg.get("pool_prefer_mode"),
         },
     }
+
+    # recent mint path stats from register log (since last RESTART marker)
+    snap["mint_log"] = _mint_log_stats(ROOT / "logs" / "register_auto.out.log")
 
     # accounts
     acc_files = sorted(ROOT.glob("accounts_*.txt"), key=lambda p: p.stat().st_mtime)
@@ -281,11 +342,39 @@ def print_human(snap: dict[str, Any]) -> None:
             f"[*] 池分层: 自有域≈{cpa.get('own_files')} | 缓冲域≈{cpa.get('buffer_files')} "
             f"| prefer={mode} ({hint})"
         )
+        target = int((snap.get("config") or {}).get("own_register_target") or 0)
+        if not target:
+            try:
+                target = int(
+                    json.loads((ROOT / "config.json").read_text(encoding="utf-8")).get(
+                        "own_register_target"
+                    )
+                    or snap.get("config", {}).get("quota_watch_target_pool")
+                    or 0
+                )
+            except Exception:
+                target = int((snap.get("config") or {}).get("quota_watch_target_pool") or 0)
+        if target:
+            own_n = int(cpa.get("own_files") or 0)
+            gap = max(0, target - own_n)
+            pct = min(100.0, 100.0 * own_n / target) if target else 0
+            print(f"[*] 自有域进度: {own_n}/{target} ({pct:.1f}%) 还差 {gap}")
     if cpa.get("domains"):
         top = ", ".join(f"{d}={n}" for d, n in list(cpa["domains"].items())[:8])
         print(f"[*] CPA 域名分布: {top}")
 
     print(snap.get("domain_health_line") or "[*] 域名健康: n/a")
+
+    ml = snap.get("mint_log") or {}
+    if ml.get("ok"):
+        print(
+            f"[*] 铸造日志(自 {ml.get('since_marker') or '?'}): "
+            f"start={ml.get('mint_start')} protocol_ok={ml.get('protocol_ok')} "
+            f"protocol_fail={ml.get('protocol_fail')} egress_rot={ml.get('egress_rotated')} "
+            f"browser_allow={ml.get('browser_allow')}"
+        )
+    elif ml.get("error"):
+        print(f"[*] 铸造日志: n/a ({ml.get('error')})")
 
     route = snap.get("cliproxy_routing") or {}
     if route.get("error"):
