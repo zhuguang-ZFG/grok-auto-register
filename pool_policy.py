@@ -41,10 +41,63 @@ def buffer_domains(cfg: dict[str, Any]) -> list[str]:
 
 
 def prefer_mode(cfg: dict[str, Any]) -> str:
-    mode = str(cfg.get("pool_prefer_mode") or "own_first").strip().lower()
+    # Accept both historical keys: pool_prefer_mode and pool_prefer
+    mode = str(
+        cfg.get("pool_prefer_mode") or cfg.get("pool_prefer") or "own_first"
+    ).strip().lower()
     if mode in ("buffer", "buffer_first", "burn_buffer", "prefer_buffer"):
         return "buffer_first"
     return "own_first"
+
+
+def domain_matches(candidate: str, owned: str) -> bool:
+    """Exact domain or DNS subdomain suffix match (not bare substring).
+
+    own=ccwu.cc  →  mail.ccwu.cc OK, evil.ccwu.cc is OK as subdomain of ccwu.cc
+    but evilccwu.cc / notlima.cc.cd-style substring traps are rejected.
+    For apex equality: dom == owned.
+    """
+    cand = (candidate or "").strip().lower().lstrip(".")
+    own = (owned or "").strip().lower().lstrip(".")
+    if not cand or not own:
+        return False
+    return cand == own or cand.endswith("." + own)
+
+
+def is_own_email(email: str, cfg: dict[str, Any]) -> bool:
+    em = (email or "").strip().lower()
+    if "@" not in em:
+        return False
+    dom = em.rsplit("@", 1)[-1]
+    own = own_domains(cfg)
+    if not own:
+        # Fail-closed for hygiene: empty own list ⇒ nothing is "own"
+        # (avoids labeling all shared buffer as own when config is missing).
+        return False
+    return any(domain_matches(dom, d) for d in own)
+
+
+def tag_pool_source(payload: dict[str, Any], cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Stamp source=own|buffer for hygiene (CLIProxy ignores unknown fields)."""
+    cfg = cfg or {}
+    out = dict(payload)
+    em = str(out.get("email") or "").strip().lower()
+    if em and is_own_email(em, cfg):
+        out["source"] = "own"
+        out["pool_tier"] = "own"
+    else:
+        # Non-own domain or missing email → buffer (shared/import)
+        out["source"] = "buffer"
+        out["pool_tier"] = "buffer"
+    return out
+
+
+def watermark_own_only(cfg: dict[str, Any]) -> bool:
+    """When true, refill / heartbeat floor counts only own-domain CPA files."""
+    v = cfg.get("pool_watermark_own_only", True)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off")
+    return bool(v)
 
 
 def domain_of_path(path: Path | str) -> str:
@@ -57,9 +110,11 @@ def domain_of_path(path: Path | str) -> str:
 def is_own_path(path: Path | str, cfg: dict[str, Any]) -> bool:
     own = own_domains(cfg)
     if not own:
-        return True
+        return False
     dom = domain_of_path(path)
-    return any(d in dom or dom == d for d in own)
+    if not dom:
+        return False
+    return any(domain_matches(dom, d) for d in own)
 
 
 def is_buffer_path(path: Path | str, cfg: dict[str, Any]) -> bool:
@@ -68,7 +123,9 @@ def is_buffer_path(path: Path | str, cfg: dict[str, Any]) -> bool:
         if not buf:
             return True
         dom = domain_of_path(path)
-        return any(d in dom or dom == d for d in buf)
+        if not dom:
+            return True
+        return any(domain_matches(dom, d) for d in buf)
     return False
 
 
@@ -121,6 +178,26 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomic JSON write: tmp file + os.replace. Retries 3x on OSError."""
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+            return
+        except OSError:
+            time.sleep(0.05 * (attempt + 1))
+    raise OSError(f"atomic_write_json failed: {path}")
 
 
 def is_prefer_buffer_hold(data: dict[str, Any]) -> bool:

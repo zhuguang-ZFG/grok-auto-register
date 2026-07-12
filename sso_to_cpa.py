@@ -731,7 +731,7 @@ def main() -> int:
         _progress["running"] = 0
 
     print(
-        f"🚀 SSO → CPA auth: {total} 个, workers={workers}, delay={args.delay}s, "
+        f"[*] SSO -> CPA auth: {total} 个, workers={workers}, delay={args.delay}s, "
         f"task_timeout={task_timeout}s"
         + (f", proxy={PROXY}" if PROXY else ", proxy=off")
         + (", quiet" if args.quiet else "")

@@ -473,9 +473,29 @@ def count_valid_pool(cfg: dict[str, Any], *, probe: bool = False) -> int:
 
     probe=True 时再调 probe_token 验证一遍（较慢，默认关）。
     disabled/quota-exhausted 账号不计入水位，否则 CLIProxy 出池后仍被当成活号。
+
+    默认只计自有域名（pool_watermark_own_only / defaultDomains），缓冲共享包不抬水位。
     """
+    try:
+        from pool_policy import is_own_path, watermark_own_only
+    except Exception:
+        is_own_path = None  # type: ignore
+        watermark_own_only = lambda _c: True  # type: ignore
+
+    own_only = True
+    try:
+        own_only = bool(watermark_own_only(cfg))
+    except Exception:
+        own_only = True
+
     valid = 0
     for p in list_cpa_pool(cfg):
+        if own_only and is_own_path is not None:
+            try:
+                if not is_own_path(p, cfg):
+                    continue
+            except Exception:
+                pass
         payload = load_json(p)
         if payload.get("disabled"):
             continue
@@ -491,6 +511,31 @@ def count_valid_pool(cfg: dict[str, Any], *, probe: bool = False) -> int:
         valid += 1
     return valid
 
+
+
+def _is_own_cpa_path(path: Path, cfg: dict[str, Any], own_domains: list[str] | None = None) -> bool:
+    """Own-domain CPA path using suffix match (not substring)."""
+    try:
+        from pool_policy import is_own_path
+
+        return is_own_path(path, cfg)
+    except Exception:
+        pass
+    doms = own_domains
+    if doms is None:
+        doms = [d.strip().lower() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
+    if not doms:
+        return False
+    name = path.name.lower()
+    if "@" not in name:
+        return False
+    dom = name.rsplit("@", 1)[-1].removesuffix(".json")
+    try:
+        from pool_policy import domain_matches
+
+        return any(domain_matches(dom, d) for d in doms)
+    except Exception:
+        return any(dom == d or dom.endswith("." + d) for d in doms)
 
 def list_cpa_pool(cfg: dict[str, Any], *, drop_expired: bool = False) -> list[Path]:
     raw = str(cfg.get("cpa_auth_dir") or "cpa_auths")
@@ -750,7 +795,7 @@ def try_rotate_from_pool(
         ]
         if own_domains:
             own_first = [
-                p for p in candidates if any(d in p.name.lower() for d in own_domains)
+                p for p in candidates if _is_own_cpa_path(p, cfg, own_domains)
             ]
             other = [p for p in candidates if p not in own_first]
             candidates = own_first + other
@@ -929,11 +974,29 @@ def topup_pool(
     target_pool = int(cfg.get("quota_watch_target_pool") or max(min_pool, 20))
     # 水位只看自有域名（defaultDomains），打野凭证不计入补池判断
     pool = list_cpa_pool(cfg)
-    own_domains = [d.strip() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
-    if own_domains:
-        own_pool = [p for p in pool if any(d in p.name for d in own_domains)]
-    else:
-        own_pool = pool
+    try:
+        from pool_policy import is_own_path, own_domains as _own_doms_fn
+
+        _owns = _own_doms_fn(cfg)
+        if _owns:
+            own_pool = [p for p in pool if is_own_path(p, cfg)]
+        else:
+            own_pool = pool
+    except Exception:
+        own_domains = [d.strip() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
+        if own_domains:
+            from pool_policy import domain_matches
+
+            def _path_own(path):
+                name = path.name.lower()
+                if "@" not in name:
+                    return False
+                dom = name.rsplit("@", 1)[-1].removesuffix(".json")
+                return any(domain_matches(dom, d.lower()) for d in own_domains)
+
+            own_pool = [p for p in pool if _path_own(p)]
+        else:
+            own_pool = pool
     def _is_usable(path: Path) -> bool:
         payload = load_json(path)
         if payload.get("disabled"):
@@ -985,7 +1048,7 @@ def topup_pool(
     after_valid = sum(
         1
         for p in after_paths
-        if (not own_domains or any(d in p.name for d in own_domains)) and _is_usable(p)
+        if (not own_domains or _is_own_cpa_path(p, cfg, own_domains)) and _is_usable(p)
     )
     # Success = new usable pool file appeared (auth.json is intentionally unchanged).
     if new_files:
@@ -1590,7 +1653,7 @@ def once(
         _all_pool = list_cpa_pool(cfg)
         _own_doms = [d.strip() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
         if _own_doms:
-            _own_pool = [p for p in _all_pool if any(d in p.name for d in _own_doms)]
+            _own_pool = [p for p in _all_pool if _is_own_cpa_path(p, cfg, _own_doms)]
         else:
             _own_pool = _all_pool
         pool_n = sum(

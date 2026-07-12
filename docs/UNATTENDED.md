@@ -81,3 +81,59 @@ python ops_heartbeat.py --json --write logs/heartbeat.json
 - 合盖 + 某些 OEM 仍可能进连接待机 → 任务暂停；真要铁 7×24 用小 VPS。  
 - 代理节点全挂时，注册/铸造会失败；health 只能换节点，不能造节点。  
 - 本方案 **不** 提高并发、不改 buffer_first 策略。
+
+
+## 5. 号池闭环（死号隔离）
+
+共享批次 RT 被吊销后，JWT 未过期也会让 CLIProxy sticky 整分钟 reselect。
+
+- 日常：`GrokPoolMaintain` 会跑 `refresh_pool --purge-dead` + `scripts/hard_purge_pool.py`（真刷新全池，revoked/disabled 移到 `cpa_auths_dead/`）。
+- 手动：`python scripts/hard_purge_pool.py`
+- 水位：`quota_watch_min_pool` / `pool_min_live` 只看可续期号；自有 4 域继续补到 target。
+- 心跳：计划任务 `GrokOpsHeartbeat` 每 15 分钟写 `logs/heartbeat.json`。
+
+
+## 6. 死号 vs 额度冷却（勿混淆）
+
+| 状态 | 位置 | 处理 |
+|------|------|------|
+| `refresh_revoked` / no RT / bad_json | `cpa_auths_dead/` | 真死，hard_purge 搬走 |
+| `free-usage-exhausted` | **留在** `cpa_auths/` 且 `disabled:true` | 冷却后 `quota_watch` re-enable |
+| 共享缓冲 RT 吊销 | dead | 正常，别当自有水位 |
+
+手动:
+```bat
+python scripts/hard_purge_pool.py
+python scripts/rescue_quota_holds.py --own-only
+python scripts/rescue_quota_holds.py --own-only --reenable-ready
+```
+
+
+## 7. P0 缓冲 hygiene + 导入熔断（2026-07-12）
+
+- **水位只计自有域**：`pool_watermark_own_only=true`（`ops_heartbeat` / `count_valid_pool`）。缓冲共享包不抬 `min_live`。
+- **source 标记**：CPA JSON 写 `source=own|buffer`（CLIProxy 忽略未知字段）。导入脚本会打 `buffer`。
+- **导入熔断**：
+  ```bat
+  python scripts/import_cpa_with_probe.py D:\Downloads\pack.zip
+  python scripts/import_cpa_with_probe.py D:\DownloadsÀx-cpa.txt --sample 30 --min-ok-rate 0.7
+  ```
+  抽检 RT ok 率 < 阈值 → **不写入 live**（exit 3）。`--force` 可强行导入。
+- **存量 SSO 补 CPA**：
+  ```bat
+  python scripts/backfill_cpa_xai_from_accounts.py --limit 5
+  python scripts/export_cpa_xai_from_grok_auth.py
+  ```
+- **prefer**：`pool_prefer=own_first`（与 `pool_prefer_mode` 同义兼容）。
+
+
+## P1 hard_purge + import survivors (2026-07-13)
+
+- **hard_purge default scope=buffer**, max 500/run, maintain interval **6h** (`pool_maintain_hard_purge_every_hours`).
+- Unknown `disabled` with RT is **probed** (not forever hold).
+- **import_cpa_with_probe**: sample fuse, then `--refresh-all` (default) only writes RT-ok survivors.
+  ```bat
+  python scripts/import_cpa_with_probe.py D:/Downloads\pack.zip
+  python scripts/hard_purge_pool.py --scope buffer --max 500
+  python scripts/hard_purge_pool.py --scope all
+  ```

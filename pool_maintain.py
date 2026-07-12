@@ -13,6 +13,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -98,6 +99,55 @@ def main() -> int:
             )
             code_r = run(refresh_cmd, log)
             print(f"[*] refresh exit={code_r}")
+
+        # 1b) hard purge (throttled): default scope=buffer, every N hours
+        # soft refresh_pool only touches expiring JWTs; hard_purge catches
+        # revoked RT while access JWT still unexpired (shared packs).
+        if purge_dead and (ROOT / "scripts" / "hard_purge_pool.py").is_file():
+            # hours between runs (default 6). 0 = every maintain cycle. -1/false skip.
+            hard_hours = cfg.get("pool_maintain_hard_purge_every_hours", 6)
+            try:
+                hard_hours = float(hard_hours)
+            except Exception:
+                hard_hours = 6.0
+            # legacy key: every N maintain cycles — if set to 0, skip
+            hard_every_legacy = cfg.get("pool_maintain_hard_purge_every", None)
+            if hard_every_legacy is not None and int(hard_every_legacy or 0) == 0:
+                hard_hours = -1.0
+            run_hard = False
+            if hard_hours < 0:
+                print("[*] hard_purge skipped (disabled in config)")
+            elif hard_hours == 0:
+                run_hard = True
+            else:
+                stamp = LOG_DIR / "_hard_purge_last.json"
+                last_ts = 0.0
+                if stamp.is_file():
+                    try:
+                        last_ts = float(json.loads(stamp.read_text(encoding="utf-8")).get("ts") or 0)
+                    except Exception:
+                        last_ts = 0.0
+                age_h = (time.time() - last_ts) / 3600.0 if last_ts else 1e9
+                if age_h >= hard_hours:
+                    run_hard = True
+                    print(f"[*] hard_purge due (age={age_h:.1f}h >= {hard_hours}h)")
+                else:
+                    print(f"[*] hard_purge skip (age={age_h:.1f}h < {hard_hours}h)")
+            if run_hard:
+                scope = str(cfg.get("pool_hard_purge_scope") or "buffer")
+                hard_cmd = [
+                    py,
+                    str(ROOT / "scripts" / "hard_purge_pool.py"),
+                    "--scope",
+                    scope,
+                ]
+                max_n = int(cfg.get("pool_hard_purge_max") or 0)
+                if max_n > 0:
+                    hard_cmd.extend(["--max", str(max_n)])
+                print(f"[*] hard_purge_pool scope={scope}")
+                code_h = run(hard_cmd, log)
+                print(f"[*] hard_purge exit={code_h}")
+
 
         if not args.skip_health:
             code = run([py, str(ROOT / "pool_health.py")], log)

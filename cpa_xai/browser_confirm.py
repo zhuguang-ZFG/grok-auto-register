@@ -193,6 +193,8 @@ def create_standalone_page(
             "--no-first-run",
             "--disable-background-networking",
             "--window-size=1280,900",
+            # Do NOT set global --window-position here (can affect wrong Chrome).
+            # Hide via page.set.window after launch instead.
         ):
             opts.set_argument(flag)
         ext = str(_pkg_root / "turnstilePatch")
@@ -245,6 +247,19 @@ def create_standalone_page(
             browser = Chromium(opts)
             page = browser.latest_tab
             log("standalone chromium started")
+            # Instance-only hide (never global Chrome flags / taskkill)
+            try:
+                from grok_register_ttk import apply_register_window_hide  # type: ignore
+
+                apply_register_window_hide(browser, page, log_callback=log)
+            except Exception as he:  # noqa: BLE001
+                try:
+                    win = getattr(getattr(page, "set", None), "window", None)
+                    if win is not None and hasattr(win, "location"):
+                        win.location(-32000, -32000)
+                        log("mint window moved off-screen")
+                except Exception:
+                    log(f"mint window hide skipped: {he}")
             return browser, page
         except Exception as e:
             log(f"chromium start attempt {_attempt+1}/3 failed: {e}")

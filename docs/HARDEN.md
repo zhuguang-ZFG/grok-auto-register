@@ -119,3 +119,20 @@ curl -s -m 10 -x http://127.0.0.1:7897 "https://cli-chat-proxy.grok.com/v1/model
 - `set_cliproxy_routing.py` / `POOL.md` / `KIMI_CLIPROXY.md`
 - 最新本机快照（无密钥）：[STATUS.md](STATUS.md)
 - Clash 专用组步骤：[CLASH_ISOLATE.md](CLASH_ISOLATE.md)
+
+
+## Import fuse
+
+`python scripts/import_cpa_with_probe.py <pack>` — sample RT refresh; abort if ok_rate < 0.7. Watermark counts **own domains only** (`pool_watermark_own_only`).
+
+
+## P1 hard_purge + import survivors (2026-07-13)
+
+- **hard_purge default scope=buffer**, max 500/run, maintain interval **6h** (`pool_maintain_hard_purge_every_hours`).
+- Unknown `disabled` with RT is **probed** (not forever hold).
+- **import_cpa_with_probe**: sample fuse, then `--refresh-all` (default) only writes RT-ok survivors.
+  ```bat
+  python scripts/import_cpa_with_probe.py D:/Downloads\pack.zip
+  python scripts/hard_purge_pool.py --scope buffer --max 500
+  python scripts/hard_purge_pool.py --scope all
+  ```

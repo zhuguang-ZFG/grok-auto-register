@@ -63,14 +63,46 @@ def list_matching(pattern: str) -> list[dict[str, Any]]:
     return list(data or [])
 
 
-def count_live_pool(auth_dir: Path) -> tuple[int, int]:
-    """Return (live_est, total_xai). live = not disabled. No JWT probe."""
+def count_live_pool(auth_dir: Path, cfg: dict[str, Any] | None = None) -> tuple[int, int]:
+    """Return (live_est, total_xai). live = not disabled. No JWT probe.
+
+    Own-domain watermark only when *explicit* cfg enables it **and** lists
+    defaultDomains/own_domains. Bare ``count_live_pool(dir)`` (tests / ad-hoc)
+    never loads project config.toml side effects — empty cfg ⇒ count all
+    non-disabled files (backward compatible).
+    """
     if not auth_dir.is_dir():
         return 0, 0
+
+    # None → empty (do NOT auto-load project config: breaks unit tests and
+    # makes live_est depend on whoever's cwd config.json).
+    # Callers that want watermark must pass cfg (build_heartbeat does).
+    if cfg is None:
+        cfg = {}
+
+    is_own_path = None
+    own_only = False
+    try:
+        from pool_policy import is_own_path as _iop
+        from pool_policy import own_domains, watermark_own_only
+
+        is_own_path = _iop
+        # Only filter when watermark on AND own domain list is non-empty.
+        own_only = bool(watermark_own_only(cfg)) and bool(own_domains(cfg))
+    except Exception:
+        is_own_path = None
+        own_only = False
+
     total = 0
     live = 0
     for p in auth_dir.glob("xai-*.json"):
         total += 1
+        if own_only and is_own_path is not None:
+            try:
+                if not is_own_path(p, cfg):
+                    continue
+            except Exception:
+                pass
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
@@ -142,7 +174,7 @@ def build_heartbeat(
     cpa_dir = Path(cpa_raw)
     if not cpa_dir.is_absolute():
         cpa_dir = root / cpa_dir
-    live, total = count_live_pool(cpa_dir)
+    live, total = count_live_pool(cpa_dir, cfg)
     min_live = min_live_from_cfg(cfg)
 
     alerts: list[str] = []

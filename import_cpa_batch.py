@@ -173,6 +173,24 @@ def import_paths(
             skipped.append([src, f"jwt_expired exp={exp}"])
             continue
         payload = normalize_payload(d, exp=exp or 0)
+        try:
+            from pool_policy import tag_pool_source
+
+            cfg_local: dict[str, Any] = {}
+            cfg_path = ROOT / "config.json"
+            if cfg_path.is_file():
+                cfg_local = json.loads(cfg_path.read_text(encoding="utf-8"))
+            payload = tag_pool_source(payload, cfg_local)
+            # Shared zip imports are buffer unless domain is own
+            if payload.get("source") != "own":
+                payload["source"] = "buffer"
+                payload["pool_tier"] = "buffer"
+                payload["imported_at"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+        except Exception:
+            payload.setdefault("source", "buffer")
+            payload.setdefault("pool_tier", "buffer")
         email = payload["email"]
         if not email:
             stats["no_email"] += 1

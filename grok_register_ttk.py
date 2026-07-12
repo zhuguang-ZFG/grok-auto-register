@@ -98,6 +98,10 @@ DEFAULT_CONFIG = {
     "cpa_mint_queue_max": -1,
     "cpa_mint_queue_block_sec": 30,
     "browser_use_custom_ua": False,
+    # 注册/铸造浏览器移出屏幕，避免抢焦点挡操作（仍是有头，非 headless）
+    "hide_window": True,
+    # 可选：网络层拦图片/字体/媒体省带宽（默认关，验证页慎开）
+    "block_media_fonts": False,
     "log_level": "info",
     "speed_log_interval_sec": 60,
     "auto_pipeline": True,
@@ -1234,7 +1238,31 @@ def create_browser_options():
         "--disable-blink-features=AutomationControlled",
     ):
         options.set_argument(flag)
-    # 仅显式配置 proxy 时写入；TUN 模式保持空
+    # Optional slim flags (community register_cli / TabPool path). Default off —
+    # aggressive flags like --disable-images can hurt signup UX; enable via config.
+    if config.get("chromium_slim", False):
+        for flag in (
+            "--mute-audio",
+            "--disable-background-networking",
+            "--disable-dev-shm-usage",
+            "--disable-software-rasterizer",
+        ):
+            try:
+                options.set_argument(flag)
+            except Exception:
+                pass
+    # Mild always-on resource trims (safe with current CF success rate)
+    if config.get("chromium_mute_audio", True):
+        try:
+            options.set_argument("--mute-audio")
+        except Exception:
+            pass
+    # 藏窗：仅影响本进程启动的隔离 profile Chromium，不动日常 Chrome
+    if config.get("hide_window", True):
+        try:
+            options.set_argument("--window-position=-32000,-32000")
+        except Exception:
+            pass
     proxy = str(config.get("proxy", "") or "").strip()
     if proxy:
         try:
@@ -1277,6 +1305,102 @@ def create_browser_options():
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
+
+
+def _is_daily_chrome_profile(ud: str) -> bool:
+    """True if path looks like the user's normal Chrome/Edge profile (do not hide)."""
+    udn = os.path.normcase(os.path.abspath(str(ud)))
+    # Explicit allow: our project profiles + DrissionPage auto temp ports
+    if ".browser_profiles" in udn:
+        return False
+    if "drissionpage" in udn and "autoportdata" in udn:
+        return False
+    if "drissionpage" in udn and "userdata" in udn:
+        return False
+    # Deny real daily browsers
+    markers = (
+        r"\google\chrome\user data",
+        r"\microsoft\edge\user data",
+        r"\chrome\user data",
+    )
+    return any(m in udn for m in markers)
+
+
+def apply_register_window_hide(browser=None, page=None, log_callback=None) -> bool:
+    """Hide ONLY this DrissionPage browser window (off-screen / CDP hide).
+
+    Instance-scoped: only the browser/page we just launched. Refuses known
+    daily Chrome/Edge User Data paths. Allows .browser_profiles and
+    Temp\\DrissionPage\\autoPortData (isolated automation profiles).
+    """
+    if not config.get("hide_window", True):
+        return False
+    br = browser if browser is not None else _get_browser()
+    pg = page if page is not None else _get_page()
+    if br is None and pg is None:
+        return False
+
+    def _log(msg: str) -> None:
+        if log_callback:
+            try:
+                log_callback(msg)
+            except Exception:
+                pass
+
+    try:
+        ud = getattr(br, "user_data_path", None) if br is not None else None
+        if ud and _is_daily_chrome_profile(ud):
+            _log(f"[!] hide_window skipped: refuses daily browser profile ({ud})")
+            return False
+        if ud:
+            _log(f"[Debug] hide_window profile={ud}")
+    except Exception:
+        pass
+
+    # Prefer page.set.window (CDP) — instance scoped only
+    targets = []
+    if pg is not None:
+        targets.append(("page", pg))
+    if br is not None:
+        targets.append(("browser", br))
+    last_err = None
+    for label, obj in targets:
+        try:
+            win = getattr(getattr(obj, "set", None), "window", None)
+            if win is None:
+                continue
+            # location first: more reliable than hide() on some Windows builds
+            if hasattr(win, "location"):
+                try:
+                    win.normal()
+                except Exception:
+                    pass
+                try:
+                    win.location(-32000, -32000)
+                    _log(f"[*] 注册浏览器已移出屏幕(set.window.location via {label})")
+                    return True
+                except Exception as e:
+                    last_err = e
+            if hasattr(win, "hide"):
+                try:
+                    win.hide()
+                    _log(f"[*] 注册浏览器已隐藏(set.window.hide via {label})")
+                    return True
+                except Exception as e:
+                    last_err = e
+            if hasattr(win, "mini"):
+                try:
+                    win.mini()
+                    _log(f"[*] 注册浏览器已最小化(set.window.mini via {label})")
+                    return True
+                except Exception as e:
+                    last_err = e
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err and log_callback:
+        _log(f"[!] hide_window failed: {last_err}")
+    return False
 
 
 def _build_request_kwargs(**kwargs):
@@ -2407,6 +2531,7 @@ def start_browser(log_callback=None):
             _set_page(tabs[-1] if tabs else _get_browser().new_tab())
             if log_callback and getattr(_get_browser(), "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {_get_browser().user_data_path}")
+            # start_browser 仍返回 (browser, page)；不再调用 apply_register_window_hide
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return _get_browser(), _get_page()
