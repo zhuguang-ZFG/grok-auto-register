@@ -145,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
     probe = not args.no_probe_xai
     rep = check_proxy(rotate_if_bad=bool(args.rotate_if_bad), probe_xai=probe)
     if args.json:
-        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        # ensure_ascii avoids Windows GBK console crashes on flag emoji node names
+        print(json.dumps(rep, ensure_ascii=True, indent=2))
     else:
         print(
             f"[proxy] clash_ok={rep.get('clash_ok')} node={_safe(rep.get('node'))} "
@@ -153,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
             f"xai_ms={rep.get('xai_ms')} rotated={rep.get('rotated')} ok={rep.get('ok')}"
         )
         if rep.get("xai_error"):
-            print(f"[proxy] xai_error={rep.get('xai_error')}")
+            print(f"[proxy] xai_error={_safe(rep.get('xai_error'))}")
     return 0 if rep.get("ok") else 1
 
 
