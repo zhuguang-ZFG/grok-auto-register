@@ -296,6 +296,8 @@ class WatchState:
     last_error: str = ""
     last_pool_topup_at: float = 0.0
     last_refresh_at: float = 0.0
+    last_sample_probe_at: float = 0.0
+    last_sample_live_ratio: float = 1.0
 
     @classmethod
     def load(cls, path: Path) -> "WatchState":
@@ -316,6 +318,8 @@ class WatchState:
         st.last_error = str(raw.get("last_error") or "")
         st.last_pool_topup_at = float(raw.get("last_pool_topup_at") or 0)
         st.last_refresh_at = float(raw.get("last_refresh_at") or 0)
+        st.last_sample_probe_at = float(raw.get("last_sample_probe_at") or 0)
+        st.last_sample_live_ratio = float(raw.get("last_sample_live_ratio") or 1.0)
         return st
 
     def save(self) -> None:
@@ -335,6 +339,8 @@ class WatchState:
                 "last_error": self.last_error,
                 "last_pool_topup_at": self.last_pool_topup_at,
                 "last_refresh_at": self.last_refresh_at,
+                "last_sample_probe_at": self.last_sample_probe_at,
+                "last_sample_live_ratio": self.last_sample_live_ratio,
                 "updated_at": _now_iso(),
             },
         )
@@ -1398,6 +1404,38 @@ def once(
         except Exception as exc:
             _log(log, f"[quota] reenable recovered error: {exc}")
 
+    # --- optional sample probe: scale water level by live ratio ---
+    sample_n = int(cfg.get("quota_watch_sample_probe_n") or 0)
+    sample_interval = float(cfg.get("quota_watch_sample_probe_interval_sec") or 900)
+    sample_info: dict[str, Any] | None = None
+    if sample_n > 0 and not dry_run:
+        now = time.time()
+        if (now - float(state.last_sample_probe_at or 0)) >= sample_interval:
+            try:
+                from pool_sample import estimate_live_count, sample_probe
+
+                sample_info = sample_probe(
+                    cfg,
+                    sample_n=sample_n,
+                    proxy=str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip()
+                    or None,
+                )
+                state.last_sample_probe_at = now
+                state.last_sample_live_ratio = float(sample_info.get("ratio") or 1.0)
+                _log(
+                    log,
+                    f"[quota] sample probe live={sample_info.get('live')}/"
+                    f"{sample_info.get('sampled')} ratio={state.last_sample_live_ratio:.2f} "
+                    f"pool_files={sample_info.get('pool_size')}",
+                )
+                report["sample_probe"] = {
+                    "live": sample_info.get("live"),
+                    "sampled": sample_info.get("sampled"),
+                    "ratio": state.last_sample_live_ratio,
+                }
+            except Exception as exc:
+                _log(log, f"[quota] sample probe error: {exc}")
+
     # --- pool water-level maintenance: top up cpa_auths/ without touching auth.json ---
     min_pool = int(cfg.get("quota_watch_min_pool") or 0)
     if min_pool > 0 and not dry_run:
@@ -1412,11 +1450,33 @@ def once(
             for p in _own_pool
             if not load_json(p).get("disabled") and not pool_token_is_expired(load_json(p))
         )
-        if pool_n < min_pool:
+        # Scale by last sample live ratio so dead-but-unexpired files don't block topup
+        effective_n = pool_n
+        if float(state.last_sample_live_ratio or 1.0) < 0.999:
+            try:
+                from pool_sample import estimate_live_count
+
+                effective_n = estimate_live_count(
+                    pool_n,
+                    {
+                        "ratio": state.last_sample_live_ratio,
+                        "sampled": sample_n,
+                    },
+                )
+            except Exception:
+                effective_n = pool_n
+            if effective_n != pool_n:
+                _log(
+                    log,
+                    f"[quota] water-level file_valid={pool_n} sample_est={effective_n} "
+                    f"(ratio={state.last_sample_live_ratio:.2f})",
+                )
+        if effective_n < min_pool:
             topup = topup_pool(cfg, state, log=log)
             if topup.get("ok") and not topup.get("skipped"):
                 report["pool_topup"] = {
                     "before_valid": pool_n,
+                    "before_effective": effective_n,
                     "email": topup.get("email"),
                 }
 

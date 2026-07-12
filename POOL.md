@@ -57,6 +57,25 @@ python pool_status.py                    # 含域名健康摘要
 # domain_health_fail_streak_demote / domain_health_demote_sec / domain_health_min_success_rate
 ```
 
+### CPA mint 工作池（R 注册 + M mint）
+
+异步 mint 默认走有界队列，避免每号一条无限线程：
+
+| 配置 | 含义 |
+|------|------|
+| `cpa_mint_workers` | mint 并发；`-1`=min(注册并发,4)；`0`=旧式无限线程 |
+| `cpa_mint_queue_max` | 队列上限；`-1`≈2×workers；满则同步回退 |
+| `cpa_mint_queue_block_sec` | 入队最长等待 |
+
+### 号池抽检水位
+
+`quota_watch` 可按间隔随机抽 `quota_watch_sample_probe_n` 个号做 `/models` 探测，用 live 比例缩放文件水位，避免「JWT 未过期但已死」挡住补号。
+
+### 抗检测 A/B
+
+- `anti_detect_viewport` / `anti_detect_tz_locale`：建议开（默认 True）
+- `anti_detect_ua_pool`：建议关（真 Chrome UA 更稳；乱换 UA 易触发 CF）
+
 ### CLIProxy 路由策略（缓存 vs 号池）
 
 | 命令 | 含义 |

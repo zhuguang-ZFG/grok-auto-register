@@ -57,7 +57,8 @@ DEFAULT_CONFIG = {
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "anti_detect_ua_pool": True,
+    # UA pool often hurts more than helps with real Chrome; viewport/tz safer A/B.
+    "anti_detect_ua_pool": False,
     "anti_detect_viewport": True,
     "anti_detect_tz_locale": True,
     "clash_rotate_per_account": True,
@@ -92,6 +93,10 @@ DEFAULT_CONFIG = {
     "browser_restart_every": 10,
     "cpa_probe_after_write": False,
     "cpa_mint_async": True,
+    # mint worker pool (community R+M): 0=legacy unbound threads; -1/auto=min(concurrent,4)
+    "cpa_mint_workers": -1,
+    "cpa_mint_queue_max": -1,
+    "cpa_mint_queue_block_sec": 30,
     "browser_use_custom_ua": False,
     "log_level": "info",
     "speed_log_interval_sec": 60,
@@ -1136,31 +1141,26 @@ def create_browser_options():
                 options.set_user_agent(ua)
             except Exception:
                 options.set_argument(f"--user-agent={ua}")
-    # 反检测：随机指纹（UA + 平台 + viewport + 时区 + 语言）
-    if config.get("anti_detect_ua_pool", True):
+    # 反检测：viewport / tz 可独立开；UA 池默认关（真浏览器 UA 更稳）。
+    want_ua = bool(config.get("anti_detect_ua_pool", False))
+    want_vp = bool(config.get("anti_detect_viewport", True))
+    want_tz = bool(config.get("anti_detect_tz_locale", True))
+    if want_ua or want_vp or want_tz:
         try:
-            from anti_detect import pick_fingerprint, TZ_OFFSETS
+            from anti_detect import pick_fingerprint
+
             fp = pick_fingerprint()
-            # UA + sec-ch-ua 客户端提示
-            try:
-                options.set_user_agent(fp.user_agent)
-            except Exception:
+            if want_ua:
+                try:
+                    options.set_user_agent(fp.user_agent)
+                except Exception:
+                    options.set_argument(f"--user-agent={fp.user_agent}")
                 options.set_argument(f"--user-agent={fp.user_agent}")
-            options.set_argument(f"--user-agent={fp.user_agent}")
-            # sec-ch-ua / platform 提示（Cloudflare 校验 UA 与 sec-ch-ua 一致性）
-            for header_val in (
-                f"sec-ch-ua={fp.sec_ch_ua}",
-                f"sec-ch-ua-platform=\"{fp.platform}\"",
-                f"sec-ch-ua-mobile=?0",
-                f"accept-language={fp.accept_language}",
-            ):
-                # 这些是 HTTP 头，不能直接作为 Chromium flag；保存到线程局部供请求层使用
-                pass
-            # 视口（Canvas/WebGL 指纹输入）
-            if config.get("anti_detect_viewport", True):
+            # 视口（Canvas/WebGL 指纹输入）— 可在无 UA 池时单独启用
+            if want_vp:
                 options.set_argument(f"--window-size={fp.window_size}")
-            # 时区 + 语言（影响 Date / Intl / navigator.language）
-            if config.get("anti_detect_tz_locale", True):
+            # 时区 + 语言
+            if want_tz:
                 options.set_argument(f"--lang={fp.lang_code}")
                 tz_env[0] = fp.timezone
             _thread_fp[0] = fp
@@ -1984,9 +1984,25 @@ _cpa_async_threads: list = []
 
 def _wait_cpa_async_threads(timeout=300, log_callback=None, skip_if_stopping=None):
     global _cpa_async_threads
+    # Prefer bounded mint pool if used
+    try:
+        from cpa_mint_pool import get_mint_pool
+
+        pool = get_mint_pool()
+        if pool.started:
+            pool.wait_done(
+                timeout=float(timeout or 0),
+                log=log_callback,
+                skip_if=skip_if_stopping,
+            )
+            if log_callback:
+                log_callback(pool.summary_line())
+            # still join any legacy threads
+    except Exception:
+        pass
     if skip_if_stopping and skip_if_stopping():
         timeout = min(float(timeout or 0), 5.0)
-        if log_callback:
+        if log_callback and _cpa_async_threads:
             log_callback(f"[*] 停止中，仅短暂等待 CPA mint 线程（{timeout:.0f}s）...")
     with _cpa_threads_lock:
         threads = [t for t in _cpa_async_threads if t.is_alive()]
@@ -2012,6 +2028,101 @@ def _wait_cpa_async_threads(timeout=300, log_callback=None, skip_if_stopping=Non
 def _track_cpa_async_thread(thread):
     with _cpa_threads_lock:
         _cpa_async_threads.append(thread)
+
+
+def _enqueue_cpa_mint(email, password, sso, log_fn, page=None):
+    """Async CPA mint via bounded worker pool when enabled; else legacy thread.
+
+    Returns cpa_result dict when sync; None when async queued.
+    """
+    if not config.get("cpa_export_enabled", True):
+        return None
+    cpa_async = bool(config.get("cpa_mint_async", True))
+    if not cpa_async:
+        log_fn("[*] 6. CPA xAI 导出 (同步)")
+        cpa_result = export_cpa_xai_for_account(
+            email, password, sso=sso, log_callback=log_fn, page=page
+        )
+        if cpa_result.get("ok"):
+            log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+        elif not cpa_result.get("skipped"):
+            log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+        return cpa_result
+
+    # async path
+    try:
+        from cpa_mint_pool import (
+            MintJob,
+            get_mint_pool,
+            resolve_queue_max,
+            resolve_worker_count,
+        )
+
+        workers = resolve_worker_count(config)
+    except Exception:
+        workers = 0
+
+    if workers > 0:
+        try:
+            from cpa_mint_pool import MintJob, get_mint_pool, resolve_queue_max
+
+            pool = get_mint_pool()
+            qmax = resolve_queue_max(config, workers)
+            pool.ensure_started(
+                workers=workers,
+                queue_max=qmax,
+                export_fn=export_cpa_xai_for_account,
+                write_local_fn=write_local_grok_from_cpa,
+                log=log_fn,
+            )
+            log_fn(f"[*] 6. CPA xAI 导出 (mint pool w={workers} qmax={qmax})")
+            block_sec = float(config.get("cpa_mint_queue_block_sec") or 30)
+            ok = pool.submit(
+                MintJob(
+                    email=email,
+                    password=password or "",
+                    sso=sso or "",
+                    log=log_fn,
+                    delay_sec=float(config.get("cpa_mint_delay_sec") or 5),
+                ),
+                block_sec=block_sec,
+                log=log_fn,
+            )
+            if not ok:
+                log_fn("[!] mint 队列满，回退同步导出")
+                cpa_result = export_cpa_xai_for_account(
+                    email, password, sso=sso, log_callback=log_fn, page=None
+                )
+                if cpa_result.get("ok"):
+                    log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
+                    write_local_grok_from_cpa(cpa_result, log_callback=log_fn)
+                elif not cpa_result.get("skipped"):
+                    log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+                return cpa_result
+            return None
+        except Exception as exc:
+            log_fn(f"[!] mint pool 不可用，回退旧异步线程: {exc}")
+
+    # legacy: unbounded daemon thread per account
+    log_fn("[*] 6. CPA xAI 导出 (异步线程)")
+    def _cpa_mint_bg():
+        time.sleep(float(config.get("cpa_mint_delay_sec") or 5))
+        try:
+            r = export_cpa_xai_for_account(
+                email, password, sso=sso, log_callback=log_fn, page=None
+            )
+            if r.get("ok"):
+                log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
+                write_local_grok_from_cpa(r, log_callback=log_fn)
+            elif not r.get("skipped"):
+                log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
+        except Exception as e:
+            log_fn(f"[!] CPA xAI 导出异常: {e}")
+
+    _t = threading.Thread(target=_cpa_mint_bg, daemon=True)
+    _t.start()
+    _track_cpa_async_thread(_t)
+    return None
 
 
 def _join_threads_interruptible(threads, should_stop=None, timeout=None, poll=0.5):
@@ -4229,39 +4340,9 @@ class GrokRegisterGUI:
             log_callback=log_fn, cancel_callback=self.should_stop
         )
         _cpa_page = _get_page()
-        cpa_result = None
-        if config.get("cpa_export_enabled", True):
-            cpa_async = bool(config.get("cpa_mint_async", True))
-            if cpa_async:
-                log_fn("[*] 6. CPA xAI 导出 (异步)")
-                _cpa_bg_page = None
-                def _cpa_mint_bg():
-                    time.sleep(5)
-                    try:
-                        r = export_cpa_xai_for_account(
-                            email, profile.get("password", ""), sso=sso,
-                            log_callback=log_fn, page=_cpa_bg_page,
-                        )
-                        if r.get("ok"):
-                            log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
-                            write_local_grok_from_cpa(r, log_callback=log_fn)
-                        elif not r.get("skipped"):
-                            log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
-                    except Exception as e:
-                        log_fn(f"[!] CPA xAI 导出异常: {e}")
-                _t = threading.Thread(target=_cpa_mint_bg, daemon=True)
-                _t.start()
-                _track_cpa_async_thread(_t)
-            else:
-                log_fn("[*] 6. CPA xAI 导出 (同步)")
-                cpa_result = export_cpa_xai_for_account(
-                    email, profile.get("password", ""), sso=sso,
-                    log_callback=log_fn, page=_cpa_page,
-                )
-                if cpa_result.get("ok"):
-                    log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
-                elif not cpa_result.get("skipped"):
-                    log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+        cpa_result = _enqueue_cpa_mint(
+            email, profile.get("password", ""), sso, log_fn, page=_cpa_page
+        )
         if config.get("enable_nsfw", True):
             log_fn("[*] 6. 开启 NSFW")
             nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log_fn)
@@ -4523,39 +4604,9 @@ def _register_one_account_cli_body(
         log_callback=log_fn, cancel_callback=stop_fn
     )
     _cpa_page = _get_page()
-    cpa_result = None
-    if config.get("cpa_export_enabled", True):
-        cpa_async = bool(config.get("cpa_mint_async", True))
-        if cpa_async:
-            log_fn("[*] 6. CPA xAI 导出 (异步)")
-            _cpa_bg_page = None
-            def _cpa_mint_bg():
-                time.sleep(5)
-                try:
-                    r = export_cpa_xai_for_account(
-                        email, profile.get("password", ""), sso=sso,
-                        log_callback=log_fn, page=_cpa_bg_page,
-                    )
-                    if r.get("ok"):
-                        log_fn(f"[+] CPA xAI 导出成功: {r.get('path', '')}")
-                        write_local_grok_from_cpa(r, log_callback=log_fn)
-                    elif not r.get("skipped"):
-                        log_fn(f"[!] CPA xAI 导出失败: {r.get('error', '未知错误')}")
-                except Exception as e:
-                    log_fn(f"[!] CPA xAI 导出异常: {e}")
-            _t = threading.Thread(target=_cpa_mint_bg, daemon=True)
-            _t.start()
-            _track_cpa_async_thread(_t)
-        else:
-            log_fn("[*] 6. CPA xAI 导出 (同步)")
-            cpa_result = export_cpa_xai_for_account(
-                email, profile.get("password", ""), sso=sso,
-                log_callback=log_fn, page=_cpa_page,
-            )
-            if cpa_result.get("ok"):
-                log_fn(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
-            elif not cpa_result.get("skipped"):
-                log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+    cpa_result = _enqueue_cpa_mint(
+        email, profile.get("password", ""), sso, log_fn, page=_cpa_page
+    )
     if config.get("enable_nsfw", True):
         log_fn("[*] 6. 开启 NSFW")
         nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log_fn)
