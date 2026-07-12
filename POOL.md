@@ -42,9 +42,13 @@ python sync_cli_live.py
 ```
 
 ```bash
+python status.py                 # 一键看板：号池+路由+进程+本机 auth
 python pool_status.py
+python pool_status.py --json     # 机器可读快照
+python pool_status.py --json --procs
 python pool_maintain.py
 python grok_register_ttk.py -n 6 -c 1 -y
+run_status.bat                   # Windows 快捷
 ```
 
 ### 域名健康与自动降权
