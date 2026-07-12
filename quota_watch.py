@@ -1,12 +1,15 @@
-"""Watch local Grok CLI quota / auth failures and auto-refill credentials.
+"""Watch local Grok CLI + CLIProxy quota failures and auto-rotate credentials.
 
 Flow:
-  detect exhausted (log keywords and/or CPA probe)
+  detect exhausted (Grok unified log and/or CLIProxy logs and/or CPA probe)
+    -> mark CPA file quota_state + disabled:true (CLIProxy drops it from pool)
     -> prefer rotate unused file from cpa_auths/ into ~/.grok/auth.json
     -> else run one registration round (CPA + local_grok_auth_auto)
+    -> re-enable accounts past recover_after so CLIProxy reloads them
     -> cooldown
 
-This targets the **official** auth.json / cli-chat-proxy path only.
+Kimi Code uses CLIProxy (127.0.0.1:8317) over the cpa_auths pool. Official
+Grok CLI still uses ~/.grok/auth.json. Both paths share the same CPA files.
 Third-party NewAPI noise (new_api_error, free-az 503, etc.) is ignored by default.
 """
 
@@ -49,6 +52,10 @@ DEFAULT_QUOTA_PATTERNS = [
     r"auth 401 attribution",
     r"sampler 401",
     r"agent response failed",
+    r"model_cooldown",
+    r"all credentials for model",
+    r"cooling down",
+    r"free-usage-exhausted",
 ]
 
 # Drop lines that look like third-party NewAPI / community mid-layer noise,
@@ -108,7 +115,14 @@ DEFAULT_CFG: dict[str, Any] = {
     "cpa_proxy": "",
     "local_grok_auth_path": "",
     "preferred_model": "grok-4.5",
+    # Extra log files (CLIProxy out/err). Scanned in addition to quota_watch_log_path.
+    "quota_watch_extra_log_paths": [],
+    # Re-enable CPA files past recover_after (clears disabled for CLIProxy).
+    "quota_watch_reenable_recovered": True,
+    # When CLIProxy/Grok logs show free-usage-exhausted, mark matching CPA disabled.
+    "quota_watch_cliproxy_mark_on_429": True,
 }
+
 
 
 def _log(log: LogFn | None, msg: str) -> None:
@@ -614,6 +628,9 @@ def try_rotate_from_pool(
         if pool_token_is_expired(payload):
             _log(log, f"[quota] pool skip expired: {path.name}")
             continue
+        if payload.get("disabled"):
+            _log(log, f"[quota] pool skip disabled: {path.name}")
+            continue
         try:
             from cpa_xai.usage import is_account_recovered, recover_in_sec
             if not is_account_recovered(path):
@@ -632,7 +649,7 @@ def try_rotate_from_pool(
             state.last_error = ""
             try:
                 from cpa_xai.usage import clear_exhausted_mark
-                clear_exhausted_mark(path)
+                clear_exhausted_mark(path, log=log)
             except Exception:
                 pass
             return {
@@ -912,6 +929,141 @@ class HitWindow:
         return len(self.times) >= max(1, min_hits)
 
 
+
+def resolve_watch_log_paths(cfg: dict[str, Any]) -> list[Path]:
+    """Primary Grok log + optional CLIProxy / extra logs."""
+    paths: list[Path] = []
+    primary = resolve_path(cfg.get("quota_watch_log_path"), default_log_path())
+    paths.append(primary)
+    for raw in list(cfg.get("quota_watch_extra_log_paths") or []):
+        p = resolve_path(raw, ROOT / "logs" / "extra.log")
+        if p not in paths:
+            paths.append(p)
+    for extra in (
+        Path(r"D:/cli-proxy-api/logs/cliproxy.out.log"),
+        Path(r"D:/cli-proxy-api/logs/cliproxy.err.log"),
+    ):
+        if extra not in paths:
+            paths.append(extra)
+    return paths
+
+
+def mark_exhausted_from_hits(
+    cfg: dict[str, Any],
+    hits: list[str],
+    *,
+    log: LogFn | None = None,
+    prefer_email: str = "",
+) -> list[str]:
+    """Mark CPA files exhausted+disabled based on log hit samples.
+
+    Prefer the currently active Grok auth email; otherwise try to extract
+    email-like tokens from the hit text. Never marks the whole pool.
+    """
+    if not hits:
+        return []
+    marked: list[str] = []
+    try:
+        from cpa_xai.usage import mark_account_exhausted
+    except Exception as exc:
+        _log(log, f"[quota] cannot import mark_account_exhausted: {exc}")
+        return marked
+
+    pool = list_cpa_pool(cfg)
+    by_email: dict[str, Path] = {}
+    for p in pool:
+        payload = load_json(p)
+        em = str(payload.get("email") or "").strip().lower()
+        if em:
+            by_email[em] = p
+        by_email[p.name.lower()] = p
+
+    targets: list[Path] = []
+    if prefer_email:
+        pe = prefer_email.strip().lower()
+        for p in pool:
+            if pe and pe in p.name.lower():
+                targets.append(p)
+                break
+        if not targets and pe in by_email:
+            targets.append(by_email[pe])
+
+    if not targets:
+        email_re = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+        found: set[str] = set()
+        for h in hits:
+            for m in email_re.findall(h):
+                found.add(m.lower())
+        for em in found:
+            if em in by_email:
+                targets.append(by_email[em])
+            else:
+                for p in pool:
+                    if em in p.name.lower():
+                        targets.append(p)
+
+    seen: set[str] = set()
+    for p in targets:
+        key = str(p.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        tu = None
+        for h in hits:
+            if "tokens" in h and "/" in h:
+                try:
+                    m = re.search(r"(\d+)/\d+", h)
+                    if m:
+                        tu = int(m.group(1))
+                except Exception:
+                    pass
+        mark_account_exhausted(p, tokens_used=tu, log=log, disable_for_proxy=True)
+        marked.append(p.name)
+    return marked
+
+
+def scan_all_logs(
+    cfg: dict[str, Any],
+    state: "WatchState",
+    include: list[re.Pattern[str]],
+    exclude: list[re.Pattern[str]],
+) -> list[str]:
+    """Scan primary + extra log files for quota keywords."""
+    paths = resolve_watch_log_paths(cfg)
+    all_hits: list[str] = []
+    if paths:
+        all_hits.extend(scan_log_new_lines(paths[0], state, include, exclude))
+    offsets: dict[str, int] = {}
+    raw_offsets = getattr(state, "extra_log_offsets", None)
+    if isinstance(raw_offsets, dict):
+        offsets = {str(k): int(v) for k, v in raw_offsets.items()}
+    for p in paths[1:]:
+        key = str(p)
+        if not p.is_file():
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        off = int(offsets.get(key) or 0)
+        if off > size:
+            off = 0
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(off)
+                chunk = f.read()
+                new_off = f.tell()
+        except Exception:
+            continue
+        offsets[key] = new_off
+        for line in chunk.splitlines():
+            flat = flatten_log_line(line)
+            if line_matches(flat, include, exclude):
+                all_hits.append(flat[:500])
+    state.extra_log_offsets = offsets  # type: ignore[attr-defined]
+    return all_hits
+
+
 def scan_log_new_lines(
     log_path: Path,
     state: WatchState,
@@ -998,8 +1150,8 @@ def once(
         "state_path": str(state_path),
     }
 
-    # --- log scan ---
-    hits = scan_log_new_lines(log_path, state, include, exclude)
+    # --- log scan (Grok unified + CLIProxy extra logs) ---
+    hits = scan_all_logs(cfg, state, include, exclude)
     if hits:
         hw = HitWindow()
         # synthetic: treat all new hits in this poll as clustered at now
@@ -1028,28 +1180,14 @@ def once(
             return report
 
         if immediate or len(hits) >= min_hits or force:
-            # Mark the current credential as exhausted (24h rolling window)
+            # Mark exhausted CPA file(s) so CLIProxy drops them (disabled:true)
             current = current_auth_email(auth_path)
-            if current and not dry_run:
-                for p in list_cpa_pool(cfg):
-                    if current in p.name:
-                        try:
-                            from cpa_xai.usage import mark_account_exhausted
-                            # Try to extract tokens_used from the 429 message
-                            tu = None
-                            for h in hits:
-                                if "tokens" in h and "/" in h:
-                                    try:
-                                        import re
-                                        m = re.search(r"(\d+)/\d+", h)
-                                        if m:
-                                            tu = int(m.group(1))
-                                    except Exception:
-                                        pass
-                            mark_account_exhausted(p, tokens_used=tu, log=log)
-                        except Exception:
-                            pass
-                        break
+            if not dry_run and cfg.get("quota_watch_cliproxy_mark_on_429", True):
+                marked = mark_exhausted_from_hits(
+                    cfg, hits, log=log, prefer_email=current
+                )
+                if marked:
+                    report["marked_disabled"] = marked
             result = refill(
                 cfg,
                 state,
@@ -1093,7 +1231,7 @@ def once(
                         if current in p.name:
                             try:
                                 from cpa_xai.usage import mark_account_exhausted
-                                mark_account_exhausted(p, log=log)
+                                mark_account_exhausted(p, log=log, disable_for_proxy=True)
                             except Exception:
                                 pass
                             break
@@ -1155,6 +1293,28 @@ def once(
     # --- pool cleanup: refresh expired tokens or move dead ones out ---
     if not dry_run:
         purge_dead_pool(cfg, log=log, max_per_run=20)
+
+    # --- sync CLIProxy .cds cooldown files into disabled:true ---
+    if cfg.get("quota_watch_cliproxy_mark_on_429", True) and not dry_run:
+        try:
+            from cpa_xai.usage import sync_disabled_from_cds
+            auth_dir = resolve_path(cfg.get("cpa_auth_dir") or "cpa_auths", ROOT / "cpa_auths")
+            cds_stats = sync_disabled_from_cds(auth_dir, log=log)
+            if cds_stats.get("marked"):
+                report["cds_marked"] = cds_stats
+        except Exception as exc:
+            _log(log, f"[quota] cds sync error: {exc}")
+
+    # --- re-enable CPA files past recover_after (CLIProxy picks them back up) ---
+    if cfg.get("quota_watch_reenable_recovered", True) and not dry_run:
+        try:
+            from cpa_xai.usage import reenable_recovered_accounts
+            auth_dir = resolve_path(cfg.get("cpa_auth_dir") or "cpa_auths", ROOT / "cpa_auths")
+            re_stats = reenable_recovered_accounts(auth_dir, log=log)
+            if re_stats.get("reenabled"):
+                report["reenabled"] = re_stats
+        except Exception as exc:
+            _log(log, f"[quota] reenable recovered error: {exc}")
 
     # --- pool water-level maintenance: top up cpa_auths/ without touching auth.json ---
     min_pool = int(cfg.get("quota_watch_min_pool") or 0)

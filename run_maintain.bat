@@ -1,10 +1,6 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-echo ============================================================
-echo  号池维持  %DATE% %TIME%
-echo ============================================================
-python pool_maintain.py %*
-set ERR=%ERRORLEVEL%
-echo [*] maintain exit=%ERR%
-exit /b %ERR%
+REM 计划任务/手动都走隐藏启动；需要看输出时用: python pool_maintain.py
+wscript.exe //B //Nologo "%~dp0run_hidden.vbs" "pool_maintain.py" %*
+exit /b 0
