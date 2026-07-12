@@ -41,6 +41,27 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+def find_cpa_by_key_prefix(auth_dir: Path, key_prefix: str) -> Path | None:
+    """Match a CPA file by Grok CLI log ``key_prefix`` (access_token prefix).
+
+    unified.jsonl 429 lines often only carry ``key_prefix`` like ``oYpRvSNpsFYQ``
+    without an email. Without this, mark_exhausted_from_hits cannot disable the
+    responsible credential and CLIProxy keeps serving it.
+    """
+    prefix = (key_prefix or "").strip()
+    if not prefix or len(prefix) < 6 or not auth_dir.is_dir():
+        return None
+    for path in sorted(auth_dir.glob("xai-*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        token = str(data.get("access_token") or "").strip()
+        if token and token.startswith(prefix):
+            return path
+    return None
+
+
 def mark_account_exhausted(
     cpa_file: Path,
     *,
@@ -198,15 +219,24 @@ def sync_disabled_from_cds(
     cds_files = list(auth_dir.glob("*.cds")) + list(auth_dir.glob("**/*.cds"))
     stats["cds"] = len(cds_files)
     for cds in cds_files:
-        stem = cds.name
         # try match xai-*.json by stem prefix / email fragment
         base = cds.stem  # without .cds
+        # CLIProxy often sanitizes '@' → '_' in cooldown sidecars.
+        base_at = base.replace("_", "@", 1) if "_" in base and "@" not in base else base
         candidates = list(auth_dir.glob(f"{base}*.json"))
+        if not candidates and base_at != base:
+            candidates = list(auth_dir.glob(f"{base_at}*.json"))
         if not candidates:
             # cds name may be sanitized auth id; try substring match on files
             for p in auth_dir.glob("xai-*.json"):
-                if base and base.lower() in p.name.lower():
+                name_l = p.name.lower()
+                if base and (base.lower() in name_l or base_at.lower() in name_l):
                     candidates.append(p)
+                elif base:
+                    # match local-part before domain separators
+                    local = base.split("_")[0].split("@")[0].lower()
+                    if local and len(local) >= 6 and local in name_l:
+                        candidates.append(p)
         for p in candidates:
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))

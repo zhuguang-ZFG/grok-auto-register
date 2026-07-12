@@ -961,11 +961,69 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
 
 
 def write_local_grok_from_cpa(cpa_result, log_callback=None):
-    """Write CPA OIDC tokens into ~/.grok/auth.json for local grok CLI."""
+    """Write CPA OIDC tokens into ~/.grok/auth.json for local grok CLI.
+
+    When the current auth.json already has a non-expired OIDC token, skip
+    overwrite so bulk registration does not thrash the live Grok CLI session.
+    Force with GROK_FORCE_LOCAL_AUTH=1 (quota_watch rotate still writes via
+    local_grok_auth directly and is unaffected).
+    """
     if str(os.environ.get("GROK_SKIP_LOCAL_AUTH", "")).strip() in ("1", "true", "yes", "on"):
         return {"ok": False, "skipped": True, "reason": "GROK_SKIP_LOCAL_AUTH"}
     if not config.get("local_grok_auth_auto", False):
         return {"ok": False, "skipped": True, "reason": "disabled"}
+    force = str(os.environ.get("GROK_FORCE_LOCAL_AUTH", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not force:
+        try:
+            from local_grok_auth import default_auth_path, load_auth_file
+            from datetime import datetime, timezone
+
+            auth_path = default_auth_path()
+            if auth_path.is_file():
+                data = load_auth_file(auth_path)
+                entry = None
+                if isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, dict) and (
+                            v.get("access_token") or v.get("key") or v.get("refresh_token")
+                        ):
+                            entry = v
+                            break
+                if entry:
+                    exp_raw = str(entry.get("expires") or entry.get("expired") or "").strip()
+                    still_valid = False
+                    if exp_raw:
+                        try:
+                            exp_s = exp_raw.replace("Z", "+00:00")
+                            exp_dt = datetime.fromisoformat(exp_s)
+                            still_valid = exp_dt.timestamp() > (
+                                datetime.now(tz=timezone.utc).timestamp() + 120
+                            )
+                        except Exception:
+                            still_valid = bool(
+                                entry.get("access_token") or entry.get("key")
+                            )
+                    else:
+                        still_valid = bool(entry.get("access_token") or entry.get("key"))
+                    if still_valid:
+                        email = entry.get("email") or "current"
+                        if log_callback:
+                            log_callback(
+                                f"[*] 本机 Grok auth 仍有效，跳过覆盖 ({email})"
+                            )
+                        return {
+                            "ok": True,
+                            "skipped": True,
+                            "reason": "preserve_healthy_auth",
+                            "email": email,
+                        }
+        except Exception:
+            pass
     try:
         from local_grok_auth import write_from_config_and_cpa_result
         return write_from_config_and_cpa_result(

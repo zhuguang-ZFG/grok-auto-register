@@ -619,6 +619,17 @@ def try_rotate_from_pool(
     if not candidates:
         return {"ok": False, "skipped": True, "reason": "empty_pool"}
 
+    # Prefer own mail domains so rotation stays on the controlled pool.
+    own_domains = [
+        d.strip().lower()
+        for d in str(cfg.get("defaultDomains") or "").split(",")
+        if d.strip()
+    ]
+    if own_domains:
+        own_first = [p for p in candidates if any(d in p.name.lower() for d in own_domains)]
+        other = [p for p in candidates if p not in own_first]
+        candidates = own_first + other
+
     for path in candidates:
         key = str(path.resolve())
         if key in used:
@@ -1010,12 +1021,21 @@ def mark_exhausted_from_hits(
     # when hits look like local-CLI errors, not CLIProxy pool-level cooldown.
     email_re = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
     file_re = re.compile(r"xai-[a-zA-Z0-9._%+\-@]+\.json", re.I)
+    # Grok CLI unified.jsonl: "key_prefix":"oYpRvSNpsFYQ"
+    key_prefix_re = re.compile(
+        r'key_prefix["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{6,})["\']',
+        re.I,
+    )
     found: set[str] = set()
+    key_prefixes: list[str] = []
     for h in hits:
         for m in email_re.findall(h):
             found.add(m.lower())
         for m in file_re.findall(h):
             found.add(m.lower())
+        for m in key_prefix_re.findall(h):
+            if m not in key_prefixes:
+                key_prefixes.append(m)
     for em in found:
         if em in by_email:
             targets.append(by_email[em])
@@ -1024,6 +1044,20 @@ def mark_exhausted_from_hits(
                 if em in p.name.lower():
                     targets.append(p)
                     break
+
+    # Resolve key_prefix → CPA file via access_token prefix match.
+    if key_prefixes:
+        try:
+            from cpa_xai.usage import find_cpa_by_key_prefix
+        except Exception:
+            find_cpa_by_key_prefix = None  # type: ignore[assignment]
+        auth_dir = resolve_path(cfg.get("cpa_auth_dir") or "cpa_auths", ROOT / "cpa_auths")
+        if find_cpa_by_key_prefix is not None:
+            for pref in key_prefixes:
+                hit = find_cpa_by_key_prefix(auth_dir, pref)
+                if hit is not None:
+                    targets.append(hit)
+                    _log(log, f"[quota] key_prefix {pref[:12]}… → {hit.name}")
 
     # Pool-level phrases must never disable the local auth email by default.
     pool_level_markers = (
