@@ -69,6 +69,15 @@ def main() -> int:
         need_refill = False
         live_count = None
 
+        # 0) proxy/Clash health (rotate if accounts.x.ai path bad)
+        if (ROOT / "proxy_health.py").is_file():
+            print("[*] proxy_health --rotate-if-bad")
+            code_p = run(
+                [py, str(ROOT / "proxy_health.py"), "--rotate-if-bad"],
+                log,
+            )
+            print(f"[*] proxy_health exit={code_p}")
+
         # 1) bulk-refresh expiring tokens + optional purge of revoked RT
         if not args.skip_refresh and (ROOT / "refresh_pool.py").is_file():
             refresh_cmd = [

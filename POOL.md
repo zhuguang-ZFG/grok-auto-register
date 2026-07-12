@@ -87,14 +87,38 @@ Get-ScheduledTask | ? TaskName -like 'Grok*'
 
 | 任务 | 周期 | 作用 |
 |------|------|------|
-| GrokPoolMaintain | 每 2h + 登录 | refresh→health→条件补号→status |
+| GrokPoolMaintain | 每 2h + 登录 | **proxy_health**→refresh→health→条件补号→status |
 | GrokPoolRefresh | 每 2h | `refresh_pool --purge-dead` |
-| GrokPoolHealth | 每 45m | 健康检查 |
+| GrokPoolHealth | 每 45m | `proxy_health --rotate-if-bad` + pool_health + CLI 同步 |
 | GrokQuotaWatch | 登录常驻 | 额度换号 |
 | GrokRegisterAuto | 登录常驻 | 后台 auto 补号 |
 | CLIProxyAPI-Local | 登录常驻 | 本地 8317 |
 
 `pool_maintain` 已内置：临期 token 刷新 + 吊销 RT 清理（`pool_maintain_purge_dead`）。
+
+### 电源 / 睡眠 / 代理（补闭环缺口）
+
+本机 7×24 需要 **插电 + 不睡 + Clash 稳**：
+
+```powershell
+# 插电：睡眠=从不，合盖=不采取任何操作（不影响息屏）
+powershell -ExecutionPolicy Bypass -File .\scripts\ensure_power_awake.ps1
+# 电池也禁用睡眠（费电，慎用）: ... -AlsoBattery
+
+# 代理体检（Clash + 出口 IP + accounts.x.ai）；坏则换节点
+python proxy_health.py
+python proxy_health.py --rotate-if-bad
+```
+
+| 项 | 建议 |
+|----|------|
+| 插电 STANDBY | 0（从不） |
+| 合盖 AC | Do nothing |
+| 息屏 | 可关（省电，不杀进程） |
+| Clash | 保持运行；`proxy_health` 进 maintain/health 任务 |
+| 真 7×24 | 仍建议小 VPS；本机方案是「插电不睡」最小改动 |
+
+说明：Windows Modern Standby 机型合盖仍可能进 S0 低电；若合盖后任务停，BIOS/厂商「合盖睡眠」再关一层，或合盖但接电外接屏。
 
 ### 自有域 / 缓冲域分层
 

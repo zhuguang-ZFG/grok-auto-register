@@ -149,6 +149,16 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
     # recent mint path stats from register log (since last RESTART marker)
     snap["mint_log"] = _mint_log_stats(ROOT / "logs" / "register_auto.out.log")
 
+    # last proxy health snapshot (if any)
+    ph = ROOT / ".proxy_health.json"
+    if ph.is_file():
+        try:
+            snap["proxy_health"] = json.loads(ph.read_text(encoding="utf-8"))
+        except Exception as e:
+            snap["proxy_health"] = {"error": str(e)}
+    else:
+        snap["proxy_health"] = {"ok": None, "error": "no snapshot yet"}
+
     # accounts
     acc_files = sorted(ROOT.glob("accounts_*.txt"), key=lambda p: p.stat().st_mtime)
     total_lines = 0
@@ -375,6 +385,16 @@ def print_human(snap: dict[str, Any]) -> None:
         )
     elif ml.get("error"):
         print(f"[*] 铸造日志: n/a ({ml.get('error')})")
+
+    ph = snap.get("proxy_health") or {}
+    if ph.get("error") and ph.get("ok") is None:
+        print(f"[*] 代理健康: n/a ({ph.get('error')})")
+    else:
+        print(
+            f"[*] 代理健康: ok={ph.get('ok')} clash={ph.get('clash_ok')} "
+            f"xai={ph.get('xai_ok')} ip={ph.get('exit_ip')} "
+            f"node={str(ph.get('node') or '')[:40]!r} ts={ph.get('ts')}"
+        )
 
     route = snap.get("cliproxy_routing") or {}
     if route.get("error"):
