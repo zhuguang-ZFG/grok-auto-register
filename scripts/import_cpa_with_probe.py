@@ -39,7 +39,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-CLIENT = "b1a00492-073a-47ea-816f-4c329264a828"
+try:
+    from cpa_xai.schema import CLIENT_ID as CLIENT
+except Exception:  # pragma: no cover
+    CLIENT = "b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_BASE = "https://cli-chat-proxy.grok.com/v1"
 DEFAULT_HEADERS = {
     "x-grok-client-version": "0.2.93",

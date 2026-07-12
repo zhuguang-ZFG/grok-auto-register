@@ -10,7 +10,9 @@ Browser lifecycle:
   - Register browser released BEFORE mint (mint always standalone Chromium)
   - Peak browsers ≈ R + M (not 2×R)
 """
-# WARNING: monkey-patches create_browser_options. Only for multi-thread CLI mode.
+# WARNING: monkey-patches create_browser_options from grok_register_ttk.
+# Overrides proxy/hide_window/anti-detect if not carefully chained. Only for multi-thread CLI.
+# Normal use: python grok_register_ttk.py auto
 from __future__ import annotations
 
 import argparse

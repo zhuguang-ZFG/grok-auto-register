@@ -137,3 +137,9 @@ python scripts/rescue_quota_holds.py --own-only --reenable-ready
   python scripts/hard_purge_pool.py --scope buffer --max 500
   python scripts/hard_purge_pool.py --scope all
   ```
+
+
+## 8. 电源复核
+
+插电运行：`powershell -ExecutionPolicy Bypass -File .\scripts\ensure_power_awake.ps1`
+目标：AC 睡眠=从不、合盖=不操作。笔记本合盖仍可能被 OEM 现代待机打断。

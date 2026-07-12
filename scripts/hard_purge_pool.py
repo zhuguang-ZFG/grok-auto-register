@@ -28,7 +28,10 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 LIVE = ROOT / "cpa_auths"
 DEAD = ROOT / "cpa_auths_dead"
-CLIENT = "b1a00492-073a-47ea-816f-4c329264a828"
+try:
+    from cpa_xai.schema import CLIENT_ID as CLIENT
+except Exception:  # pragma: no cover
+    CLIENT = "b1a00492-073a-47ea-816f-4c329264a828"
 
 HOLD_REASONS = frozenset(
     {
