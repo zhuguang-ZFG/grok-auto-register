@@ -135,7 +135,18 @@ python pool_status.py                    # 含域名健康摘要
 | `cpa_protocol_poll_timeout_sec` | 协议轮询 token 超时（默认 90） |
 
 社区参考：`_community_ref/grok_auto_register_share_20260712/`（分层 mail/session/credential；TempMail.lol；砍 headless 注册幻想）。  
-本仓库仍以 `grok_register_ttk.py` 为主路径，仅把 **协议铸造** 接到 `cpa_xai.mint_and_export` / `cpa_export`。
+本仓库仍以 `grok_register_ttk.py` 为主路径：
+
+- **协议铸造** → `cpa_xai.mint_and_export` / `cpa_export`（默认开）
+- **TempMail.lol** → `email_provider: "tempmail_lol"`（可选；默认仍用 cloudflare 四域名）
+
+```json
+"email_provider": "tempmail_lol",
+"tempmail_lol_api_base": "https://api.tempmail.lol/v2",
+"tempmail_lol_api_key": ""
+```
+
+协议铸造冒烟（有 SSO 的 accounts 行）：约 4s 写出 CPA + `/models` 含 grok-4.5。
 
 外部 CPA 包导入：
 

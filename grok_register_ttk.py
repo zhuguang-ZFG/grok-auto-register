@@ -1671,6 +1671,12 @@ def get_email_and_token(api_key=None):
             raise Exception("Cloudflare API Base / mail_backends 未配置")
         # 多后端四域名负载均衡（mail_backends + 池内最少域名优先）
         return cloudflare_create_temp_address()
+    if provider in ("tempmail_lol", "tempmail.lol", "tempmail"):
+        try:
+            import tempmail_lol as _tml
+        except ImportError as e:
+            raise Exception(f"tempmail_lol module missing: {e}") from e
+        return _tml.create_inbox(config)
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -1712,6 +1718,20 @@ def get_oai_code(
             log_callback=log_callback,
             cancel_callback=cancel_callback,
             resend_callback=resend_callback,
+        )
+    if provider in ("tempmail_lol", "tempmail.lol", "tempmail"):
+        try:
+            import tempmail_lol as _tml
+        except ImportError as e:
+            raise Exception(f"tempmail_lol module missing: {e}") from e
+        return _tml.wait_code(
+            dev_token,
+            cfg=config,
+            timeout=timeout,
+            poll_interval=max(0.3, float(poll_interval or 0.5)),
+            log=log_callback,
+            cancel=cancel_callback,
+            resend=resend_callback,
         )
     return duckmail_get_oai_code(
         dev_token,
@@ -3976,7 +3996,12 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(
+            config_frame,
+            self.email_provider_var,
+            ["duckmail", "yyds", "cloudflare", "tempmail_lol"],
+            width=12,
+        )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
         add_label(0, 2, "注册数量:")
