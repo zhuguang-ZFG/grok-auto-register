@@ -13,6 +13,7 @@ On any failure raise ProtocolMintError so callers can fall back to browser mint.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -38,6 +39,53 @@ class ProtocolMintError(RuntimeError):
 
 def _noop_log(_: str) -> None:
     return None
+
+
+def _is_transient_tls_error(exc: BaseException) -> bool:
+    """Proxy/TLS blips that often succeed on a short retry."""
+    msg = str(exc).lower()
+    needles = (
+        "curl: (35)",
+        "tls connect error",
+        "ssl",
+        "openssl",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "broken pipe",
+        "eof occurred",
+        "unexpected_eof",
+        "proxy",
+        "temporarily unavailable",
+    )
+    return any(n in msg for n in needles)
+
+
+def _request_with_retry(
+    do_req: Callable[[], Any],
+    *,
+    what: str,
+    log: LogFn,
+    retries: int = 2,
+    retry_sleep: float = 1.2,
+    cancel: Callable[[], bool] | None = None,
+) -> Any:
+    """Run a curl_cffi request with short retries on transient TLS/proxy errors."""
+    last: BaseException | None = None
+    attempts = max(int(retries), 0) + 1
+    for i in range(attempts):
+        if cancel and cancel():
+            raise ProtocolMintError("cancelled")
+        try:
+            return do_req()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i + 1 >= attempts or not _is_transient_tls_error(e):
+                raise
+            log(f"protocol {what} transient fail try={i+1}/{attempts}: {e}")
+            time.sleep(retry_sleep * (i + 1))
+    raise ProtocolMintError(f"{what}: {last}")
 
 
 def extract_sso_from_cookies(cookies: Any) -> str:
@@ -138,12 +186,19 @@ def mint_with_sso_protocol(
 
     # 1) Validate SSO
     try:
-        r = session.get(
-            "https://accounts.x.ai/",
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
+        r = _request_with_retry(
+            lambda: session.get(
+                "https://accounts.x.ai/",
+                impersonate="chrome",
+                timeout=timeout,
+                allow_redirects=True,
+            ),
+            what="accounts.x.ai",
+            log=log,
+            cancel=cancel,
         )
+    except ProtocolMintError:
+        raise
     except Exception as e:  # noqa: BLE001
         raise ProtocolMintError(f"accounts.x.ai network error: {e}") from e
 
@@ -166,13 +221,23 @@ def mint_with_sso_protocol(
 
     # 3) Open verification URI (sets session state / CSRF)
     try:
-        r = session.get(
-            sess.verification_uri_complete,
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
+        r = _request_with_retry(
+            lambda: session.get(
+                sess.verification_uri_complete,
+                impersonate="chrome",
+                timeout=timeout,
+                allow_redirects=True,
+            ),
+            what="verification_uri",
+            log=log,
+            cancel=cancel,
         )
-        log(f"protocol verify-uri status={getattr(r, 'status_code', '?')} url={getattr(r, 'url', '')[:140]}")
+        log(
+            f"protocol verify-uri status={getattr(r, 'status_code', '?')} "
+            f"url={getattr(r, 'url', '')[:140]}"
+        )
+    except ProtocolMintError:
+        raise
     except Exception as e:  # noqa: BLE001
         raise ProtocolMintError(f"verification_uri get failed: {e}") from e
 
@@ -181,14 +246,21 @@ def mint_with_sso_protocol(
 
     # 4) POST device/verify
     try:
-        r = session.post(
-            VERIFY_URL,
-            data={"user_code": sess.user_code},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
+        r = _request_with_retry(
+            lambda: session.post(
+                VERIFY_URL,
+                data={"user_code": sess.user_code},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=timeout,
+                allow_redirects=True,
+            ),
+            what="device/verify",
+            log=log,
+            cancel=cancel,
         )
+    except ProtocolMintError:
+        raise
     except Exception as e:  # noqa: BLE001
         raise ProtocolMintError(f"device/verify exception: {e}") from e
 
@@ -219,19 +291,26 @@ def mint_with_sso_protocol(
 
     # 5) POST device/approve
     try:
-        r = session.post(
-            APPROVE_URL,
-            data={
-                "user_code": sess.user_code,
-                "action": "allow",
-                "principal_type": "User",
-                "principal_id": "",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            impersonate="chrome",
-            timeout=timeout,
-            allow_redirects=True,
+        r = _request_with_retry(
+            lambda: session.post(
+                APPROVE_URL,
+                data={
+                    "user_code": sess.user_code,
+                    "action": "allow",
+                    "principal_type": "User",
+                    "principal_id": "",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                impersonate="chrome",
+                timeout=timeout,
+                allow_redirects=True,
+            ),
+            what="device/approve",
+            log=log,
+            cancel=cancel,
         )
+    except ProtocolMintError:
+        raise
     except Exception as e:  # noqa: BLE001
         raise ProtocolMintError(f"device/approve exception: {e}") from e
 
