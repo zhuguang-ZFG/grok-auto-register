@@ -6,7 +6,9 @@
 
 ## 加固基线（必读）
 
-完整约定见 **[docs/HARDEN.md](docs/HARDEN.md)**（铸造三层、soft-disable、sticky、Clash 不掐连接、性能默认）。
+完整约定见 **[docs/HARDEN.md](docs/HARDEN.md)**（铸造三层、soft-disable、sticky、Clash 不掐连接、性能默认）。  
+最新本机运行快照（无密钥）：**[docs/STATUS.md](docs/STATUS.md)**。  
+Clash「注册专用」隔离：**[docs/CLASH_ISOLATE.md](docs/CLASH_ISOLATE.md)**。
 
 要点速查：
 

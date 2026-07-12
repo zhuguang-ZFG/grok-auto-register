@@ -85,3 +85,5 @@ curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer sk-local-grok-
 - `quota_watch.py` / `refresh_pool.py` / `pool_health.py` / `cpa_xai/usage.py`
 - `clash_proxy.py` / `grok_register_ttk.py`（出口）
 - `set_cliproxy_routing.py` / `POOL.md` / `KIMI_CLIPROXY.md`
+- 最新本机快照（无密钥）：[STATUS.md](STATUS.md)
+- Clash 专用组步骤：[CLASH_ISOLATE.md](CLASH_ISOLATE.md)
