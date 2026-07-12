@@ -79,7 +79,39 @@ curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer sk-local-grok-
 - 在 live 号池上 `pool_maintain_purge_dead=true` + 硬删
 - 把第三方不可用中转写进 Kimi `default_model` 冒充稳
 
-## 7. 相关文件
+## 7. CLIProxy 出口加固（防 region block / 死代理）
+
+### 7.1 全局 proxy-url（必须）
+CLIProxy `config.yaml` **必须**设 `proxy-url: "http://127.0.0.1:7897"`（Clash）。
+不设则直连出口 → 数据中心 IP（SG/DO/等）被 grok 判 `403 region-denied`，
+CLIProxy 轮换所有号都 403 → 20s 超时 500。
+
+### 7.2 CPA 文件 proxy 字段污染（已知坑）
+部分导入的 CPA 文件带 `proxy: http://127.0.0.1:18478`（旧端口），
+**覆盖**全局 proxy-url → CLIProxy 用死端口 refresh token → 全部失败。
+
+修复 + 预防：
+```bat
+:: 清除所有 CPA 文件中的死 proxy 字段（保留 7897）
+python scripts\clean_cpa_proxy.py
+```
+
+`clean_cpa_proxy.py` 扫 `cpa_auths/xai-*.json`，删除非 7897 的 per-auth proxy。
+建议注册机每次导入号后跑一次，或挂进 `pool_maintain`。
+
+### 7.3 出口节点区域
+`注册专用` 组只选 grok 接受的区域：**TW / HK / US / JP**。
+**禁止**：SG（新加坡）、DE（德国）、RU 等 → region block。
+
+验证链路（社区 403 排查法）：
+```bat
+python pool_status.py          :: 看代理健康
+curl -s -m 10 -x http://127.0.0.1:7897 https://ifconfig.me  :: 出口 IP
+:: 直连 cli-chat-proxy 看是否 region block
+curl -s -m 10 -x http://127.0.0.1:7897 "https://cli-chat-proxy.grok.com/v1/models" -H "Authorization: Bearer <token>"
+```
+
+## 8. 相关文件
 
 - `cpa_xai/mint.py` / `authcode_mint.py` / `protocol_mint.py`
 - `quota_watch.py` / `refresh_pool.py` / `pool_health.py` / `cpa_xai/usage.py`

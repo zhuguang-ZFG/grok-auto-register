@@ -90,6 +90,118 @@ def _mint_log_stats(log_path: Path, *, max_bytes: int = 400_000) -> dict[str, An
     return out
 
 
+def _power_ac_sleep_status() -> dict[str, Any]:
+    """Read-only powercfg: AC standby idle + lid action (Windows).
+
+    Uses active scheme GUID + setting GUIDs (locale-safe). SCHEME_CURRENT +
+    SUB_SLEEP aliases are rejected on some Windows builds when mixed.
+    """
+    import re
+
+    out: dict[str, Any] = {"ok": False, "ac_sleep_never": None, "ac_lid_do_nothing": None}
+    exe = r"C:\Windows\System32\powercfg.exe"
+    sub_sleep = "238c9fa8-0aad-41ed-83f4-97be242c8f20"
+    standby = "29f6c1db-86da-48c5-9fdb-f2b67b1f44da"
+    sub_btn = "4f971e89-eebd-4455-a8de-9e59040e7347"
+    lid_set = "5ca83367-6e45-459f-a27b-476b1d01c936"
+
+    def _run(args: list[str]) -> str:
+        r = subprocess.run(
+            [exe, *args], capture_output=True, timeout=15, check=False
+        )
+        raw = r.stdout or b""
+        for enc in ("mbcs", "utf-8", "utf-16le"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    try:
+        active_blob = _run(["/GETACTIVESCHEME"])
+        m = re.search(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+            active_blob,
+        )
+        if not m:
+            out["error"] = "active scheme GUID not found"
+            return out
+        scheme = m.group(1)
+        out["scheme"] = scheme
+        sleep = _run(["/q", scheme, sub_sleep, standby])
+        lid = _run(["/q", scheme, sub_btn, lid_set])
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
+    def _ac_index(blob: str) -> int | None:
+        # Prefer AC/current-AC line; Chinese: 当前交流电源的电源设置索引
+        for line in blob.splitlines():
+            s = line.strip()
+            if "0x" not in s.lower():
+                continue
+            is_ac = (
+                "交流" in s
+                or "AC" in s.upper()
+                or "Current AC" in s
+                or ("当前" in s and "直流" not in s and "DC" not in s.upper())
+            )
+            if not is_ac and "当前交流" not in s:
+                continue
+            try:
+                hx = re.search(r"0x([0-9a-fA-F]+)", s, re.I)
+                if hx:
+                    return int(hx.group(1), 16)
+            except Exception:
+                continue
+        # Ordered: first "当前交流", else first Current AC Power, else first 0x after STANDBY
+        for pat in (
+            r"当前交流[^\n]*0x([0-9a-fA-F]+)",
+            r"Current AC Power[^\n]*0x([0-9a-fA-F]+)",
+            r"AC Power Setting Index:\s*0x([0-9a-fA-F]+)",
+        ):
+            m2 = re.search(pat, blob, re.I)
+            if m2:
+                try:
+                    return int(m2.group(1), 16)
+                except Exception:
+                    pass
+        # last resort: first power setting index line (often AC then DC)
+        ms = re.findall(
+            r"(?:电源设置索引|Power Setting Index)[^\n]*0x([0-9a-fA-F]+)",
+            blob,
+            re.I,
+        )
+        if ms:
+            try:
+                return int(ms[0], 16)
+            except Exception:
+                return None
+        return None
+
+    ac_sleep = _ac_index(sleep)
+    ac_lid = _ac_index(lid)
+    out["ac_standby_sec"] = ac_sleep
+    out["ac_lid_action"] = ac_lid
+    out["ac_sleep_never"] = ac_sleep == 0 if ac_sleep is not None else None
+    out["ac_lid_do_nothing"] = ac_lid == 0 if ac_lid is not None else None
+    out["ok"] = True
+    out["warn"] = not (
+        out["ac_sleep_never"] is True and out["ac_lid_do_nothing"] is True
+    )
+    return out
+
+
+def _load_heartbeat_file() -> dict[str, Any]:
+    p = ROOT / "logs" / "heartbeat.json"
+    if not p.is_file():
+        return {"ok": False, "error": "missing"}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _cliproxy_affinity_stats(
     log_path: Path, *, max_bytes: int = 300_000
 ) -> dict[str, Any]:
@@ -371,6 +483,13 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
             "cliproxy": _list_procs("cli-proxy-api"),
         }
 
+    # power (read-only) + last heartbeat file
+    try:
+        snap["power_ac"] = _power_ac_sleep_status()
+    except Exception as exc:
+        snap["power_ac"] = {"ok": False, "error": str(exc)}
+    snap["heartbeat"] = _load_heartbeat_file()
+
     return snap
 
 
@@ -465,8 +584,35 @@ def print_human(snap: dict[str, Any]) -> None:
             f"miss={aff.get('affinity_miss')} reselect={aff.get('affinity_reselect')} "
             f"rate={rr_s} REMOVE={aff.get('auth_remove')} WRITE={aff.get('auth_write')}"
         )
+        if isinstance(rr, float) and rr > 0.15:
+            print(
+                "[!] sticky reselect_rate>15%: 查 REMOVE/disabled 导致的 affinity rebind"
+                "（soft-disable 勿硬删 live 池）"
+            )
     elif aff.get("error"):
         print(f"[*] CLIProxy sticky: n/a ({aff.get('error')})")
+
+    pwr = snap.get("power_ac") or {}
+    if pwr.get("ok"):
+        sleep_s = "never" if pwr.get("ac_sleep_never") else f"sec={pwr.get('ac_standby_sec')}"
+        lid_s = "do-nothing" if pwr.get("ac_lid_do_nothing") else f"code={pwr.get('ac_lid_action')}"
+        flag = "WARN" if pwr.get("warn") else "ok"
+        print(f"[*] 电源AC: sleep={sleep_s} lid={lid_s} ({flag})")
+        if pwr.get("warn"):
+            print("[!] 插电仍可能睡眠/合盖休眠 → scripts/ensure_power_awake.ps1")
+    elif pwr.get("error"):
+        print(f"[*] 电源AC: n/a ({pwr.get('error')})")
+
+    hb = snap.get("heartbeat") or {}
+    if hb.get("level") or hb.get("ok") is True:
+        print(
+            f"[*] heartbeat: level={hb.get('level')} live={hb.get('pool_live_est')}/"
+            f"{hb.get('min_live')} ts={hb.get('ts_iso') or '?'}"
+        )
+        for a in (hb.get("alerts") or [])[:3]:
+            print(f"    ! {a}")
+    elif hb.get("error") and hb.get("error") != "missing":
+        print(f"[*] heartbeat: n/a ({hb.get('error')})")
 
     auth = snap.get("local_grok_auth") or {}
     if auth.get("error"):

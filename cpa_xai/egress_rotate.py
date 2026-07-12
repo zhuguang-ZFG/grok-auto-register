@@ -44,6 +44,17 @@ def rotate_mint_egress(
             if isinstance(cfg, dict) and verify_ip is not None:
                 cfg["clash_verify_ip"] = bool(verify_ip)
 
+            # Before switching nodes, soft-disable score the last failing Clash
+            # exit (community: fail streak → drop bad nodes from 注册专用).
+            try:
+                import clash_proxy as _cp  # type: ignore
+
+                report = getattr(_cp, "report_fail", None)
+                if callable(report):
+                    report()
+            except Exception as _rf_exc:  # noqa: BLE001
+                log(f"mint egress report_fail skip: {_rf_exc}")
+
             rotate_fn = getattr(reg, "rotate_egress_proxy", None)
             if not callable(rotate_fn):
                 out["error"] = "rotate_egress_proxy missing"

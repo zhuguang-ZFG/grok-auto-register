@@ -22,6 +22,11 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.original_config = app.config.copy()
         self.original_cf_domain_index = app._cf_domain_index
         app._cf_domain_index = 0
+        # Clear multi-backend / fallback config so api_base parameter is used directly
+        app.config["mail_backends"] = []
+        app.config["cloudflare_api_base"] = ""
+        app.config.pop("_cf_domain_backend_map", None)
+        app.config.pop("_cf_domains_cache", None)
 
     def tearDown(self):
         app.config = self.original_config
@@ -36,13 +41,14 @@ class CloudflareAdminCreateTests(unittest.TestCase):
             captured.update(kwargs)
             return DummyResponse({"address": "anon@example.com", "jwt": "default-jwt"})
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        with patch.object(app, "generate_username", return_value="testuser"), \
+                patch.object(app, "http_post", side_effect=fake_post):
             address, jwt = app.cloudflare_create_temp_address("https://temp-mail.example.com")
 
         self.assertEqual(address, "anon@example.com")
         self.assertEqual(jwt, "default-jwt")
         self.assertEqual(captured["url"], "https://temp-mail.example.com/api/new_address")
-        self.assertEqual(captured["json"], {})
+        self.assertEqual(captured["json"], {"name": "testuser", "enablePrefix": True})
         self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
 
     def test_app_uses_admin_new_address_with_x_admin_auth(self):
@@ -88,13 +94,14 @@ class CloudflareAdminCreateTests(unittest.TestCase):
             captured.update(kwargs)
             return DummyResponse({"address": "anon@vitassk.com", "jwt": "anon-jwt"})
 
-        with patch.object(app, "http_post", side_effect=fake_post):
+        with patch.object(app, "generate_username", return_value="anon"), \
+                patch.object(app, "http_post", side_effect=fake_post):
             address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
 
         self.assertEqual(address, "anon@vitassk.com")
         self.assertEqual(jwt, "anon-jwt")
         self.assertEqual(captured["url"], "https://temp-mail.ikun.day/api/new_address")
-        self.assertEqual(captured["json"], {"domain": "vitassk.com"})
+        self.assertEqual(captured["json"], {"name": "anon", "domain": "vitassk.com", "enablePrefix": True})
         self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
 
     def test_debug_tool_can_create_address_through_admin_api(self):

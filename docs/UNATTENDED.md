@@ -58,7 +58,23 @@ python proxy_health.py --rotate-if-bad
 python pool_status.py
 ```
 
-看：代理健康、铸造 protocol_ok、CPA 水位、三进程。
+看：代理健康、铸造 protocol_ok、CPA 水位、三进程、电源 AC、sticky reselect。
+
+## 3.1 Heartbeat（进程 + 水位，可选计划任务）
+
+```bat
+python ops_heartbeat.py
+python ops_heartbeat.py --json --write logs/heartbeat.json
+```
+
+| exit | 含义 |
+|------|------|
+| 0 | ok |
+| 1 | warn（水位低于 `pool_min_live` / quota_watch 未跑） |
+| 2 | critical（注册机或 CLIProxy 未跑） |
+
+建议 Task Scheduler 每 10–15 分钟跑一次并 `--write logs/heartbeat.json`；`pool_status` 会读该文件打一行摘要。  
+**不**发网络 probe，不碰号池文件内容以外的读。
 
 ## 4. 边界
 
