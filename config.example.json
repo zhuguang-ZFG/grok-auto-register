@@ -36,6 +36,9 @@
     "User-Agent": "grok-shell/0.2.93 (linux; x86_64)"
   },
   "cpa_force_standalone": false,
+  "cpa_prefer_protocol": true,
+  "cpa_protocol_only": false,
+  "cpa_protocol_poll_timeout_sec": 90,
   "cpa_mint_cookie_inject": true,
   "cpa_mint_browser_reuse": true,
   "cpa_mint_browser_recycle_every": 15,

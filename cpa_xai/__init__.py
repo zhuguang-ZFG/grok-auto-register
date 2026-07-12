@@ -7,6 +7,7 @@ from .accounts import AccountLine, existing_cpa_emails, parse_accounts_file
 from .mint import mint_and_export
 from .probe import probe_mini_response, probe_models
 from .oauth_device import refresh_access_token
+from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
 from .schema import (
     CLIENT_ID,
     DEFAULT_BASE_URL,
@@ -37,7 +38,10 @@ __all__ = [
     "credential_file_name",
     "existing_cpa_emails",
     "expired_from_access_token",
+    "ProtocolMintError",
+    "extract_sso_from_cookies",
     "mint_and_export",
+    "mint_with_sso_protocol",
     "parse_accounts_file",
     "probe_mini_response",
     "probe_models",

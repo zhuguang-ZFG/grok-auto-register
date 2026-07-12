@@ -1,4 +1,10 @@
-"""High-level: mint CPA xai-*.json for one free registered account."""
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""High-level: mint CPA xai-*.json for one free registered account.
+
+Protocol-first (community): if SSO cookie is available, mint via pure HTTP
+Device Flow (no casting browser). Fall back to browser mint on failure.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,7 @@ from typing import Any, Callable
 
 from .browser_confirm import mint_with_browser
 from .probe import probe_mini_response, probe_models
+from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
 from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth
 from .writer import write_cpa_xai_auth
@@ -33,43 +40,124 @@ def mint_and_export(
     browser_timeout_sec: float = 240.0,
     force_standalone: bool = False,
     cookies: Any | None = None,
+    sso: str | None = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    prefer_protocol: bool = True,
+    protocol_only: bool = False,
+    protocol_poll_timeout_sec: float = 90.0,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Full pipeline: device-auth → write CPA file → optional probe.
+    """Full pipeline: protocol Device Flow (preferred) | browser → write CPA → probe.
 
-    Returns dict with keys: ok, path, email, probe, error?
+    When ``prefer_protocol`` and an SSO cookie is present, mint over pure HTTP.
+    On ``ProtocolMintError`` (or other failure) fall back to browser unless
+    ``protocol_only`` is set.
+
+    Returns dict with keys: ok, path, email, probe*, error?, mint_method?
     """
     log = log or _noop
     email = (email or "").strip()
-    if not email or not password:
-        return {"ok": False, "email": email, "error": "missing email/password"}
+    password = password or ""
+    sso_val = (sso or "").strip() or extract_sso_from_cookies(cookies)
+
+    if not email:
+        return {"ok": False, "email": email, "error": "missing email"}
+    if not password and not sso_val:
+        return {"ok": False, "email": email, "error": "missing email/password/sso"}
 
     # Config/explicit proxy wins over shell https_proxy (common 7890 trap).
     # Thread-local pin — safe under concurrent mint workers.
     resolved = resolve_proxy(proxy)
     set_runtime_proxy(resolved or None)
-    log(f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'}")
-    try:
-        tokens = mint_with_browser(
-            email=email,
-            password=password,
-            page=page,
-            proxy=resolved or None,
-            headless=headless,
-            browser_timeout_sec=browser_timeout_sec,
-            force_standalone=force_standalone,
-            cookies=cookies,
-            reuse_browser=reuse_browser,
-            recycle_every=recycle_every,
-            poll_log=log,
-            cancel=cancel,
-        )
-    except Exception as e:  # noqa: BLE001
-        log(f"mint failed: {e}")
-        return {"ok": False, "email": email, "error": str(e)}
+    log(
+        f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'} "
+        f"prefer_protocol={prefer_protocol} sso={'yes' if sso_val else 'no'}"
+    )
+
+    tokens: dict[str, Any] | None = None
+    protocol_err: str | None = None
+
+    if prefer_protocol and sso_val:
+        try:
+            tokens = mint_with_sso_protocol(
+                sso_cookie=sso_val,
+                email=email,
+                proxy=resolved or None,
+                poll_timeout_sec=protocol_poll_timeout_sec,
+                log=log,
+                cancel=cancel,
+            )
+            log(f"protocol mint ok: {email}")
+        except ProtocolMintError as e:
+            protocol_err = str(e)
+            log(f"protocol mint failed: {e}")
+            if protocol_only:
+                return {
+                    "ok": False,
+                    "email": email,
+                    "error": f"protocol_only: {e}",
+                    "mint_method": "protocol",
+                }
+        except Exception as e:  # noqa: BLE001
+            protocol_err = str(e)
+            log(f"protocol mint error: {e}")
+            if protocol_only:
+                return {
+                    "ok": False,
+                    "email": email,
+                    "error": f"protocol_only: {e}",
+                    "mint_method": "protocol",
+                }
+    elif prefer_protocol and not sso_val:
+        log("protocol mint skipped: no sso cookie")
+        if protocol_only:
+            return {
+                "ok": False,
+                "email": email,
+                "error": "protocol_only but no sso",
+                "mint_method": "protocol",
+            }
+
+    if tokens is None:
+        if not password:
+            return {
+                "ok": False,
+                "email": email,
+                "error": protocol_err or "protocol failed and no password for browser fallback",
+                "protocol_error": protocol_err,
+            }
+        try:
+            tokens = mint_with_browser(
+                email=email,
+                password=password,
+                page=page,
+                proxy=resolved or None,
+                headless=headless,
+                browser_timeout_sec=browser_timeout_sec,
+                force_standalone=force_standalone,
+                cookies=cookies,
+                reuse_browser=reuse_browser,
+                recycle_every=recycle_every,
+                poll_log=log,
+                cancel=cancel,
+            )
+            tokens["mint_method"] = "browser"
+            if protocol_err:
+                tokens["protocol_error"] = protocol_err
+            log(f"browser mint ok: {email}")
+        except Exception as e:  # noqa: BLE001
+            log(f"mint failed: {e}")
+            err = str(e)
+            if protocol_err:
+                err = f"{err} (protocol: {protocol_err})"
+            return {
+                "ok": False,
+                "email": email,
+                "error": err,
+                "protocol_error": protocol_err,
+            }
 
     payload = build_cpa_xai_auth(
         email=email,
@@ -90,12 +178,18 @@ def mint_and_export(
         "user_code": tokens.get("user_code"),
         "base_url": base_url,
         "proxy": proxy_log_label(resolved),
+        "mint_method": tokens.get("mint_method") or "browser",
     }
+    if protocol_err and result["mint_method"] != "protocol":
+        result["protocol_error"] = protocol_err
 
     if probe:
         pr = probe_models(tokens["access_token"], base_url=base_url, proxy=resolved or None)
         result["probe_models"] = pr
-        log(f"probe models: ok={pr.get('ok')} has_grok_45={pr.get('has_grok_45')} ids={pr.get('model_ids')}")
+        log(
+            f"probe models: ok={pr.get('ok')} has_grok_45={pr.get('has_grok_45')} "
+            f"ids={pr.get('model_ids')}"
+        )
         if not pr.get("has_grok_45"):
             result["ok"] = False
             result["error"] = "token ok but grok-4.5 not listed"

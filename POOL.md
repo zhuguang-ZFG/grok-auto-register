@@ -124,6 +124,25 @@ python pool_status.py                    # 含域名健康摘要
 # domain_health_fail_streak_demote / domain_health_demote_sec / domain_health_min_success_rate
 ```
 
+### CPA mint：协议优先（社区 v2 对齐）
+
+注册拿到 `sso` 后，铸造默认 **先纯 HTTP Device Flow**（`cpa_xai/protocol_mint.py`），不弹铸造浏览器；失败再回退 `browser_confirm`。
+
+| 配置 | 含义 |
+|------|------|
+| `cpa_prefer_protocol` | 默认 `true`：有 SSO 先协议铸造 |
+| `cpa_protocol_only` | `true` 时协议失败不回退浏览器 |
+| `cpa_protocol_poll_timeout_sec` | 协议轮询 token 超时（默认 90） |
+
+社区参考：`_community_ref/grok_auto_register_share_20260712/`（分层 mail/session/credential；TempMail.lol；砍 headless 注册幻想）。  
+本仓库仍以 `grok_register_ttk.py` 为主路径，仅把 **协议铸造** 接到 `cpa_xai.mint_and_export` / `cpa_export`。
+
+外部 CPA 包导入：
+
+```bash
+python import_cpa_batch.py D:/Downloads/grok_cpa_30.zip
+```
+
 ### CPA mint 工作池（R 注册 + M mint）
 
 异步 mint 默认走有界队列，避免每号一条无限线程：

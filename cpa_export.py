@@ -120,6 +120,9 @@ def export_cpa_xai_for_account(
     cookie_inject = bool(cfg.get("cpa_mint_cookie_inject", True))
     reuse_browser = bool(cfg.get("cpa_mint_browser_reuse", True))
     recycle_every = int(cfg.get("cpa_mint_browser_recycle_every", 15) or 0)
+    prefer_protocol = bool(cfg.get("cpa_prefer_protocol", True))
+    protocol_only = bool(cfg.get("cpa_protocol_only", False))
+    protocol_poll_timeout_sec = float(cfg.get("cpa_protocol_poll_timeout_sec", 90) or 90)
 
     reuse_page = None if force_standalone else page
 
@@ -177,8 +180,12 @@ def export_cpa_xai_for_account(
         browser_timeout_sec=timeout,
         force_standalone=force_standalone,
         cookies=use_cookies,
+        sso=sso,
         reuse_browser=reuse_browser,
         recycle_every=recycle_every,
+        prefer_protocol=prefer_protocol,
+        protocol_only=protocol_only,
+        protocol_poll_timeout_sec=protocol_poll_timeout_sec,
         log=_log,
     )
 
