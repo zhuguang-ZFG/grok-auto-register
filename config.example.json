@@ -90,5 +90,10 @@
   "quota_watch_target_pool": 50,
   "anti_detect_ua_pool": true,
   "anti_detect_viewport": true,
-  "anti_detect_tz_locale": true
+  "anti_detect_tz_locale": true,
+  "domain_health_enabled": true,
+  "domain_health_fail_streak_demote": 5,
+  "domain_health_demote_sec": 3600,
+  "domain_health_min_samples": 4,
+  "domain_health_min_success_rate": 0.25
 }

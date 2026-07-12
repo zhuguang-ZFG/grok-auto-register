@@ -22,6 +22,11 @@ import string
 import json
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
+# Windows file redirects / Git Bash often use gbk; force UTF-8 log lines.
+try:
+    import stdio_utf8  # noqa: F401
+except Exception:
+    pass
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
@@ -530,11 +535,20 @@ def cloudflare_next_default_domain():
 
     优先按池中各域名已有账号数做负载均衡（选最少的），避免单域名堆积触发风控。
     池数据不可用时回退到轮询。支持 mail_backends 多后端域名列表。
+    会跳过 domain_health 临时降权的域名（全降权时回退全部）。
     """
     global _cf_domain_index
     domains, _ = _rebuild_domain_backend_map()
     if not domains:
         domains = _parse_domain_list(config.get("defaultDomains", ""))
+    if not domains:
+        return ""
+    try:
+        import domain_health as _dh
+
+        domains = _dh.filter_active_domains(list(domains), cfg=config)
+    except Exception:
+        pass
     if not domains:
         return ""
     if len(domains) == 1:
@@ -661,6 +675,13 @@ def cloudflare_create_temp_address(api_base=None):
             raise Exception("无可用邮箱后端/域名")
         domains = _parse_domain_list(config.get("defaultDomains", "")) or [""]
 
+    try:
+        import domain_health as _dh
+
+        domains = _dh.filter_active_domains(list(domains), cfg=config) or list(domains)
+    except Exception:
+        pass
+
     # 首选最少域名，再准备 fallback 顺序
     preferred = cloudflare_next_default_domain() or domains[0]
     ordered = [preferred] + [d for d in domains if d != preferred]
@@ -687,12 +708,30 @@ def cloudflare_create_temp_address(api_base=None):
                 _cf_domain_index += 1
                 _save_domain_rr_index()
             _cf_email_api_base[str(address).lower()] = backend["api_base"]
+            try:
+                import domain_health as _dh
+
+                _dh.record_event(domain, kind="mail_ok", cfg=config)
+            except Exception:
+                pass
             return address, jwt
         except ValueError as exc:
             last_err = str(exc)
+            try:
+                import domain_health as _dh
+
+                _dh.record_event(domain, kind="mail_fail", reason=str(exc), cfg=config)
+            except Exception:
+                pass
             continue
         except Exception as exc:
             last_err = f"{domain}@{backend.get('api_base')}: {exc}"
+            try:
+                import domain_health as _dh
+
+                _dh.record_event(domain, kind="mail_fail", reason=str(exc), cfg=config)
+            except Exception:
+                pass
             continue
     raise Exception(f"创建邮箱失败（多域名负载均衡）: {last_err}")
 
@@ -4085,6 +4124,7 @@ class GrokRegisterGUI:
                         with _stats_lock:
                             self.fail_count += 1
                         log_fn(f"[-] 注册失败: {exc}")
+                        # domain stats: email often not in scope on GUI fail path
                         slot_done = True
                     finally:
                         local_attempts += 1
@@ -4244,6 +4284,12 @@ class GrokRegisterGUI:
         with _stats_lock:
             self.success_count += 1
         log_fn(f"[+] 注册成功: {email}")
+        try:
+            import domain_health as _dh
+
+            _dh.record_success(email, cfg=config)
+        except Exception:
+            pass
         # Community proxy_pool pattern: credit the exit node on success
         try:
             from clash_proxy import report_success
@@ -4374,11 +4420,8 @@ def _restore_sigint_handler(previous):
 
 
 def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
-    email = ""
-    dev_token = ""
-    code = ""
-    mail_ok = False
     clash_node = None
+    email_holder = {"email": ""}
     # Anti-detection: rotate Clash proxy node before each registration
     if config.get("clash_rotate_per_account", True):
         try:
@@ -4394,26 +4437,43 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
         except Exception as exc:
             safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
             log_fn(f"[*] Clash 轮换跳过: {safe}")
-    max_mail_retry = 3
     try:
         return _register_one_account_cli_body(
-            log_fn, stop_fn, accounts_output_file, clash_node
+            log_fn,
+            stop_fn,
+            accounts_output_file,
+            clash_node,
+            email_holder=email_holder,
         )
-    except Exception:
+    except Exception as exc:
         try:
             from clash_proxy import report_fail
             report_fail(clash_node)
         except Exception:
             pass
+        try:
+            import domain_health as _dh
+
+            em = str(email_holder.get("email") or "")
+            if em:
+                _dh.record_fail(
+                    em, reason=_dh.classify_fail_reason(exc), cfg=config
+                )
+        except Exception:
+            pass
         raise
 
 
-def _register_one_account_cli_body(log_fn, stop_fn, accounts_output_file, clash_node=None):
+def _register_one_account_cli_body(
+    log_fn, stop_fn, accounts_output_file, clash_node=None, email_holder=None
+):
     email = ""
     dev_token = ""
     code = ""
     mail_ok = False
     max_mail_retry = 3
+    if email_holder is None:
+        email_holder = {"email": ""}
     for mail_try in range(1, max_mail_retry + 1):
         log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
         open_signup_page(log_callback=log_fn, cancel_callback=stop_fn)
@@ -4423,6 +4483,7 @@ def _register_one_account_cli_body(log_fn, stop_fn, accounts_output_file, clash_
         email, dev_token = fill_email_and_submit(
             log_callback=log_fn, cancel_callback=stop_fn
         )
+        email_holder["email"] = email or ""
         log_fn(f"[*] 邮箱: {email}")
         try:
             with _io_lock:
@@ -4513,6 +4574,12 @@ def _register_one_account_cli_body(log_fn, stop_fn, accounts_output_file, clash_
         sso, email, log_callback=log_fn, cpa_result=cpa_result
     )
     log_fn(f"[+] 注册成功: {email}")
+    try:
+        import domain_health as _dh
+
+        _dh.record_success(email, cfg=config)
+    except Exception:
+        pass
     # Community proxy_pool pattern: credit the exit node on success
     try:
         from clash_proxy import report_success
@@ -4568,6 +4635,7 @@ def _cli_worker_loop(worker_id, task_queue, total_count, controller, accounts_ou
                     with stats["lock"]:
                         stats["fail"] += 1
                     log_fn(f"[-] 注册失败: {exc}")
+                    # domain_health recorded inside _register_one_account_cli
                     slot_done = True
                 finally:
                     local_attempts += 1
@@ -4730,7 +4798,30 @@ def run_registration_cli(count):
         _restore_sigint_handler(prev_handler)
         with stats["lock"]:
             ok, bad = stats["success"], stats["fail"]
-        cli_log(f"[*] 任务结束。成功 {ok} | 失败 {bad}")
+        total = max(ok + bad, 1)
+        rate = 100.0 * ok / total
+        cli_log(
+            f"[*] 任务结束。成功 {ok} | 失败 {bad} | 成功率 {rate:.0f}% | 目标 {count}"
+        )
+        try:
+            import domain_health as _dh
+
+            cli_log(_dh.format_summary_line(config))
+        except Exception:
+            pass
+        # fail-class histogram from domain_health last_reasons (best-effort)
+        try:
+            snap = __import__("domain_health").snapshot(config)
+            reasons = {}
+            for ent in (snap.get("domains") or {}).values():
+                r = str(ent.get("last_reason") or "").strip()
+                if r:
+                    reasons[r] = reasons.get(r, 0) + 1
+            if reasons:
+                top = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])[:6])
+                cli_log(f"[*] 失败原因(末次/域名): {top}")
+        except Exception:
+            pass
 
 
 def run_registration_cli_loop(count_per_round):

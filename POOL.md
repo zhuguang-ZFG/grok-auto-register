@@ -47,6 +47,26 @@ python pool_maintain.py
 python grok_register_ttk.py -n 6 -c 1 -y
 ```
 
+### 域名健康与自动降权
+
+注册成功/失败会写入 `.domain_health.json`（gitignore）。连续失败或成功率过低时，域名会被临时降权，选邮箱时优先其它域。
+
+```bash
+python pool_status.py                    # 含域名健康摘要
+# 配置项见 config.example.json:
+# domain_health_fail_streak_demote / domain_health_demote_sec / domain_health_min_success_rate
+```
+
+### CLIProxy 路由策略（缓存 vs 号池）
+
+| 命令 | 含义 |
+|------|------|
+| `python set_cliproxy_routing.py status` | 查看当前 |
+| `python set_cliproxy_routing.py pool` | 轮询、关粘性（免费池默认，利换号） |
+| `python set_cliproxy_routing.py cache` | 开 session-affinity（利 prompt 缓存命中） |
+
+默认保持 `pool`。长会话想提高缓存命中再切 `cache`。
+
 ## Grok CLI 无感切换
 
 1. 定时任务跑 `run_maintain.bat` 维持 `cpa_auths` 健康  

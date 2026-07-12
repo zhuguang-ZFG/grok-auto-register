@@ -27,6 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import stdio_utf8  # noqa: F401
+except Exception:
+    pass
+
 
 LogFn = Callable[[str], None]
 

@@ -29,6 +29,10 @@ token.json
 .clash_node_stats.json
 .clash_node_stats.json.tmp
 
+# per-domain registration health / demotion
+.domain_health.json
+.domain_health.json.tmp
+
 *.log
 .DS_Store
 .idea/

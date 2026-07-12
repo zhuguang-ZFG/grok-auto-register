@@ -89,8 +89,33 @@ def main() -> None:
         n = sum(1 for ln in pending.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip())
         print(f"[*] 待重推: {n} （python grok_register_ttk.py --retry-push）")
 
+    try:
+        import domain_health as _dh
+
+        print(_dh.format_summary_line(cfg))
+    except Exception as exc:
+        print(f"[*] 域名健康: (unavailable: {exc})")
+
+    try:
+        from set_cliproxy_routing import DEFAULT_CONFIG, detect_profile, parse_routing
+
+        cpath = Path(DEFAULT_CONFIG)
+        if cpath.is_file():
+            parsed = parse_routing(cpath.read_text(encoding="utf-8"))
+            print(
+                f"[*] CLIProxy 路由: profile={detect_profile(parsed)} "
+                f"strategy={parsed.get('strategy')} affinity={parsed.get('session_affinity')}"
+            )
+    except Exception:
+        pass
+
     print("[*] 维持建议: 域名先接入 mail 后端；单批 6~12；并发 1；计划任务每 2~4 小时 run_pool.bat")
+    print("[*] 路由切换: python set_cliproxy_routing.py status|pool|cache")
 
 
 if __name__ == "__main__":
+    try:
+        import stdio_utf8  # noqa: F401
+    except Exception:
+        pass
     main()
