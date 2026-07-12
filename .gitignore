@@ -11,6 +11,7 @@ accounts_*.txt
 mail_credentials.txt
 *.txt
 !requirements.txt
+!mail_credentials.example.txt
 
 cpa_auths/
 screenshots/

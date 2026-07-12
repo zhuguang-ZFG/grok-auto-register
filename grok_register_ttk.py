@@ -20,6 +20,7 @@ import random
 import re
 import string
 import json
+from pathlib import Path
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 # Windows file redirects / Git Bash often use gbk; force UTF-8 log lines.
@@ -112,6 +113,26 @@ DEFAULT_CONFIG = {
     "local_grok_auth_auto": False,
     "local_grok_auth_path": "",
     "preferred_model": "grok-4.5",
+    # Fixed-inbox OTP backup (mailsapi get-code). NOT bulk register.
+    "mailsapi_email": "",
+    "mailsapi_get_code_url": "",
+    "mailsapi_entries": [],
+    "mailsapi_lines": [],
+    "mailsapi_credentials_file": "mail_credentials.txt",
+    "mailsapi_direct": True,
+    "mailsapi_accept_cached_code": False,
+    "mailsapi_resend_after_sec": 45,
+    # Hotmail/Outlook pool (optional; not default). See hotmail_pool.py
+    "hotmail_pool_path": "data/hotmail_pool.txt",
+    "hotmail_preflight_token": True,
+    "hotmail_pop_max_try": 5,
+    "hotmail_imap_host": "outlook.office365.com",
+    "hotmail_client_id": "",
+    "hotmail_resend_after_sec": 45,
+    # Mix Hotmail into Cloudflare domain registration to diversify risk.
+    # Only applies when email_provider is cloudflare/mixed (not pure hotmail).
+    "email_mix_hotmail": True,
+    "email_mix_hotmail_ratio": 0.6,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -1802,14 +1823,76 @@ def pick_domain(api_key=None):
 
 
 def get_email_provider():
-    return config.get("email_provider", "duckmail")
+    return str(config.get("email_provider", "duckmail") or "duckmail").strip().lower()
+
+
+def _hotmail_ms_domains():
+    return ("hotmail.com", "outlook.com", "live.com", "msn.com")
+
+
+def _is_ms_mail_address(email: str) -> bool:
+    em = (email or "").strip().lower()
+    if "@" not in em:
+        return False
+    dom = em.rsplit("@", 1)[-1]
+    return any(dom == d or dom.endswith("." + d) for d in _hotmail_ms_domains())
+
+
+def _is_hotmail_session(dev_token, email: str = "") -> bool:
+    """True when this signup used Hotmail pool (mixed or pure hotmail)."""
+    tok = str(dev_token or "").strip()
+    if tok.startswith("{") and "refresh_token" in tok:
+        return True
+    if _is_ms_mail_address(email) and tok.startswith("{"):
+        return True
+    return False
+
+
+def _email_mix_hotmail_enabled() -> bool:
+    """Whether Cloudflare/mixed registration should sometimes pop Hotmail."""
+    v = config.get("email_mix_hotmail", True)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
+def _email_mix_hotmail_ratio() -> float:
+    try:
+        r = float(config.get("email_mix_hotmail_ratio", 0.3) or 0.0)
+    except Exception:
+        r = 0.3
+    return max(0.0, min(1.0, r))
+
+
+def _try_hotmail_inbox():
+    import hotmail_pool as _hp
+
+    return _hp.pick_inbox(config)
 
 
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    # Diversify: under cloudflare/mixed, roll Hotmail ratio (risk spread).
+    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail") and _email_mix_hotmail_enabled():
+        ratio = _email_mix_hotmail_ratio()
+        if ratio > 0 and random.random() < ratio:
+            try:
+                email, tok = _try_hotmail_inbox()
+                # lightweight stderr so auto logs show mix hits without GUI callback
+                try:
+                    print(f"[*] email_mix: hotmail {email}", flush=True)
+                except Exception:
+                    pass
+                return email, tok
+            except Exception as exc:
+                # Pool empty / all dead RT → fall back to CF domains
+                try:
+                    print(f"[!] email_mix hotmail failed, fallback CF: {exc}", flush=True)
+                except Exception:
+                    pass
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
-    if provider == "cloudflare":
+    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail"):
         if not get_mail_backends() and not get_cloudflare_api_base():
             raise Exception("Cloudflare API Base / mail_backends 未配置")
         # 多后端四域名负载均衡（mail_backends + 池内最少域名优先）
@@ -1820,6 +1903,20 @@ def get_email_and_token(api_key=None):
         except ImportError as e:
             raise Exception(f"tempmail_lol module missing: {e}") from e
         return _tml.create_inbox(config)
+    if provider in ("mailsapi", "mailsapi_otp", "fixed_otp"):
+        try:
+            import mailsapi_otp as _mo
+        except ImportError as e:
+            raise Exception(f"mailsapi_otp module missing: {e}") from e
+        # (fixed_email, get_code_url) — not a random mailbox
+        return _mo.pick_inbox(config, root=Path(__file__).resolve().parent)
+    if provider in ("hotmail", "outlook", "hotmail_pool", "ms_mail"):
+        try:
+            import hotmail_pool as _hp
+        except ImportError as e:
+            raise Exception(f"hotmail_pool module missing: {e}") from e
+        # Pop one Hotmail line: (email, json account blob for IMAP OTP)
+        return _hp.pick_inbox(config)
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -1842,6 +1939,24 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    # Route by actual mailbox used (mixed CF+Hotmail must not use CF poll for @hotmail.com)
+    if _is_hotmail_session(dev_token, email) or (
+        provider in ("hotmail", "outlook", "hotmail_pool", "ms_mail")
+    ):
+        try:
+            import hotmail_pool as _hp
+        except ImportError as e:
+            raise Exception(f"hotmail_pool module missing: {e}") from e
+        return _hp.wait_code(
+            dev_token,
+            email,
+            cfg=config,
+            timeout=timeout,
+            poll_interval=max(3.0, float(poll_interval or 5)),
+            log=log_callback,
+            cancel=cancel_callback,
+            resend=resend_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1852,7 +1967,27 @@ def get_oai_code(
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
         )
-    if provider == "cloudflare":
+    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail"):
+        # Optional: fixed Gmail/OTP map for a known email without switching provider
+        try:
+            import mailsapi_otp as _mo
+
+            _otp_root = Path(__file__).resolve().parent
+            if _mo.resolve_url(email, config, root=_otp_root):
+                return _mo.wait_code(
+                    dev_token if str(dev_token or "").startswith("http") else "",
+                    email,
+                    cfg=config,
+                    timeout=timeout,
+                    poll_interval=poll_interval,
+                    log=log_callback,
+                    cancel=cancel_callback,
+                    resend=resend_callback,
+                    root=_otp_root,
+                )
+        except ImportError:
+            pass
+        # Mapped mailsapi emails must not fall through to CF inbox poll
         return cloudflare_get_oai_code(
             dev_token,
             email,
@@ -1876,6 +2011,23 @@ def get_oai_code(
             cancel=cancel_callback,
             resend=resend_callback,
         )
+    if provider in ("mailsapi", "mailsapi_otp", "fixed_otp"):
+        try:
+            import mailsapi_otp as _mo
+        except ImportError as e:
+            raise Exception(f"mailsapi_otp module missing: {e}") from e
+        return _mo.wait_code(
+            dev_token,
+            email,
+            cfg=config,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log=log_callback,
+            cancel=cancel_callback,
+            resend=resend_callback,
+            root=Path(__file__).resolve().parent,
+        )
+    # pure hotmail already handled at top via _is_hotmail_session
     return duckmail_get_oai_code(
         dev_token,
         email,
@@ -4143,7 +4295,7 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "tempmail_lol"],
+            ["duckmail", "yyds", "cloudflare", "tempmail_lol", "mailsapi", "hotmail"],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)

@@ -10,6 +10,13 @@ Modes (config pool_prefer_mode):
 
 CLIProxy only serves auth files with disabled!=true. Holding own accounts is the
 reliable way to force the proxy onto the buffer pool without a second auth-dir.
+
+Auto failover (community-style tiered pool — buffer ammo, own base):
+  When buffer_first and live buffer auth count falls below pool_buffer_min_live,
+  release prefer_buffer holds and switch to own_first so CLIProxy/quota_watch
+  can keep serving. Optional hysteresis: if buffer recovers above
+  pool_buffer_recover_live, soft-hold own again (only when
+  pool_buffer_auto_recover is true).
 """
 from __future__ import annotations
 
@@ -17,9 +24,13 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 HOLD_REASON = "prefer_buffer"
+
+# Defaults aligned with community "buffer ammo / own base" ops
+DEFAULT_BUFFER_MIN_LIVE = 50
+DEFAULT_BUFFER_RECOVER_LIVE = 120
 
 
 def parse_domains(raw: str | Iterable[str] | None) -> list[str]:
@@ -277,3 +288,192 @@ def release_own_hold(
             _atomic_write(path, data)
         stats["released"] += 1
     return stats
+
+
+def _truthy(v: Any, default: bool = True) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
+def is_live_auth_payload(data: dict[str, Any]) -> bool:
+    """Rough live check: not disabled and has access or refresh token."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("disabled"):
+        return False
+    at = str(data.get("access_token") or "").strip()
+    rt = str(data.get("refresh_token") or "").strip()
+    return bool(at or rt)
+
+
+def count_live_tiers(
+    auth_dir: Path,
+    cfg: dict[str, Any],
+) -> dict[str, int]:
+    """Count live (not disabled) own vs buffer CPA files."""
+    out = {
+        "own_live": 0,
+        "buffer_live": 0,
+        "own_held": 0,
+        "own_total": 0,
+        "buffer_total": 0,
+        "total": 0,
+    }
+    if not auth_dir.is_dir():
+        return out
+    for path in auth_dir.glob("xai-*.json"):
+        out["total"] += 1
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        own = is_own_path(path, cfg)
+        if own:
+            out["own_total"] += 1
+            if is_prefer_buffer_hold(data):
+                out["own_held"] += 1
+            if is_live_auth_payload(data):
+                out["own_live"] += 1
+        else:
+            out["buffer_total"] += 1
+            if is_live_auth_payload(data):
+                out["buffer_live"] += 1
+    return out
+
+
+def buffer_min_live(cfg: dict[str, Any]) -> int:
+    try:
+        return max(0, int(cfg.get("pool_buffer_min_live", DEFAULT_BUFFER_MIN_LIVE) or 0))
+    except Exception:
+        return DEFAULT_BUFFER_MIN_LIVE
+
+
+def buffer_recover_live(cfg: dict[str, Any]) -> int:
+    try:
+        return max(0, int(cfg.get("pool_buffer_recover_live", DEFAULT_BUFFER_RECOVER_LIVE) or 0))
+    except Exception:
+        return DEFAULT_BUFFER_RECOVER_LIVE
+
+
+def persist_prefer_mode(
+    cfg: dict[str, Any],
+    mode: str,
+    *,
+    config_path: Path | None = None,
+) -> dict[str, Any]:
+    """Update in-memory cfg prefer keys; optionally write config.json."""
+    mode = "buffer_first" if mode == "buffer_first" else "own_first"
+    cfg["pool_prefer_mode"] = mode
+    cfg["pool_prefer"] = mode
+    cfg["prefer_mode"] = mode
+    if mode == "buffer_first":
+        cfg["pool_local_use_buffer"] = True
+    if config_path is not None:
+        try:
+            raw = {}
+            if config_path.is_file():
+                raw = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raw = {}
+            raw["pool_prefer_mode"] = mode
+            raw["pool_prefer"] = mode
+            raw["prefer_mode"] = mode
+            if mode == "buffer_first":
+                raw["pool_local_use_buffer"] = True
+            text = json.dumps(raw, ensure_ascii=False, indent=2) + "\n"
+            tmp = config_path.with_suffix(config_path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, config_path)
+        except Exception:
+            pass
+    return cfg
+
+
+def ensure_buffer_failover(
+    auth_dir: Path,
+    cfg: dict[str, Any],
+    *,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Auto-release own holds when live buffer is low; optional recover.
+
+    Community practice: burn shared/buffer ammo first, keep own as base.
+    Without this, buffer_first soft-holds leave CLIProxy empty after buffer dies.
+
+    Returns action summary dict.
+    """
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    enabled = _truthy(cfg.get("pool_buffer_failover_enabled", True), True)
+    tiers = count_live_tiers(auth_dir, cfg)
+    mode = prefer_mode(cfg)
+    min_live = buffer_min_live(cfg)
+    recover_at = buffer_recover_live(cfg)
+    auto_recover = _truthy(cfg.get("pool_buffer_auto_recover", False), False)
+
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "mode_before": mode,
+        "mode_after": mode,
+        "action": "none",
+        "min_live": min_live,
+        "recover_at": recover_at,
+        "auto_recover": auto_recover,
+        "dry_run": dry_run,
+        **tiers,
+        "released": 0,
+        "held": 0,
+    }
+    if not enabled:
+        result["action"] = "disabled"
+        return result
+
+    # Failover: buffer thin → free own + own_first
+    if mode == "buffer_first" and tiers["buffer_live"] < min_live:
+        _log(
+            f"[prefer] buffer_live={tiers['buffer_live']} < min={min_live} "
+            f"→ release own holds + own_first"
+        )
+        if not dry_run:
+            st = release_own_hold(auth_dir, cfg, dry_run=False)
+            result["released"] = int(st.get("released") or 0)
+            persist_prefer_mode(cfg, "own_first", config_path=config_path)
+        result["action"] = "failover_to_own"
+        result["mode_after"] = "own_first"
+        return result
+
+    # Optional recover: buffer fat again → hold own + buffer_first
+    if (
+        auto_recover
+        and mode == "own_first"
+        and recover_at > 0
+        and tiers["buffer_live"] >= recover_at
+        and tiers["own_held"] == 0
+    ):
+        _log(
+            f"[prefer] buffer_live={tiers['buffer_live']} >= recover={recover_at} "
+            f"→ re-hold own + buffer_first"
+        )
+        if not dry_run:
+            persist_prefer_mode(cfg, "buffer_first", config_path=config_path)
+            st = hold_own_for_buffer(auth_dir, cfg, dry_run=False)
+            result["held"] = int(st.get("held") or 0)
+        result["action"] = "recover_to_buffer"
+        result["mode_after"] = "buffer_first"
+        return result
+
+    result["action"] = "hold"
+    return result

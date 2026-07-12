@@ -1,37 +1,37 @@
 # 运行状态快照
 
-> 记录时间：2026-07-12 19:32（本机 Asia/Shanghai 墙钟）  
+> 记录时间：2026-07-13 06:00（本机 Asia/Shanghai 墙钟）  
 > 仓库：`zhuguang-ZFG/grok-auto-register`  
-> 不含密钥 / 号池 JSON / 订阅 token。
+> 不含密钥 / 号池 JSON / 订阅 token / `mail_credentials` / Hotmail 号池正文。
 
 ## 1. 进程与入口
 
 | 组件 | 状态 | 备注 |
 |------|------|------|
-| CLIProxyAPI | 运行中 `:8317` | **7.2.67** (`2075f77c`, Built 2026-07-11) |
-| 注册机 `grok_register_ttk.py auto` | 运行中 | 隐藏窗口 / 1 并发 |
-| `quota_watch` | 运行中 | soft-disable + 静默 refresh |
-| Kimi CLI | `local-cpa/grok-4.5` → `http://127.0.0.1:8317/v1` | 已剔除失效中转模型 |
+| CLIProxyAPI | 运行中 `:8317` | 本机 `cli-proxy-api`；`auth-dir=cpa_auths` |
+| 注册机 `grok_register_ttk.py auto` | 运行中 | 隐藏窗口 / `concurrent_count=1` / `register_count=8` |
+| `quota_watch` | 运行中 | soft-disable + 静默 refresh + buffer failover |
+| Kimi CLI | `local-cpa/grok-4.5` → `http://127.0.0.1:8317/v1` | 本地号池 |
 
-路由：
+路由（CLIProxy）：
 
 ```text
 strategy=round-robin
 session-affinity=true
-session-affinity-ttl=4h
 profile=cache
 ```
 
-## 2. 号池水位（约 19:31）
+## 2. 号池水位（约 05:59）
 
 | 指标 | 数值 |
 |------|------|
-| CPA 文件 | ~4019 |
-| access 未过期（粗判） | ~3884 |
-| disabled | ~348 |
-| 自有域文件 | ~726 / 目标 2000（~36.3%） |
-| 缓冲域文件 | ~3293 |
-| 策略 | `pool_prefer_mode=own_first` |
+| CPA 文件 | ~2431 |
+| access 未过期（粗判） | ~2420 |
+| disabled | ~1309（含 prefer_buffer soft-hold） |
+| 自有域文件 | ~1138 / 目标 2000（~56.9%） |
+| 缓冲域文件 | ~1293 |
+| 策略 | **`pool_prefer_mode=buffer_first`**（先烧缓冲） |
+| 缓冲 live（约） | ~1000+；failover 阈值 `pool_buffer_min_live=50` |
 
 自有域名（`defaultDomains`）：
 
@@ -40,78 +40,78 @@ profile=cache
 - `zhuguang.de5.net`
 - `baoxia.top`
 
-域名健康（注册成功率粗算）：四域均 **>0.93**。
+缓冲来源示例：
 
-## 3. 铸造 / 补号
+- 社区包 `777.zip` → `*.oo-ooo.fun`（777，已 probe+全量 refresh）
+- 其它共享域 / `unknown.local` 历史导入
+
+Hotmail 铸造进 CPA（当缓冲弹药，不当 own 水位）：
+
+| 指标 | 约值 |
+|------|------|
+| `@hotmail.com` CPA | ~26 |
+| disabled / quota_cool | 0 / 0（样本仍小，新号为主） |
+
+巡检：`python scripts/hotmail_cpa_health.py`
+
+## 3. 邮箱与注册策略
 
 | 项 | 值 |
 |----|-----|
-| 并发 | **1** |
-| 每批 | **4** |
-| 轮间休息 | ~180s |
-| 铸造顺序 | Device → **Authcode PKCE** → Browser |
-| 近窗铸造 | protocol_ok≈92 / fail≈3；**authcode_ok≈4** / fail=0；browser≈0 |
-| 铸造后 probe | **关** |
-| mint 默认换出口 | **关**（仅 TLS 失败时 rotate） |
+| `email_provider` | `cloudflare`（主路径） |
+| CF Worker | `cloudflare_temp_email`（dreamhunter2333 系 API） |
+| `mail_backends` | 自有三域 + `baoxia.top` 第二后端 |
+| `email_mix_hotmail` | **true** |
+| `email_mix_hotmail_ratio` | **0.35**（约 35% Hotmail / 65% 自有域） |
+| Hotmail 池 | `data/hotmail_pool.txt`（~6.4 万 unique，gitignore） |
+| 固定 OTP 备用 | `mailsapi_otp` + `mail_credentials.txt`（不进 bulk 主路径） |
 
-## 4. Clash 出口隔离（本机已落地）
+出口：
 
-| 项 | 状态 |
-|----|------|
-| 模式 | **rule** |
-| 专用组 | **`注册专用`**（约 20 真实节点） |
-| 规则 | `x.ai` / `auth.x.ai` / `accounts.x.ai` / `grok.com` / `cli-chat-proxy` → 注册专用 |
-| 验证 | 注册专用换节点时，`悍刀行` / `GLOBAL` 可保持不变 |
-| 项目配置 | `clash_selector=注册专用`，`clash_force_global=false`，`clash_close_conns=false`，`clash_rotate_every_n=5` |
+- 统一 `http://127.0.0.1:7897`（Clash）
+- `clash_rotate_per_account` + `clash_rotate_every_n=5`（弱多 IP，非每号独立住宅 IP）
+- `http_proxy_enabled=false`（`all_proxies.txt` 未作主路径）
 
-增强写入位置（Clash Verge Rev，悍刀行 profile）：
+## 4. 近期质量（观察窗）
 
-- groups: `profiles/gjI9d9XqFzUo.yaml`
-- rules: `profiles/rqnAW40JSaDd.yaml`
-- merge: `profiles/muvS3ZaQD9v6.yaml`
-- 运行时曾 patch：`clash-verge.yaml`（订阅更新可能覆盖，见 [CLASH_ISOLATE.md](CLASH_ISOLATE.md)）
+修复 CF 收码 `resend_callback` 参数名 + 验证码误抽欢迎信 `app-img` 之后：
 
-## 5. 稳定性约定（代码已合入）
+| 窗口 | 成功率（约） |
+|------|----------------|
+| RESTART 后连续多轮 | **~100%**（多轮 8/0） |
+| 更大日志尾部（含历史噪声） | **~90%** |
 
-详见 [HARDEN.md](HARDEN.md)：
+域名健康粗率：自有四域 ~95%+；`hotmail.com` 累计 ~85%+（含早期失败）。
 
-- soft-disable，禁止 live 号池硬删风暴  
-- 恢复窗口默认 6h 滚动  
-- 终端 `refresh_revoked` purge 跳过  
-- 静默 JWT refresh（`quota_watch_pool_refresh_*`）  
-- pool_status 输出 sticky reselect / REMOVE / authcode 计数  
+## 5. 本阶段已落地（相对上一快照）
 
-近窗 sticky tail 示例（波动正常，额度耗尽会 reselect）：
+1. **分层号池**：`buffer_first` + 自有 soft-hold；`ensure_buffer_failover`（缓冲 live&lt;50 → 自动放开自有）挂 maintain / quota_watch / `set_pool_prefer.py check`  
+2. **777 CPA 导入**：probe fuse + 全量 refresh 写入缓冲  
+3. **Hotmail 号池**：入库、IMAP XOAUTH2 收码、注册机 `email_provider=hotmail` 与 **CF 混用 0.35**  
+4. **mailsapi 固定 OTP**：备用通道，不替代 CF 批量  
+5. **巡检脚本**：`scripts/hotmail_cpa_health.py`、`scripts/_restart_register_auto.py`  
+6. **正确性修复**：`cloudflare_get_oai_code(..., resend_callback=)`；Hotmail 验证码过滤 Outlook 欢迎信  
 
-```text
-hit≈53 reselect≈28 rate≈35% REMOVE≈115
-```
+## 6. 运维命令速查
 
-## 6. 近期运维动作（已执行）
-
-1. 导入社区 CPA 包（第一弹 1000 + 第二弹 2000）→ 缓冲水位拉高  
-2. 静默 refresh 一批临期号（例：40 候选 / 28 成功）  
-3. 本机性能：1 并发、降频 poll、清理多余调试 Chrome  
-4. Kimi `config.toml`：删除 klsf / 未登录 kimi-code 别名 / venlacy / voya；默认 `local-cpa/grok-4.5`  
-5. GitHub 已推：authcode fallback、HARDEN、sticky 指标、测试  
-
-## 7. 未入库（有意）
-
-- `config.json`、`cpa_auths/`、代理列表、邮箱密钥  
-- Clash 订阅 URL / secret  
-- 本机绝对路径运行时状态  
-
-## 8. 建议后续
-
-- 继续 1 并发补自有域至 2000  
-- 订阅更新后确认「注册专用」仍在；消失则按 CLASH_ISOLATE 重载增强  
-- CLIProxy 跟官方 7.2.x 小版本  
-- 观察 sticky reselect 是否随 soft-disable 继续下降  
-
-## 9. 一键自检
-
-```bash
+```bat
 python pool_status.py
-python set_cliproxy_routing.py status
-python proxy_health.py
+python set_pool_prefer.py status
+python set_pool_prefer.py check
+python scripts/hotmail_cpa_health.py
+python hotmail_pool.py
+python hotmail_pool.py --smoke --imap-list
+python grok_register_ttk.py auto
+python scripts/_restart_register_auto.py
 ```
+
+## 7. 已知边界
+
+- 合盖/睡眠仍影响无人值守（见 `docs/UNATTENDED.md` / power 脚本）  
+- sticky reselect 偏高时：查 soft-disable / REMOVE，勿硬删 live  
+- 共享缓冲与 Hotmail 野号：注册成功率高 ≠ 长期不废；持续用 `hotmail_cpa_health` + hard_purge 盯  
+- 避免同时跑多个 `auto`/`start`（抢浏览器）
+
+## 8. 不提交内容
+
+`config.json`、`cpa_auths/`、`data/hotmail_pool.txt`、`mail_credentials.txt`、tokens、代理明文列表。

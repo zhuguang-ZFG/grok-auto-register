@@ -1615,6 +1615,30 @@ def once(
         except Exception as exc:
             _log(log, f"[quota] reenable recovered error: {exc}")
 
+    # --- buffer-first auto failover: thin buffer → release own soft-holds ---
+    # Community tiered pool: burn shared ammo first, own as base. Without this,
+    # prefer_buffer holds leave CLIProxy empty after buffer dies.
+    if cfg.get("pool_buffer_failover_enabled", True) and not dry_run:
+        try:
+            from pool_policy import ensure_buffer_failover
+
+            auth_dir = resolve_path(cfg.get("cpa_auth_dir") or "cpa_auths", ROOT / "cpa_auths")
+            fo = ensure_buffer_failover(
+                auth_dir,
+                cfg,
+                config_path=DEFAULT_CONFIG if DEFAULT_CONFIG.is_file() else None,
+                log=lambda m: _log(log, m),
+            )
+            if fo.get("action") not in (None, "none", "hold", "disabled"):
+                report["buffer_failover"] = fo
+                _log(
+                    log,
+                    f"[quota] buffer_failover action={fo.get('action')} "
+                    f"buffer_live={fo.get('buffer_live')} mode={fo.get('mode_after')}",
+                )
+        except Exception as exc:
+            _log(log, f"[quota] buffer failover error: {exc}")
+
     # --- optional sample probe: scale water level by live ratio ---
     sample_n = int(cfg.get("quota_watch_sample_probe_n") or 0)
     sample_interval = float(cfg.get("quota_watch_sample_probe_interval_sec") or 900)

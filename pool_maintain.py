@@ -209,19 +209,42 @@ def main() -> int:
         # 自动挂接 CLI auth 目录
         run([py, str(ROOT / "auto_link_cli.py")], log)
 
-        # buffer_first：新注册的自有号也 soft-hold，继续先烧缓冲
+        # prefer policy: buffer ammo → own base (community tiered pool)
+        # 1) if buffer_first and buffer thin → auto release own (failover)
+        # 2) if still buffer_first → re-hold newly minted own accounts
         try:
-            from pool_policy import hold_own_for_buffer, prefer_mode
+            from pool_policy import (
+                ensure_buffer_failover,
+                hold_own_for_buffer,
+                prefer_mode,
+            )
 
+            ad = ROOT / str(cfg.get("cpa_auth_dir") or "cpa_auths")
+            if not ad.is_absolute():
+                ad = (ROOT / ad).resolve()
+
+            def _plog(msg: str) -> None:
+                print(msg)
+                log.write(msg + "\n")
+
+            fo = ensure_buffer_failover(
+                ad, cfg, config_path=CONFIG, log=_plog
+            )
+            print(
+                f"[*] buffer_failover action={fo.get('action')} "
+                f"buffer_live={fo.get('buffer_live')} "
+                f"mode={fo.get('mode_after')}"
+            )
+            log.write(f"buffer_failover: {fo}\n")
+
+            # reload prefer after possible config write
+            cfg = load_cfg() or cfg
             if prefer_mode(cfg) == "buffer_first":
-                ad = ROOT / str(cfg.get("cpa_auth_dir") or "cpa_auths")
-                if not ad.is_absolute():
-                    ad = (ROOT / ad).resolve()
                 st_hold = hold_own_for_buffer(ad, cfg)
                 print(f"[*] prefer=buffer_first re-hold own: {st_hold}")
                 log.write(f"re-hold own: {st_hold}\n")
         except Exception as exc:
-            print(f"[!] re-hold own failed: {exc}")
+            print(f"[!] prefer/buffer failover failed: {exc}")
 
         # 状态快照
         run([py, str(ROOT / "pool_status.py")], log)

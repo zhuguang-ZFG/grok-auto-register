@@ -18,6 +18,8 @@
 | Chromium 轻量 flag | `chromium_mute_audio` 默认；`chromium_slim` 可选 |
 | TabPool / 多线程 CLI | `tab_pool.py` + `register_cli.py`（可选，不改默认 auto） |
 | 缓冲抽检 | `scripts/buffer_health_sample.py` |
+| 分层号池：先烧缓冲 | `set_pool_prefer.py buffer` + soft-hold own |
+| 缓冲低水位自动接自有 | `pool_policy.ensure_buffer_failover`（maintain / quota_watch / `check`） |
 
 ## 社区有、仍可选（未默认打开）
 
@@ -25,7 +27,7 @@
 |----|------|--------|
 | `register_cli.py --threads N` | 多浏览器吃内存/代理 | 自有水位低且代理稳 |
 | `chromium_slim: true` | 可能影响页面脚本 | 内存紧时试 |
-| Hotmail XOAUTH2 | 要凭证池 | 有 Outlook 再上 |
+| Hotmail 号池 + IMAP XOAUTH2 | 已接 `email_provider=hotmail` + **CF 混用** | `email_mix_hotmail=true` + `email_mix_hotmail_ratio=0.35`；巡检 `scripts/hotmail_cpa_health.py` |
 | HTTP 代理池文件 | 与 Clash 注册组二选一为主 | 节点池更稳时 |
 | 无头注册 | CF 常拦 | 协议+打码足够时再碰 |
 
@@ -45,4 +47,22 @@ python register_cli.py --help
 1. **缓冲当弹药，自有当基本盘**  
 2. **共享包必 probe，禁止盲导**  
 3. **加吞吐先稳代理，再加线程**  
-4. **不覆盖本机 ops 去追 upstream 全文**
+4. **不覆盖本机 ops 去追 upstream 全文**  
+5. **buffer_first 必须有低水位 failover**（否则缓冲烧光 + own hold = 空池）
+
+### 缓冲自动接自有（本机默认）
+
+```text
+pool_buffer_failover_enabled: true   # 开
+pool_buffer_min_live: 50             # buffer live < 50 → 放开自有 + own_first
+pool_buffer_auto_recover: false      # 缓冲回升后是否再 hold 自有（默认关，防抖）
+pool_buffer_recover_live: 120        # 仅 auto_recover=true 时生效
+```
+
+```bat
+python set_pool_prefer.py status
+python set_pool_prefer.py check
+python set_pool_prefer.py buffer
+python set_pool_prefer.py own
+python scripts/hotmail_cpa_health.py
+```

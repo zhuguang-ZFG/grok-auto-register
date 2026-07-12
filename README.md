@@ -51,6 +51,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
 - 支持多 worker 并发注册（`concurrent_count`），每个 worker 独立浏览器与隔离 profile。
 - 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
+- 支持 mailsapi 固定收件箱 OTP 备用通道（`email----get-code-url`，不走批量注册主路径）。
 - 支持验证码邮件轮询和解析。
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。

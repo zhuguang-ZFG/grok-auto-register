@@ -7,7 +7,9 @@ import unittest
 from pathlib import Path
 
 from pool_policy import (
+    count_live_tiers,
     domain_matches,
+    ensure_buffer_failover,
     is_own_email,
     is_own_path,
     tag_pool_source,
@@ -58,6 +60,78 @@ class WatermarkFlagTests(unittest.TestCase):
 
     def test_string_false(self):
         self.assertFalse(watermark_own_only({"pool_watermark_own_only": "false"}))
+
+
+class BufferFailoverTests(unittest.TestCase):
+    def test_failover_releases_own_when_buffer_thin(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            ad = Path(td)
+            cfg = {
+                "defaultDomains": "baoxia.top",
+                "pool_prefer_mode": "buffer_first",
+                "pool_buffer_min_live": 2,
+                "pool_buffer_failover_enabled": True,
+            }
+            # 1 live buffer, 1 held own
+            (ad / "xai-a@wild.example.json").write_text(
+                json.dumps(
+                    {
+                        "email": "a@wild.example",
+                        "access_token": "t",
+                        "disabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (ad / "xai-b@baoxia.top.json").write_text(
+                json.dumps(
+                    {
+                        "email": "b@baoxia.top",
+                        "access_token": "t",
+                        "disabled": True,
+                        "hold_reason": "prefer_buffer",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fo = ensure_buffer_failover(ad, cfg, config_path=None, dry_run=False)
+            self.assertEqual(fo["action"], "failover_to_own")
+            self.assertEqual(cfg["pool_prefer_mode"], "own_first")
+            own = json.loads((ad / "xai-b@baoxia.top.json").read_text(encoding="utf-8"))
+            self.assertFalse(own.get("disabled"))
+            self.assertNotIn("hold_reason", own)
+
+    def test_hold_when_buffer_healthy(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            ad = Path(td)
+            cfg = {
+                "defaultDomains": "baoxia.top",
+                "pool_prefer_mode": "buffer_first",
+                "pool_buffer_min_live": 1,
+                "pool_buffer_failover_enabled": True,
+            }
+            for i in range(3):
+                (ad / f"xai-b{i}@wild.example.json").write_text(
+                    json.dumps(
+                        {
+                            "email": f"b{i}@wild.example",
+                            "access_token": "t",
+                            "disabled": False,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            fo = ensure_buffer_failover(ad, cfg, dry_run=True)
+            self.assertEqual(fo["action"], "hold")
+            self.assertGreaterEqual(fo["buffer_live"], 1)
 
 
 if __name__ == "__main__":
