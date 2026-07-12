@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,8 +50,23 @@ def load_cfg() -> dict[str, Any]:
 def atomic_write(path: Path, payload: dict[str, Any]) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    last_err: BaseException | None = None
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
 
 
 def needs_refresh(

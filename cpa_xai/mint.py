@@ -140,10 +140,14 @@ def mint_and_export(
                 if attempt < attempts and transient:
                     if rotate_egress_on_tls:
                         eg = rotate_mint_egress(log)
-                        if eg.get("proxy"):
-                            resolved = _apply_proxy(str(eg.get("proxy")))
+                        # Prefer freshly rotated HTTP-list URL; Clash same-port re-pin.
+                        new_proxy = eg.get("proxy")
+                        if new_proxy:
+                            resolved = _apply_proxy(str(new_proxy))
                         elif eg.get("ok"):
-                            resolved = _apply_proxy(proxy if proxy is not None else resolved)
+                            resolved = _apply_proxy(
+                                proxy if proxy is not None else resolved
+                            )
                     time.sleep(1.0 * attempt)
                     continue
                 # Do not return on protocol_only yet — authcode fallback still counts as protocol.
@@ -158,10 +162,13 @@ def mint_and_export(
                 if attempt < attempts and transient:
                     if rotate_egress_on_tls:
                         eg = rotate_mint_egress(log)
-                        if eg.get("proxy"):
-                            resolved = _apply_proxy(str(eg.get("proxy")))
+                        new_proxy = eg.get("proxy")
+                        if new_proxy:
+                            resolved = _apply_proxy(str(new_proxy))
                         elif eg.get("ok"):
-                            resolved = _apply_proxy(proxy if proxy is not None else resolved)
+                            resolved = _apply_proxy(
+                                proxy if proxy is not None else resolved
+                            )
                     time.sleep(1.0 * attempt)
                     continue
                 break
@@ -208,8 +215,9 @@ def mint_and_export(
                     if attempt < ac_attempts and transient:
                         if rotate_egress_on_tls:
                             eg = rotate_mint_egress(log)
-                            if eg.get("proxy"):
-                                resolved = _apply_proxy(str(eg.get("proxy")))
+                            new_proxy = eg.get("proxy")
+                            if new_proxy:
+                                resolved = _apply_proxy(str(new_proxy))
                             elif eg.get("ok"):
                                 resolved = _apply_proxy(
                                     proxy if proxy is not None else resolved

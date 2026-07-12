@@ -178,11 +178,21 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    last_err: BaseException | None = None
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            # Windows: target may be briefly locked by CLIProxy file watcher.
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
 
 
 def merge_config(path: Path | None = None) -> dict[str, Any]:
@@ -497,42 +507,74 @@ def list_cpa_pool(cfg: dict[str, Any], *, drop_expired: bool = False) -> list[Pa
     return out
 
 
+class DeadRefreshError(Exception):
+    """Refresh token definitively revoked/invalid — soft-disable as refresh_revoked.
+
+    Used by the subprocess fallback so transient network/JSON failures are *not*
+    aliased to a terminal state (Reasonix P1: never set OAuthDeviceError = Exception).
+    """
+
+
+def _access_token_exp(payload: dict[str, Any]) -> float | None:
+    """JWT exp epoch for sorting soonest-to-expire first; None if unknown."""
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        return None
+    try:
+        import base64 as _b64
+
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        seg = parts[1]
+        seg += "=" * (-len(seg) % 4)
+        claims = json.loads(_b64.urlsafe_b64decode(seg))
+        exp = int(claims.get("exp") or 0)
+        return float(exp) if exp > 0 else None
+    except Exception:
+        return None
+
+
 def purge_dead_pool(
     cfg: dict[str, Any],
     *,
     log: LogFn | None = None,
     max_per_run: int = 20,
 ) -> dict[str, Any]:
-    """扫描过期凭证，尝试 refresh；失败的移入 cpa_auths_dead/。
+    """扫描过期凭证，尝试 refresh；失败的 soft-disable（不硬 MOVE）。
 
     每次最多处理 max_per_run 个，避免阻塞主循环太久。
-    返回 {refreshed: int, purged: int, errors: int}。
+    返回 {refreshed: int, purged: int, errors: int, ...}。
     """
     pool = list_cpa_pool(cfg)
-    pool_dir = resolve_path(cfg.get("cpa_auth_dir"), ROOT / "cpa_auths")
-    dead_dir = pool_dir.parent / "cpa_auths_dead"
     stats = {"refreshed": 0, "purged": 0, "errors": 0, "scanned": 0}
 
-    _use_subprocess = False
+    # Only these exception types mark refresh_revoked (terminal).
+    # Subprocess path must NEVER widen this to bare Exception.
+    _terminal_exc: tuple[type[BaseException], ...] = (DeadRefreshError,)
     try:
         from cpa_xai.oauth_device import refresh_access_token, OAuthDeviceError
+
+        _terminal_exc = (OAuthDeviceError, DeadRefreshError)
     except Exception:
         try:
             import importlib.util
+
             _od_path = str(ROOT / "cpa_xai" / "oauth_device.py")
             _spec = importlib.util.spec_from_file_location("cpa_xai.oauth_device", _od_path)
             _mod = importlib.util.module_from_spec(_spec)
+            assert _spec is not None and _spec.loader is not None
             _spec.loader.exec_module(_mod)
             refresh_access_token = _mod.refresh_access_token
             OAuthDeviceError = _mod.OAuthDeviceError
+            _terminal_exc = (OAuthDeviceError, DeadRefreshError)
         except Exception as exc2:
             _log(log, f"[pool-purge] in-process import failed ({exc2}), using subprocess fallback")
-            _use_subprocess = True
-            OAuthDeviceError = Exception  # type: ignore[misc,assignment]
 
             def refresh_access_token(rt: str, *, proxy: str | None = None, **_kw: Any) -> Any:  # type: ignore[misc]
                 """Subprocess fallback: call _refresh_token.py in a clean Python."""
                 import subprocess as _sp
+
                 python = str(cfg.get("quota_watch_python") or sys.executable)
                 script = str(ROOT / "_refresh_token.py")
                 cmd = [python, script, rt]
@@ -540,23 +582,28 @@ def purge_dead_pool(
                     cmd.append(proxy)
                 try:
                     proc = _sp.run(cmd, capture_output=True, text=True, timeout=30)
-                    data = json.loads(proc.stdout.strip()) if proc.stdout.strip() else {}
+                    raw_out = (proc.stdout or "").strip()
+                    data = json.loads(raw_out) if raw_out else {}
                 except Exception as e:
-                    raise Exception(f"subprocess refresh failed: {e}") from e
+                    # Transient: timeout, JSON decode, empty stdout — not terminal.
+                    raise RuntimeError(f"subprocess refresh failed: {e}") from e
                 if not data.get("ok"):
-                    err_msg = data.get("error", "unknown")
+                    err_msg = str(data.get("error") or "unknown")
+                    # Only explicit dead=true from _refresh_token.py → terminal.
                     if data.get("dead"):
-                        raise OAuthDeviceError(err_msg)
-                    raise Exception(f"refresh error: {err_msg}")
+                        raise DeadRefreshError(err_msg)
+                    raise RuntimeError(f"refresh error: {err_msg}")
                 from types import SimpleNamespace
+
                 return SimpleNamespace(
                     access_token=data["access_token"],
                     refresh_token=data["refresh_token"],
                     expires_in=data.get("expires_in", 21600),
                 )
 
+            _terminal_exc = (DeadRefreshError,)
+
     proxy = str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip() or None
-    processed = 0
     # Terminal soft-disable reasons: never re-write these files every poll.
     # atomic_write/os.replace is seen by CLIProxy as REMOVE+CREATE and blows up
     # session-affinity reselect (community sticky cache miss pattern).
@@ -570,22 +617,28 @@ def purge_dead_pool(
     stats["skipped_terminal"] = 0
     stats["skipped_disabled"] = 0
 
+    # Build expired candidates sorted by JWT exp ascending (soonest first).
+    # Large pools + max_per_run=20 otherwise starve tail files for many cycles.
+    candidates: list[tuple[float, Path, dict[str, Any]]] = []
     for p in pool:
-        if processed >= max_per_run:
-            break
         payload = load_json(p)
         if not pool_token_is_expired(payload):
             continue
-
         qs = payload.get("quota_state") or {}
         reason = str(qs.get("reason") or "")
-        # Already known-dead RT: do not rewrite / re-hit token endpoint.
         if payload.get("disabled") and reason in _TERMINAL_REASONS:
             stats["skipped_terminal"] += 1
             continue
+        exp = _access_token_exp(payload)
+        candidates.append((exp if exp is not None else 0.0, p, payload))
+    candidates.sort(key=lambda t: t[0])
 
-        processed += 1
+    for _exp, p, payload in candidates:
+        if stats["scanned"] >= max_per_run:
+            break
         stats["scanned"] += 1
+        qs = payload.get("quota_state") or {}
+        reason = str(qs.get("reason") or "")
 
         rt = str(payload.get("refresh_token") or "").strip()
         if not rt:
@@ -614,15 +667,15 @@ def purge_dead_pool(
             payload["refresh_token"] = result.refresh_token
             payload["expires_in"] = result.expires_in
             from cpa_xai.schema import expired_from_access_token
+
             exp_s, _, _ = expired_from_access_token(result.access_token)
             payload["expired"] = exp_s
-            from datetime import datetime, timezone
             payload["last_refresh"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             # Keep existing disabled/quota_state if this was a free-tier hold;
             # only refresh tokens so the account is ready when recover_after hits.
             atomic_write_json(p, payload)
             stats["refreshed"] += 1
-        except OAuthDeviceError:
+        except _terminal_exc:
             # Revoked RT: soft-disable once; never rewrite every cycle.
             if payload.get("disabled") and reason == "refresh_revoked":
                 stats["skipped_terminal"] += 1
@@ -640,6 +693,7 @@ def purge_dead_pool(
             except Exception:
                 stats["errors"] += 1
         except Exception:
+            # Network / JSON / non-dead helper errors — retry next cycle.
             stats["errors"] += 1
 
     if stats["scanned"] > 0 or stats.get("skipped_terminal"):

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,16 +47,57 @@ RESET_WINDOW_SEC = 6 * 3600  # default recovery window (see _recover_window_sec)
 LogFn = Callable[[str], None]
 
 
+def parse_recover_after(raw: Any) -> float:
+    """Normalize recover_after to Unix epoch seconds.
+
+    Canonical writers use float timestamps. Older pool_health.soft_disable wrote
+    ISO-8601 strings; accept both so reenable never ValueError-crashes the loop.
+    """
+    if raw is None or raw is False:
+        return 0.0
+    if isinstance(raw, (int, float)):
+        try:
+            v = float(raw)
+            return v if v > 0 else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+    s = str(raw).strip()
+    if not s:
+        return 0.0
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        pass
+    # ISO-8601: 2026-07-12T11:00:00Z / with offset
+    try:
+        iso = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return 0.0
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     """Write JSON atomically: write to .tmp then os.replace()."""
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    last_err: BaseException | None = None
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
 
 
 def find_cpa_by_key_prefix(auth_dir: Path, key_prefix: str) -> Path | None:
@@ -100,12 +142,13 @@ def mark_account_exhausted(
         now = time.time()
         # Keep original recover window so repeated 429/probe marks cannot push
         # recover_after forever into the future.
-        prev_recover = float(qs.get("recover_after") or 0)
+        prev_recover = parse_recover_after(qs.get("recover_after"))
         if not qs.get("exhausted_at"):
             qs["exhausted_at"] = now
         if prev_recover and prev_recover > now:
             # still within existing recovery window — only refresh reason/tokens
-            pass
+            # Normalize legacy ISO strings to float for future readers.
+            qs["recover_after"] = prev_recover
         else:
             qs["recover_after"] = now + _recover_window_sec()
         if tokens_used:
@@ -118,7 +161,7 @@ def mark_account_exhausted(
         _atomic_write_json(cpa_file, data)
         if log:
             email = data.get("email", cpa_file.name)
-            remain = int(max(0, float(qs.get("recover_after") or 0) - now))
+            remain = int(max(0, parse_recover_after(qs.get("recover_after")) - now))
             log(f"[quota] marked {email} exhausted+disabled (recovers in ~{remain // 3600}h)")
     except Exception as exc:
         if log:
@@ -132,7 +175,7 @@ def is_account_recovered(cpa_file: Path) -> bool:
     try:
         data = json.loads(cpa_file.read_text(encoding="utf-8"))
         qs = data.get("quota_state", {})
-        recover_after = qs.get("recover_after") or 0
+        recover_after = parse_recover_after(qs.get("recover_after"))
         if not recover_after:
             return True  # never exhausted
         return time.time() >= recover_after
@@ -147,7 +190,7 @@ def recover_in_sec(cpa_file: Path) -> int:
     try:
         data = json.loads(cpa_file.read_text(encoding="utf-8"))
         qs = data.get("quota_state", {})
-        recover_after = qs.get("recover_after") or 0
+        recover_after = parse_recover_after(qs.get("recover_after"))
         if not recover_after:
             return 0
         remain = int(recover_after - time.time())
@@ -205,7 +248,7 @@ def reenable_recovered_accounts(
         if reason in _TERMINAL:
             stats["skipped_terminal"] += 1
             continue
-        recover_after = float(qs.get("recover_after") or 0)
+        recover_after = parse_recover_after(qs.get("recover_after"))
         disabled = bool(data.get("disabled"))
         if not recover_after and not disabled:
             continue

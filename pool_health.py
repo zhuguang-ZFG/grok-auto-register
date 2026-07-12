@@ -66,6 +66,8 @@ def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: f
     """轻量探测：对 cli-chat-proxy 发一条极短 models/list 或 chat 预检。
 
     优先 GET {base}/models；失败再记原因。不在这里打真实对话，避免耗额度。
+    Prefer curl_cffi Chrome TLS when available (mint path fingerprint); fall back
+    to stdlib urllib so health checks still work without the optional dep.
     """
     base = (base_url or "https://cli-chat-proxy.grok.com/v1").rstrip("/")
     url = base + "/models"
@@ -75,6 +77,37 @@ def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: f
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
         "x-grok-client-version": "0.2.93",
     }
+
+    cffi_err: str | None = None
+    # --- curl_cffi path (Chrome TLS fingerprint, matches mint) ---
+    try:
+        from curl_cffi import requests as creq
+    except ImportError:
+        creq = None  # type: ignore[assignment]
+    if creq is not None:
+        try:
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            resp = creq.get(
+                url,
+                headers=headers,
+                proxies=proxies,
+                timeout=timeout,
+                impersonate="chrome",
+            )
+            code = int(getattr(resp, "status_code", 0) or 0)
+            body = (getattr(resp, "text", None) or "")[:300]
+            if 200 <= code < 300:
+                return True, f"HTTP {code}"
+            if code == 429:
+                return True, f"HTTP 429 rate-limited (alive): {body[:80]}"
+            # Auth/client errors from curl_cffi are definitive — no urllib retry.
+            if code in (401, 403, 400):
+                return False, f"HTTP {code}: {body[:160]}"
+            # Soft/network-ish status: fall through to urllib once.
+            cffi_err = f"HTTP {code}: {body[:80]}"
+        except Exception as e:  # noqa: BLE001
+            cffi_err = f"{type(e).__name__}: {e}"
+
     handlers: list[Any] = []
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
@@ -96,7 +129,8 @@ def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: f
             return True, f"HTTP 429 rate-limited (alive): {body[:80]}"
         return False, f"HTTP {e.code}: {body[:160]}"
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        note = f" (curl_cffi: {cffi_err})" if cffi_err else ""
+        return False, f"{type(e).__name__}: {e}{note}"
 
 
 def refresh_auth_file(path: Path, proxy: str | None) -> tuple[bool, str, dict | None]:
@@ -213,20 +247,31 @@ def soft_disable(path: Path, reason: str, *, hours: float = 24.0) -> None:
     except Exception:
         data = {}
     data["disabled"] = True
-    recover_after = datetime.now(timezone.utc) + timedelta(hours=hours)
+    # Canonical recover_after is Unix epoch float (matches cpa_xai.usage / quota_watch).
+    # Do not write ISO strings — reenable used to float() them and ValueError.
+    now = time.time()
     data["quota_state"] = {
         "reason": "probe_or_refresh_fail",
         "detail": str(reason)[:300],
-        "recover_after": recover_after.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "marked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "recover_after": now + float(hours) * 3600.0,
+        "marked_at": now,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    last_err: BaseException | None = None
+    for attempt in range(3):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            return
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
 
 
 def quarantine(path: Path, dead_dir: Path, reason: str, *, hard: bool = False) -> None:

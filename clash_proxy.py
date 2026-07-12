@@ -300,11 +300,39 @@ def rotate_node(
         stats = _load_stats()
         candidates = [n for n in real if n != avoid and _node_score(n, stats) >= 0]
         if not candidates:
-            # All soft-disabled — re-enable all and try again
-            for n in list(stats.get("nodes", {}).keys()):
-                stats["nodes"][n]["disabled"] = False
+            # All soft-disabled — recover carefully (Reasonix P2).
+            # Prefer historically-ok nodes (success>0) so pure-fail nodes stay out
+            # of the first recovery window; if none, re-enable everything and warn.
+            nodes = stats.setdefault("nodes", {})
+            disabled_in_sel = [
+                n for n in real if bool((nodes.get(n) or {}).get("disabled"))
+            ]
+            preferred = [
+                n
+                for n in disabled_in_sel
+                if int((nodes.get(n) or {}).get("success") or 0) > 0
+            ]
+            if preferred:
+                for n in preferred:
+                    nodes.setdefault(n, {"success": 0, "fail": 0})["disabled"] = False
+                _safe_log(
+                    log,
+                    f"[clash] mass re-enable preferred success>0 count={len(preferred)} "
+                    f"left_disabled={len(disabled_in_sel) - len(preferred)}",
+                )
+            else:
+                for n in list(nodes.keys()):
+                    nodes[n]["disabled"] = False
+                _safe_log(
+                    log,
+                    f"[clash] WARNING mass re-enable ALL soft-disabled "
+                    f"count={len(nodes)} pure_fail_in_sel="
+                    f"{sum(1 for n in disabled_in_sel if int((nodes.get(n) or {}).get('success') or 0) == 0)}",
+                )
             _save_stats(stats)
-            candidates = [n for n in real if n != avoid] or list(real)
+            candidates = [n for n in real if n != avoid and _node_score(n, stats) >= 0]
+            if not candidates:
+                candidates = [n for n in real if n != avoid] or list(real)
 
         # Score: high success rate first, then low delay
         scored: list[tuple[float, int, str]] = []

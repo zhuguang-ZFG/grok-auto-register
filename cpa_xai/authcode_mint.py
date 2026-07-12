@@ -134,8 +134,11 @@ def _session(proxy: str | None, log: LogFn):
     except ImportError as exc:
         raise ProtocolMintError("curl_cffi required for authcode mint") from exc
     s = creq.Session()
+    # Always set proxies so a reused Session never keeps a stale proxy pin.
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
+    else:
+        s.proxies = {}
     return s
 
 
