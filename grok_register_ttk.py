@@ -361,10 +361,99 @@ DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
 def get_proxies():
-    proxy = config.get("proxy", "")
+    # Prefer runtime-selected HTTP proxy (http_proxy_pool / env), then config.proxy
+    proxy = (
+        str(config.get("_runtime_http_proxy") or "").strip()
+        or str(__import__("os").environ.get("GROK_HTTP_PROXY") or "").strip()
+        or str(config.get("proxy", "") or "").strip()
+    )
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def rotate_egress_proxy(log_fn=None):
+    """Rotate Clash node and/or HTTP list proxy before each registration.
+
+    Community HTTP lists (e.g. all_proxies.txt) are often overseas-only; they
+    only apply when http_proxy_enabled and pick() succeeds.
+    Returns dict {clash_node, http_proxy}.
+    """
+    out = {"clash_node": None, "http_proxy": None}
+    prefer_http = bool(config.get("http_proxy_prefer_over_clash"))
+    http_url = None
+    clash_node = None
+
+    def _try_http():
+        nonlocal http_url
+        try:
+            import http_proxy_pool as hpp
+
+            if hpp.is_available(config):
+                http_url = hpp.pick(config, log=log_fn)
+                if http_url:
+                    config["_runtime_http_proxy"] = http_url
+                    config["proxy"] = http_url
+                    out["http_proxy"] = http_url
+                    if log_fn:
+                        log_fn(f"[*] HTTP代理: {hpp.redact(http_url)}")
+        except Exception as exc:
+            if log_fn:
+                safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+                log_fn(f"[*] HTTP代理池跳过: {safe}")
+
+    def _try_clash():
+        nonlocal clash_node
+        if not config.get("clash_rotate_per_account", True):
+            return
+        try:
+            from clash_proxy import rotate_node, is_available
+
+            if is_available():
+                clash_node = rotate_node(
+                    log=log_fn,
+                    verify_ip=bool(config.get("clash_verify_ip", False)),
+                )
+                if clash_node:
+                    out["clash_node"] = clash_node
+                    safe = str(clash_node).encode("ascii", "backslashreplace").decode("ascii")
+                    if log_fn:
+                        log_fn(f"[*] 出口节点: {safe}")
+        except Exception as exc:
+            if log_fn:
+                safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+                log_fn(f"[*] Clash 轮换跳过: {safe}")
+
+    if prefer_http:
+        _try_http()
+        if not http_url:
+            _try_clash()
+    else:
+        _try_clash()
+        # If clash missing/failed and HTTP pool configured, fall back
+        if not clash_node:
+            _try_http()
+        elif config.get("http_proxy_also_with_clash"):
+            _try_http()
+    return out
+
+
+def report_egress_result(ok: bool, egress: dict | None = None) -> None:
+    egress = egress or {}
+    try:
+        if egress.get("clash_node"):
+            from clash_proxy import report_success, report_fail
+
+            (report_success if ok else report_fail)(egress.get("clash_node"))
+    except Exception:
+        pass
+    try:
+        if egress.get("http_proxy"):
+            import http_proxy_pool as hpp
+
+            (hpp.report_success if ok else hpp.report_fail)(egress.get("http_proxy"))
+    except Exception:
+        pass
 
 
 def get_duckmail_api_key():
@@ -4260,30 +4349,16 @@ class GrokRegisterGUI:
         dev_token = ""
         code = ""
         mail_ok = False
-        clash_node = None
-        # Anti-detection: rotate Clash proxy node before each registration
-        if config.get("clash_rotate_per_account", True):
-            try:
-                from clash_proxy import rotate_node, is_available
-                if is_available():
-                    clash_node = rotate_node(
-                        log=log_fn,
-                        verify_ip=bool(config.get("clash_verify_ip", False)),
-                    )
-                    if clash_node:
-                        safe = str(clash_node).encode("ascii", "backslashreplace").decode("ascii")
-                        log_fn(f"[*] 出口节点: {safe}")
-            except Exception as exc:
-                safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
-                log_fn(f"[*] Clash 轮换跳过: {safe}")
+        egress = rotate_egress_proxy(log_fn)
+        clash_node = egress.get("clash_node")
         try:
-            return self._register_one_account_body(log_fn, worker_id, local_success, clash_node)
+            result = self._register_one_account_body(
+                log_fn, worker_id, local_success, clash_node
+            )
+            report_egress_result(True, egress)
+            return result
         except Exception:
-            try:
-                from clash_proxy import report_fail
-                report_fail(clash_node)
-            except Exception:
-                pass
+            report_egress_result(False, egress)
             raise
 
     def _register_one_account_body(self, log_fn, worker_id=0, local_success=0, clash_node=None):
@@ -4501,37 +4576,21 @@ def _restore_sigint_handler(previous):
 
 
 def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
-    clash_node = None
     email_holder = {"email": ""}
-    # Anti-detection: rotate Clash proxy node before each registration
-    if config.get("clash_rotate_per_account", True):
-        try:
-            from clash_proxy import rotate_node, is_available
-            if is_available():
-                clash_node = rotate_node(
-                    log=log_fn,
-                    verify_ip=bool(config.get("clash_verify_ip", False)),
-                )
-                if clash_node:
-                    safe = str(clash_node).encode("ascii", "backslashreplace").decode("ascii")
-                    log_fn(f"[*] 出口节点: {safe}")
-        except Exception as exc:
-            safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
-            log_fn(f"[*] Clash 轮换跳过: {safe}")
+    egress = rotate_egress_proxy(log_fn)
+    clash_node = egress.get("clash_node")
     try:
-        return _register_one_account_cli_body(
+        result = _register_one_account_cli_body(
             log_fn,
             stop_fn,
             accounts_output_file,
             clash_node,
             email_holder=email_holder,
         )
+        report_egress_result(True, egress)
+        return result
     except Exception as exc:
-        try:
-            from clash_proxy import report_fail
-            report_fail(clash_node)
-        except Exception:
-            pass
+        report_egress_result(False, egress)
         try:
             import domain_health as _dh
 

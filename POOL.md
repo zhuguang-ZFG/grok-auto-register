@@ -58,6 +58,25 @@ python refresh_pool.py --within-hours 3 --workers 3
 python refresh_pool.py --domain lsw666.dpdns.org --within-hours 6 --max 400
 ```
 
+### HTTP 代理列表（社区节点包）
+
+支持 `host:port:user:pass` / `http://user:pass@host:port` 文本列表（如 7 天有效期 HTTP 节点）：
+
+```bash
+python http_proxy_pool.py status --path D:/Downloads/all_proxies.txt
+python http_proxy_pool.py probe --path D:/Downloads/all_proxies.txt --sample 10
+```
+
+配置：
+
+| 键 | 含义 |
+|----|------|
+| `http_proxy_list_path` | 列表路径 |
+| `http_proxy_enabled` | 是否启用 |
+| `http_proxy_prefer_over_clash` | true=优先 HTTP 列表，false=Clash 优先、失败再 HTTP |
+
+说明：很多社区节点 **仅境外可达**，国内直连 probe 会全 FAIL；需境外机器或能出国的前置网络。
+
 ### 无感运维（计划任务）
 
 ```powershell

@@ -33,6 +33,11 @@ token.json
 .domain_health.json
 .domain_health.json.tmp
 
+# HTTP proxy list stats / local lists with credentials
+.http_proxy_stats.json
+all_proxies.txt
+proxies.txt
+
 *.log
 .DS_Store
 .idea/
