@@ -2,15 +2,24 @@
 # -*- coding: utf-8 -*-
 """Own-domain vs buffer-domain pool policy.
 
-Self-owned mail domains (config.defaultDomains) are primary for water-level
-and local Grok CLI rotation. Third-party batch imports (e.g. lsw666.dpdns.org)
-are buffer capacity for CLIProxy round-robin only, used as local-auth fallback
-when own pool is empty.
+Modes (config pool_prefer_mode):
+  - own_first (default): local Grok CLI rotation prefers self-owned domains;
+    buffer (e.g. lsw666.dpdns.org) is fallback only.
+  - buffer_first: burn third-party buffer quota first; own domains are soft-held
+    (disabled + hold_reason) so CLIProxy round-robin skips them until restored.
+
+CLIProxy only serves auth files with disabled!=true. Holding own accounts is the
+reliable way to force the proxy onto the buffer pool without a second auth-dir.
 """
 from __future__ import annotations
 
+import json
+import os
+import time
 from pathlib import Path
 from typing import Any, Iterable
+
+HOLD_REASON = "prefer_buffer"
 
 
 def parse_domains(raw: str | Iterable[str] | None) -> list[str]:
@@ -31,9 +40,15 @@ def buffer_domains(cfg: dict[str, Any]) -> list[str]:
     return parse_domains(cfg.get("pool_buffer_domains") or "")
 
 
+def prefer_mode(cfg: dict[str, Any]) -> str:
+    mode = str(cfg.get("pool_prefer_mode") or "own_first").strip().lower()
+    if mode in ("buffer", "buffer_first", "burn_buffer", "prefer_buffer"):
+        return "buffer_first"
+    return "own_first"
+
+
 def domain_of_path(path: Path | str) -> str:
     name = Path(path).name
-    # xai-email@domain.json
     if "@" in name:
         return name.rsplit("@", 1)[-1].removesuffix(".json").lower()
     return ""
@@ -51,7 +66,7 @@ def is_buffer_path(path: Path | str, cfg: dict[str, Any]) -> bool:
     if not is_own_path(path, cfg):
         buf = buffer_domains(cfg)
         if not buf:
-            return True  # non-own = buffer by default
+            return True
         dom = domain_of_path(path)
         return any(d in dom or dom == d for d in buf)
     return False
@@ -71,15 +86,117 @@ def partition_paths(
 
 
 def order_for_local_rotate(paths: list[Path], cfg: dict[str, Any]) -> list[Path]:
-    """Own first; buffer only if pool_local_use_buffer (default True) as tail."""
+    """Order candidates for ~/.grok/auth.json rotation."""
     own, buf = partition_paths(paths, cfg)
     use_buf = cfg.get("pool_local_use_buffer", True)
-    if use_buf is False or str(use_buf).lower() in ("0", "false", "no"):
+    buf_ok = not (
+        use_buf is False or str(use_buf).lower() in ("0", "false", "no")
+    )
+    mode = prefer_mode(cfg)
+    if mode == "buffer_first":
+        if buf_ok:
+            return buf + own
         return own
-    # Prefer own only first; if prefer_own_only_strict, still append buffer as last resort
-    return own + buf
+    # own_first
+    if buf_ok:
+        return own + buf
+    return own
 
 
 def summarize_pool_files(paths: list[Path], cfg: dict[str, Any]) -> dict[str, int]:
     own, buf = partition_paths(paths, cfg)
-    return {"own": len(own), "buffer": len(buf), "total": len(paths)}
+    return {
+        "own": len(own),
+        "buffer": len(buf),
+        "total": len(paths),
+        "prefer_mode": prefer_mode(cfg),
+    }
+
+
+def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def is_prefer_buffer_hold(data: dict[str, Any]) -> bool:
+    if str(data.get("hold_reason") or "") == HOLD_REASON:
+        return True
+    qs = data.get("quota_state") or {}
+    return str(qs.get("reason") or "") == HOLD_REASON
+
+
+def hold_own_for_buffer(
+    auth_dir: Path,
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Soft-disable own-domain auths so CLIProxy burns buffer first.
+
+    Does not touch accounts already disabled for real quota exhaustion
+    (quota_state.reason != prefer_buffer and recover_after set).
+    """
+    stats = {"scanned": 0, "held": 0, "already": 0, "skipped_quota": 0}
+    if not auth_dir.is_dir():
+        return stats
+    for path in sorted(auth_dir.glob("xai-*.json")):
+        if not is_own_path(path, cfg):
+            continue
+        stats["scanned"] += 1
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if is_prefer_buffer_hold(data) and data.get("disabled"):
+            stats["already"] += 1
+            continue
+        qs = data.get("quota_state") or {}
+        if data.get("disabled") and qs.get("recover_after") and not is_prefer_buffer_hold(data):
+            # real exhaustion mark — leave alone
+            stats["skipped_quota"] += 1
+            continue
+        data["disabled"] = True
+        data["hold_reason"] = HOLD_REASON
+        data["held_at"] = time.time()
+        # no recover_after → reenable_recovered leaves operator holds alone
+        if not dry_run:
+            _atomic_write(path, data)
+        stats["held"] += 1
+    return stats
+
+
+def release_own_hold(
+    auth_dir: Path,
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Clear prefer_buffer holds on own-domain auths."""
+    stats = {"scanned": 0, "released": 0}
+    if not auth_dir.is_dir():
+        return stats
+    for path in sorted(auth_dir.glob("xai-*.json")):
+        if not is_own_path(path, cfg):
+            continue
+        stats["scanned"] += 1
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not is_prefer_buffer_hold(data):
+            continue
+        data["disabled"] = False
+        data.pop("hold_reason", None)
+        data.pop("held_at", None)
+        qs = data.get("quota_state")
+        if isinstance(qs, dict) and str(qs.get("reason") or "") == HOLD_REASON:
+            data.pop("quota_state", None)
+        if not dry_run:
+            _atomic_write(path, data)
+        stats["released"] += 1
+    return stats

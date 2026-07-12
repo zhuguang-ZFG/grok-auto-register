@@ -103,6 +103,7 @@
   "domain_health_min_samples": 4,
   "domain_health_min_success_rate": 0.25,
   "pool_local_use_buffer": true,
+  "pool_prefer_mode": "own_first",
   "pool_buffer_domains": "",
   "pool_maintain_refresh_within_hours": 2,
   "pool_maintain_refresh_max": 300,

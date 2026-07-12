@@ -155,8 +155,9 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
 
         part = summarize_pool_files(auths, cfg)
         own_n, buf_n = part.get("own", 0), part.get("buffer", 0)
+        prefer = part.get("prefer_mode") or cfg.get("pool_prefer_mode") or "own_first"
     except Exception:
-        pass
+        prefer = cfg.get("pool_prefer_mode") or "own_first"
     snap["cpa"] = {
         "dir": str(cpa_dir),
         "files": len(auths),
@@ -166,6 +167,7 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
         "disabled": disabled,
         "own_files": own_n,
         "buffer_files": buf_n,
+        "prefer_mode": prefer,
         "domains": dict(domain_auth.most_common()),
     }
 
@@ -273,9 +275,11 @@ def print_human(snap: dict[str, Any]) -> None:
         f"| 已过期≈{cpa.get('access_expired')} | disabled≈{cpa.get('disabled')} | 未知={cpa.get('unknown')}"
     )
     if cpa.get("own_files") is not None:
+        mode = (cpa.get("prefer_mode") or "own_first")
+        hint = "先烧缓冲" if mode == "buffer_first" else "本地换号优先自有"
         print(
             f"[*] 池分层: 自有域≈{cpa.get('own_files')} | 缓冲域≈{cpa.get('buffer_files')} "
-            f"(本地换号优先自有)"
+            f"| prefer={mode} ({hint})"
         )
     if cpa.get("domains"):
         top = ", ".join(f"{d}={n}" for d, n in list(cpa["domains"].items())[:8])

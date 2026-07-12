@@ -150,6 +150,20 @@ def main() -> int:
         # 自动挂接 CLI auth 目录
         run([py, str(ROOT / "auto_link_cli.py")], log)
 
+        # buffer_first：新注册的自有号也 soft-hold，继续先烧缓冲
+        try:
+            from pool_policy import hold_own_for_buffer, prefer_mode
+
+            if prefer_mode(cfg) == "buffer_first":
+                ad = ROOT / str(cfg.get("cpa_auth_dir") or "cpa_auths")
+                if not ad.is_absolute():
+                    ad = (ROOT / ad).resolve()
+                st_hold = hold_own_for_buffer(ad, cfg)
+                print(f"[*] prefer=buffer_first re-hold own: {st_hold}")
+                log.write(f"re-hold own: {st_hold}\n")
+        except Exception as exc:
+            print(f"[!] re-hold own failed: {exc}")
+
         # 状态快照
         run([py, str(ROOT / "pool_status.py")], log)
 

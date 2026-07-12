@@ -79,9 +79,21 @@ Get-ScheduledTask | ? TaskName -like 'Grok*'
 
 ### 自有域 / 缓冲域分层
 
-- **自有**：`defaultDomains` 四域名 → 水位 + 本地 `auth.json` 换号优先  
-- **缓冲**：其它域名（如导入的 `lsw666.dpdns.org`）→ CLIProxy 轮询可用，本地换号作后备  
-- 配置：`pool_local_use_buffer`（默认 true）
+- **自有**：`defaultDomains` 四域名  
+- **缓冲**：其它域名（如 `lsw666.dpdns.org`）  
+
+```bash
+python set_pool_prefer.py status
+python set_pool_prefer.py buffer   # 先烧缓冲：自有 soft-hold(disabled)，CLIProxy 只用缓冲
+python set_pool_prefer.py own      # 恢复：自有重新进轮询，本地换号优先自有
+```
+
+| `pool_prefer_mode` | 行为 |
+|--------------------|------|
+| `own_first`（默认） | 本地换号优先自有；缓冲作后备 |
+| `buffer_first` | 自有 `disabled+hold_reason=prefer_buffer`；先消耗缓冲额度 |
+
+maintain 在 `buffer_first` 下会反复 re-hold 新注册的自有号。
 
 ### 域名健康与自动降权
 
