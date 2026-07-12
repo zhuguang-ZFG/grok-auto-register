@@ -49,6 +49,13 @@ python pool_status.py --json --procs
 python pool_maintain.py
 python grok_register_ttk.py -n 6 -c 1 -y
 run_status.bat                   # Windows 快捷
+
+# 外部 CPA zip / 目录导入号池
+python import_cpa_batch.py D:/Downloads/batch_0001-0500.zip D:/Downloads/batch_0501-1000.zip
+
+# 批量刷新临期/过期 access_token（有 refresh_token）
+python refresh_pool.py --within-hours 3 --workers 3
+python refresh_pool.py --domain lsw666.dpdns.org --within-hours 6 --max 400
 ```
 
 ### 域名健康与自动降权
