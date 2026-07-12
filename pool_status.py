@@ -40,10 +40,13 @@ def _mint_log_stats(log_path: Path, *, max_bytes: int = 400_000) -> dict[str, An
         "mint_start": 0,
         "protocol_ok": 0,
         "protocol_fail": 0,
+        "authcode_ok": 0,
+        "authcode_fail": 0,
         "egress_rotated": 0,
         "browser_allow": 0,
         "export_ok_protocol": 0,
         "export_ok_browser": 0,
+        "export_ok_authcode": 0,
     }
     if not log_path.is_file():
         out["error"] = "missing"
@@ -70,6 +73,8 @@ def _mint_log_stats(log_path: Path, *, max_bytes: int = 400_000) -> dict[str, An
     out["mint_start"] = low.count("mint start:")
     out["protocol_ok"] = low.count("protocol mint ok")
     out["protocol_fail"] = low.count("protocol mint failed")
+    out["authcode_ok"] = low.count("authcode mint ok")
+    out["authcode_fail"] = low.count("authcode mint failed")
     out["egress_rotated"] = low.count("mint egress rotated")
     out["browser_allow"] = chunk.count("clicked REAL exact")
     out["export_ok_protocol"] = low.count("export ok method=protocol") + low.count(
@@ -78,6 +83,46 @@ def _mint_log_stats(log_path: Path, *, max_bytes: int = 400_000) -> dict[str, An
     out["export_ok_browser"] = low.count("export ok method=browser") + low.count(
         "method=browser path="
     )
+    out["export_ok_authcode"] = low.count("export ok method=authcode") + low.count(
+        "method=authcode path="
+    )
+    out["ok"] = True
+    return out
+
+
+def _cliproxy_affinity_stats(
+    log_path: Path, *, max_bytes: int = 300_000
+) -> dict[str, Any]:
+    """Tail CLIProxy main.log for sticky session reselect / REMOVE churn."""
+    out: dict[str, Any] = {
+        "log": str(log_path),
+        "ok": False,
+        "affinity_hit": 0,
+        "affinity_miss": 0,
+        "affinity_reselect": 0,
+        "auth_remove": 0,
+        "auth_create": 0,
+        "auth_write": 0,
+    }
+    if not log_path.is_file():
+        out["error"] = "missing"
+        return out
+    try:
+        raw = log_path.read_bytes()
+        if len(raw) > max_bytes:
+            raw = raw[-max_bytes:]
+        text = raw.decode("utf-8", errors="replace")
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+    out["affinity_hit"] = text.count("session-affinity: cache hit |")
+    out["affinity_miss"] = text.count("session-affinity: cache miss")
+    out["affinity_reselect"] = text.count("auth unavailable, reselected")
+    out["auth_remove"] = text.count("auth file changed (REMOVE)")
+    out["auth_create"] = text.count("auth file changed (CREATE)")
+    out["auth_write"] = text.count("auth file changed (WRITE)")
+    denom = out["affinity_hit"] + out["affinity_miss"] + out["affinity_reselect"]
+    out["reselect_rate"] = round(out["affinity_reselect"] / denom, 4) if denom else None
     out["ok"] = True
     return out
 
@@ -148,6 +193,11 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
 
     # recent mint path stats from register log (since last RESTART marker)
     snap["mint_log"] = _mint_log_stats(ROOT / "logs" / "register_auto.out.log")
+
+    # CLIProxy sticky / auth-file churn (community: reselect kills cache)
+    snap["cliproxy_affinity"] = _cliproxy_affinity_stats(
+        Path(r"D:/cli-proxy-api/logs/main.log")
+    )
 
     # last proxy health snapshot (if any)
     ph = ROOT / ".proxy_health.json"
@@ -380,8 +430,9 @@ def print_human(snap: dict[str, Any]) -> None:
         print(
             f"[*] 铸造日志(自 {ml.get('since_marker') or '?'}): "
             f"start={ml.get('mint_start')} protocol_ok={ml.get('protocol_ok')} "
-            f"protocol_fail={ml.get('protocol_fail')} egress_rot={ml.get('egress_rotated')} "
-            f"browser_allow={ml.get('browser_allow')}"
+            f"protocol_fail={ml.get('protocol_fail')} "
+            f"authcode_ok={ml.get('authcode_ok')} authcode_fail={ml.get('authcode_fail')} "
+            f"egress_rot={ml.get('egress_rotated')} browser_allow={ml.get('browser_allow')}"
         )
     elif ml.get("error"):
         print(f"[*] 铸造日志: n/a ({ml.get('error')})")
@@ -404,6 +455,18 @@ def print_human(snap: dict[str, Any]) -> None:
             f"[*] CLIProxy 路由: profile={route.get('profile')} "
             f"strategy={route.get('strategy')} affinity={route.get('session_affinity')}"
         )
+
+    aff = snap.get("cliproxy_affinity") or {}
+    if aff.get("ok"):
+        rr = aff.get("reselect_rate")
+        rr_s = f"{rr:.1%}" if isinstance(rr, float) else "n/a"
+        print(
+            f"[*] CLIProxy sticky(tail): hit={aff.get('affinity_hit')} "
+            f"miss={aff.get('affinity_miss')} reselect={aff.get('affinity_reselect')} "
+            f"rate={rr_s} REMOVE={aff.get('auth_remove')} WRITE={aff.get('auth_write')}"
+        )
+    elif aff.get("error"):
+        print(f"[*] CLIProxy sticky: n/a ({aff.get('error')})")
 
     auth = snap.get("local_grok_auth") or {}
     if auth.get("error"):

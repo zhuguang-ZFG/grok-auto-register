@@ -47,7 +47,7 @@ SSO cookie
 | `clash_selector` | `""` | 填专用组名可彻底隔离本机 GLOBAL |
 | `http_proxy_prefer_over_clash` | `false` | 社区境外 HTTP 列表国内常不可达 |
 
-可选彻底隔离：Clash **rule** 模式 + 分组 `注册专用` + 规则 `x.ai`/`grok.com` → 该组，再设 `clash_selector`。
+可选彻底隔离：见 **[CLASH_ISOLATE.md](CLASH_ISOLATE.md)**（rule 模式 + 分组 `注册专用` + `clash_selector`）。
 
 ## 4. 本机性能（号池已大时）
 
