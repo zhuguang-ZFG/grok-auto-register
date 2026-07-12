@@ -123,6 +123,7 @@ def export_cpa_xai_for_account(
     prefer_protocol = bool(cfg.get("cpa_prefer_protocol", True))
     protocol_only = bool(cfg.get("cpa_protocol_only", False))
     protocol_poll_timeout_sec = float(cfg.get("cpa_protocol_poll_timeout_sec", 90) or 90)
+    protocol_attempts = int(cfg.get("cpa_protocol_attempts", 2) or 2)
 
     reuse_page = None if force_standalone else page
 
@@ -186,8 +187,14 @@ def export_cpa_xai_for_account(
         prefer_protocol=prefer_protocol,
         protocol_only=protocol_only,
         protocol_poll_timeout_sec=protocol_poll_timeout_sec,
+        protocol_attempts=protocol_attempts,
         log=_log,
     )
+    if result.get("ok"):
+        log(
+            f"[cpa] export ok method={result.get('mint_method')} "
+            f"path={result.get('path')}"
+        )
 
     # Navigate registration browser back to blank after reuse
     if reuse_page is not None:

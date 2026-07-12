@@ -8,12 +8,18 @@ Device Flow (no casting browser). Fall back to browser mint on failure.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from .browser_confirm import mint_with_browser
 from .probe import probe_mini_response, probe_models
-from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
+from .protocol_mint import (
+    ProtocolMintError,
+    _is_transient_tls_error,
+    extract_sso_from_cookies,
+    mint_with_sso_protocol,
+)
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
 from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth
 from .writer import write_cpa_xai_auth
@@ -46,14 +52,15 @@ def mint_and_export(
     prefer_protocol: bool = True,
     protocol_only: bool = False,
     protocol_poll_timeout_sec: float = 90.0,
+    protocol_attempts: int = 2,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: protocol Device Flow (preferred) | browser → write CPA → probe.
 
     When ``prefer_protocol`` and an SSO cookie is present, mint over pure HTTP.
-    On ``ProtocolMintError`` (or other failure) fall back to browser unless
-    ``protocol_only`` is set.
+    Transient TLS failures retry the full protocol flow (``protocol_attempts``).
+    On remaining ``ProtocolMintError`` fall back to browser unless ``protocol_only``.
 
     Returns dict with keys: ok, path, email, probe*, error?, mint_method?
     """
@@ -71,45 +78,67 @@ def mint_and_export(
     # Thread-local pin — safe under concurrent mint workers.
     resolved = resolve_proxy(proxy)
     set_runtime_proxy(resolved or None)
+    attempts = max(1, min(int(protocol_attempts or 1), 4))
     log(
         f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'} "
-        f"prefer_protocol={prefer_protocol} sso={'yes' if sso_val else 'no'}"
+        f"prefer_protocol={prefer_protocol} sso={'yes' if sso_val else 'no'} "
+        f"protocol_attempts={attempts}"
     )
 
     tokens: dict[str, Any] | None = None
     protocol_err: str | None = None
 
     if prefer_protocol and sso_val:
-        try:
-            tokens = mint_with_sso_protocol(
-                sso_cookie=sso_val,
-                email=email,
-                proxy=resolved or None,
-                poll_timeout_sec=protocol_poll_timeout_sec,
-                log=log,
-                cancel=cancel,
-            )
-            log(f"protocol mint ok: {email}")
-        except ProtocolMintError as e:
-            protocol_err = str(e)
-            log(f"protocol mint failed: {e}")
-            if protocol_only:
-                return {
-                    "ok": False,
-                    "email": email,
-                    "error": f"protocol_only: {e}",
-                    "mint_method": "protocol",
-                }
-        except Exception as e:  # noqa: BLE001
-            protocol_err = str(e)
-            log(f"protocol mint error: {e}")
-            if protocol_only:
-                return {
-                    "ok": False,
-                    "email": email,
-                    "error": f"protocol_only: {e}",
-                    "mint_method": "protocol",
-                }
+        for attempt in range(1, attempts + 1):
+            if cancel and cancel():
+                return {"ok": False, "email": email, "error": "cancelled"}
+            try:
+                tokens = mint_with_sso_protocol(
+                    sso_cookie=sso_val,
+                    email=email,
+                    proxy=resolved or None,
+                    poll_timeout_sec=protocol_poll_timeout_sec,
+                    log=log,
+                    cancel=cancel,
+                )
+                log(f"protocol mint ok: {email} attempt={attempt}/{attempts}")
+                break
+            except ProtocolMintError as e:
+                protocol_err = str(e)
+                transient = _is_transient_tls_error(e)
+                log(
+                    f"protocol mint failed attempt={attempt}/{attempts} "
+                    f"transient={transient}: {e}"
+                )
+                if attempt < attempts and transient:
+                    time.sleep(1.0 * attempt)
+                    continue
+                if protocol_only:
+                    return {
+                        "ok": False,
+                        "email": email,
+                        "error": f"protocol_only: {e}",
+                        "mint_method": "protocol",
+                    }
+                break
+            except Exception as e:  # noqa: BLE001
+                protocol_err = str(e)
+                transient = _is_transient_tls_error(e)
+                log(
+                    f"protocol mint error attempt={attempt}/{attempts} "
+                    f"transient={transient}: {e}"
+                )
+                if attempt < attempts and transient:
+                    time.sleep(1.0 * attempt)
+                    continue
+                if protocol_only:
+                    return {
+                        "ok": False,
+                        "email": email,
+                        "error": f"protocol_only: {e}",
+                        "mint_method": "protocol",
+                    }
+                break
     elif prefer_protocol and not sso_val:
         log("protocol mint skipped: no sso cookie")
         if protocol_only:
@@ -171,6 +200,7 @@ def mint_and_export(
     path = write_cpa_xai_auth(auth_dir, payload)
     log(f"wrote {path}")
 
+    method = tokens.get("mint_method") or "browser"
     result: dict[str, Any] = {
         "ok": True,
         "email": email,
@@ -178,10 +208,11 @@ def mint_and_export(
         "user_code": tokens.get("user_code"),
         "base_url": base_url,
         "proxy": proxy_log_label(resolved),
-        "mint_method": tokens.get("mint_method") or "browser",
+        "mint_method": method,
     }
-    if protocol_err and result["mint_method"] != "protocol":
+    if protocol_err and method != "protocol":
         result["protocol_error"] = protocol_err
+    log(f"mint done: {email} method={method} path={path}")
 
     if probe:
         pr = probe_models(tokens["access_token"], base_url=base_url, proxy=resolved or None)

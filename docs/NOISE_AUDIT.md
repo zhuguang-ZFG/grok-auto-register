@@ -54,11 +54,15 @@
 2. 重启后看日志应出现：`prefer_protocol=True sso=yes` → `protocol mint ok`；不应再默认 `clicked Allow`。  
 3. 保持 **并发 1–2**、`buffer_first`、UA 池关闭。
 
-### P1 — 低成本
+### P1 — 低成本（已部分落地）
 
 4. 代理 TLS 报错多时：修 Clash 节点质量 / 降并发，而不是加指纹。  
-5. 确认 mint 日志带 `mint_method=protocol`（或 `protocol mint ok`）再谈“铸造更干净”。  
-6. 可选：`cpa_protocol_only=true` 做一轮观察（协议失败直接失败、不弹铸造浏览器）— 仅调试用。
+5. 确认 mint 日志带 `mint_method=protocol`（或 `protocol mint ok` / `mint done method=`）。  
+6. **已做**：请求级 TLS 短重试 + 整次协议再试（`cpa_protocol_attempts`，默认 2）。  
+7. **已做**：mint 队列 delay 加 0–1.5s 抖动，避免双 worker 齐打 OIDC。  
+8. 可选：`cpa_protocol_only=true` 做一轮观察（协议失败不弹铸造浏览器）— 仅调试用。  
+9. 可选：`clash_verify_ip=true`（换节点后验 IP，更慢更稳）。  
+10. 可选：铸造前再 `rotate_egress_proxy` 一次（代码未接；协议失败率高再做）。
 
 ### P2 — 刻意不做（除非你要求）
 

@@ -121,7 +121,11 @@ class MintPool:
     def _run_job(self, job: MintJob) -> None:
         log = job.log
         if job.delay_sec > 0:
-            time.sleep(job.delay_sec)
+            # small jitter so concurrent mint workers don't hammer OIDC together
+            import random
+
+            delay = float(job.delay_sec) + random.uniform(0.0, 1.5)
+            time.sleep(max(0.0, delay))
         export_fn = self._export_fn
         if export_fn is None:
             with self._lock:
