@@ -630,16 +630,24 @@ def try_rotate_from_pool(
     if not candidates:
         return {"ok": False, "skipped": True, "reason": "empty_pool"}
 
-    # Prefer own mail domains so rotation stays on the controlled pool.
-    own_domains = [
-        d.strip().lower()
-        for d in str(cfg.get("defaultDomains") or "").split(",")
-        if d.strip()
-    ]
-    if own_domains:
-        own_first = [p for p in candidates if any(d in p.name.lower() for d in own_domains)]
-        other = [p for p in candidates if p not in own_first]
-        candidates = own_first + other
+    # Prefer own mail domains; third-party buffer domains only as fallback
+    # for local Grok CLI (CLIProxy still sees the full auth-dir).
+    try:
+        from pool_policy import order_for_local_rotate
+
+        candidates = order_for_local_rotate(candidates, cfg)
+    except Exception:
+        own_domains = [
+            d.strip().lower()
+            for d in str(cfg.get("defaultDomains") or "").split(",")
+            if d.strip()
+        ]
+        if own_domains:
+            own_first = [
+                p for p in candidates if any(d in p.name.lower() for d in own_domains)
+            ]
+            other = [p for p in candidates if p not in own_first]
+            candidates = own_first + other
 
     for path in candidates:
         key = str(path.resolve())

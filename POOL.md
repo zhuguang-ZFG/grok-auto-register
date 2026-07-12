@@ -58,6 +58,31 @@ python refresh_pool.py --within-hours 3 --workers 3
 python refresh_pool.py --domain lsw666.dpdns.org --within-hours 6 --max 400
 ```
 
+### 无感运维（计划任务）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\enable_autonomy.ps1
+# 卸载: powershell -ExecutionPolicy Bypass -File .\enable_autonomy.ps1 -Unregister
+Get-ScheduledTask | ? TaskName -like 'Grok*'
+```
+
+| 任务 | 周期 | 作用 |
+|------|------|------|
+| GrokPoolMaintain | 每 2h + 登录 | refresh→health→条件补号→status |
+| GrokPoolRefresh | 每 2h | `refresh_pool --purge-dead` |
+| GrokPoolHealth | 每 45m | 健康检查 |
+| GrokQuotaWatch | 登录常驻 | 额度换号 |
+| GrokRegisterAuto | 登录常驻 | 后台 auto 补号 |
+| CLIProxyAPI-Local | 登录常驻 | 本地 8317 |
+
+`pool_maintain` 已内置：临期 token 刷新 + 吊销 RT 清理（`pool_maintain_purge_dead`）。
+
+### 自有域 / 缓冲域分层
+
+- **自有**：`defaultDomains` 四域名 → 水位 + 本地 `auth.json` 换号优先  
+- **缓冲**：其它域名（如导入的 `lsw666.dpdns.org`）→ CLIProxy 轮询可用，本地换号作后备  
+- 配置：`pool_local_use_buffer`（默认 true）
+
 ### 域名健康与自动降权
 
 注册成功/失败会写入 `.domain_health.json`（gitignore）。连续失败或成功率过低时，域名会被临时降权，选邮箱时优先其它域。

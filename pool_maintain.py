@@ -42,16 +42,21 @@ def run(cmd: list[str], log_fp) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="号池维持：health + 条件补号 + CLI 同步")
+    parser = argparse.ArgumentParser(description="号池维持：refresh + health + 条件补号 + CLI 同步")
     parser.add_argument("--force-refill", type=int, default=0, help="强制补 N 个，忽略健康阈值")
     parser.add_argument("--skip-refill", action="store_true", help="只做健康检查不同步补号")
     parser.add_argument("--skip-health", action="store_true", help="跳过健康检查直接补号")
+    parser.add_argument("--skip-refresh", action="store_true", help="跳过 access_token 批量刷新")
     args = parser.parse_args()
 
     cfg = load_cfg()
     min_live = int(cfg.get("pool_min_live", 5) or 5)
     refill_count = int(cfg.get("pool_refill_count", cfg.get("register_count", 8)) or 8)
     concurrency = int(cfg.get("pool_refill_concurrency", cfg.get("concurrency", 1)) or 1)
+    refresh_within = float(cfg.get("pool_maintain_refresh_within_hours", 2) or 2)
+    refresh_max = int(cfg.get("pool_maintain_refresh_max", 300) or 300)
+    refresh_workers = int(cfg.get("pool_maintain_refresh_workers", 3) or 3)
+    purge_dead = bool(cfg.get("pool_maintain_purge_dead", True))
     py = sys.executable
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,6 +68,27 @@ def main() -> int:
         log.write(f"=== pool_maintain {datetime.now(timezone.utc).isoformat()} ===\n")
         need_refill = False
         live_count = None
+
+        # 1) bulk-refresh expiring tokens + optional purge of revoked RT
+        if not args.skip_refresh and (ROOT / "refresh_pool.py").is_file():
+            refresh_cmd = [
+                py,
+                str(ROOT / "refresh_pool.py"),
+                "--within-hours",
+                str(refresh_within),
+                "--max",
+                str(max(0, refresh_max)),
+                "--workers",
+                str(max(1, refresh_workers)),
+            ]
+            if purge_dead:
+                refresh_cmd.append("--purge-dead")
+            print(
+                f"[*] refresh within={refresh_within}h max={refresh_max} "
+                f"purge_dead={purge_dead}"
+            )
+            code_r = run(refresh_cmd, log)
+            print(f"[*] refresh exit={code_r}")
 
         if not args.skip_health:
             code = run([py, str(ROOT / "pool_health.py")], log)

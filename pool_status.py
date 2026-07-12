@@ -149,6 +149,14 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
             unknown += 1
         except Exception:
             unknown += 1
+    own_n = buf_n = 0
+    try:
+        from pool_policy import is_own_path, summarize_pool_files
+
+        part = summarize_pool_files(auths, cfg)
+        own_n, buf_n = part.get("own", 0), part.get("buffer", 0)
+    except Exception:
+        pass
     snap["cpa"] = {
         "dir": str(cpa_dir),
         "files": len(auths),
@@ -156,6 +164,8 @@ def collect_snapshot(*, include_procs: bool = False) -> dict[str, Any]:
         "access_expired": expired,
         "unknown": unknown,
         "disabled": disabled,
+        "own_files": own_n,
+        "buffer_files": buf_n,
         "domains": dict(domain_auth.most_common()),
     }
 
@@ -262,6 +272,11 @@ def print_human(snap: dict[str, Any]) -> None:
         f"[*] CPA auth: {cpa.get('files')} 个 | access 未过期(粗判)≈{cpa.get('access_alive')} "
         f"| 已过期≈{cpa.get('access_expired')} | disabled≈{cpa.get('disabled')} | 未知={cpa.get('unknown')}"
     )
+    if cpa.get("own_files") is not None:
+        print(
+            f"[*] 池分层: 自有域≈{cpa.get('own_files')} | 缓冲域≈{cpa.get('buffer_files')} "
+            f"(本地换号优先自有)"
+        )
     if cpa.get("domains"):
         top = ", ".join(f"{d}={n}" for d, n in list(cpa["domains"].items())[:8])
         print(f"[*] CPA 域名分布: {top}")

@@ -101,5 +101,11 @@
   "domain_health_fail_streak_demote": 5,
   "domain_health_demote_sec": 3600,
   "domain_health_min_samples": 4,
-  "domain_health_min_success_rate": 0.25
+  "domain_health_min_success_rate": 0.25,
+  "pool_local_use_buffer": true,
+  "pool_buffer_domains": "",
+  "pool_maintain_refresh_within_hours": 2,
+  "pool_maintain_refresh_max": 300,
+  "pool_maintain_refresh_workers": 3,
+  "pool_maintain_purge_dead": true
 }
