@@ -124,6 +124,8 @@ def export_cpa_xai_for_account(
     protocol_only = bool(cfg.get("cpa_protocol_only", False))
     protocol_poll_timeout_sec = float(cfg.get("cpa_protocol_poll_timeout_sec", 90) or 90)
     protocol_attempts = int(cfg.get("cpa_protocol_attempts", 2) or 2)
+    rotate_egress_before = bool(cfg.get("cpa_mint_rotate_egress", True))
+    rotate_egress_on_tls = bool(cfg.get("cpa_mint_rotate_on_tls", True))
 
     reuse_page = None if force_standalone else page
 
@@ -188,6 +190,8 @@ def export_cpa_xai_for_account(
         protocol_only=protocol_only,
         protocol_poll_timeout_sec=protocol_poll_timeout_sec,
         protocol_attempts=protocol_attempts,
+        rotate_egress_before=rotate_egress_before,
+        rotate_egress_on_tls=rotate_egress_on_tls,
         log=_log,
     )
     if result.get("ok"):

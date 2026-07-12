@@ -133,6 +133,9 @@ python pool_status.py                    # 含域名健康摘要
 | `cpa_prefer_protocol` | 默认 `true`：有 SSO 先协议铸造 |
 | `cpa_protocol_only` | `true` 时协议失败不回退浏览器 |
 | `cpa_protocol_poll_timeout_sec` | 协议轮询 token 超时（默认 90） |
+| `cpa_protocol_attempts` | 整次协议重试次数（默认 2，瞬时 TLS） |
+| `cpa_mint_rotate_egress` | 铸造前再轮换 Clash/HTTP 出口（默认 true） |
+| `cpa_mint_rotate_on_tls` | 协议 TLS 失败时再换出口后重试（默认 true） |
 
 社区参考：`_community_ref/grok_auto_register_share_20260712/`（分层 mail/session/credential；TempMail.lol；砍 headless 注册幻想）。  
 本仓库仍以 `grok_register_ttk.py` 为主路径：

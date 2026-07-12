@@ -62,7 +62,7 @@
 7. **已做**：mint 队列 delay 加 0–1.5s 抖动，避免双 worker 齐打 OIDC。  
 8. 可选：`cpa_protocol_only=true` 做一轮观察（协议失败不弹铸造浏览器）— 仅调试用。  
 9. 可选：`clash_verify_ip=true`（换节点后验 IP，更慢更稳）。  
-10. 可选：铸造前再 `rotate_egress_proxy` 一次（代码未接；协议失败率高再做）。
+10. **已做**：铸造前 `cpa_mint_rotate_egress` + TLS 失败再换节点 `cpa_mint_rotate_on_tls`（`cpa_xai/egress_rotate.py`）。
 
 ### P2 — 刻意不做（除非你要求）
 

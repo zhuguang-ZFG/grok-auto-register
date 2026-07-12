@@ -44,6 +44,8 @@
   "cpa_protocol_only": false,
   "cpa_protocol_poll_timeout_sec": 90,
   "cpa_protocol_attempts": 2,
+  "cpa_mint_rotate_egress": true,
+  "cpa_mint_rotate_on_tls": true,
   "cpa_mint_delay_sec": 5,
   "cpa_mint_cookie_inject": true,
   "cpa_mint_browser_reuse": true,

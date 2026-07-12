@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .browser_confirm import mint_with_browser
+from .egress_rotate import rotate_mint_egress
 from .probe import probe_mini_response, probe_models
 from .protocol_mint import (
     ProtocolMintError,
@@ -29,6 +30,12 @@ LogFn = Callable[[str], None]
 
 def _noop(_: str) -> None:
     return None
+
+
+def _apply_proxy(proxy: str | None) -> str | None:
+    resolved = resolve_proxy(proxy)
+    set_runtime_proxy(resolved or None)
+    return resolved or None
 
 
 def mint_and_export(
@@ -53,13 +60,16 @@ def mint_and_export(
     protocol_only: bool = False,
     protocol_poll_timeout_sec: float = 90.0,
     protocol_attempts: int = 2,
+    rotate_egress_before: bool = True,
+    rotate_egress_on_tls: bool = True,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: protocol Device Flow (preferred) | browser → write CPA → probe.
 
     When ``prefer_protocol`` and an SSO cookie is present, mint over pure HTTP.
-    Transient TLS failures retry the full protocol flow (``protocol_attempts``).
+    Transient TLS failures retry the full protocol flow (``protocol_attempts``),
+    optionally rotating Clash/HTTP egress between attempts.
     On remaining ``ProtocolMintError`` fall back to browser unless ``protocol_only``.
 
     Returns dict with keys: ok, path, email, probe*, error?, mint_method?
@@ -76,13 +86,22 @@ def mint_and_export(
 
     # Config/explicit proxy wins over shell https_proxy (common 7890 trap).
     # Thread-local pin — safe under concurrent mint workers.
-    resolved = resolve_proxy(proxy)
-    set_runtime_proxy(resolved or None)
+    resolved = _apply_proxy(proxy)
     attempts = max(1, min(int(protocol_attempts or 1), 4))
+
+    if rotate_egress_before:
+        eg = rotate_mint_egress(log)
+        # Clash keeps local URL; HTTP list may replace proxy URL.
+        if eg.get("proxy"):
+            resolved = _apply_proxy(str(eg.get("proxy")))
+        elif eg.get("ok"):
+            # node changed behind same local port — re-pin current config proxy
+            resolved = _apply_proxy(proxy if proxy is not None else resolved)
+
     log(
         f"mint start: {email} proxy={proxy_log_label(resolved) or '(none)'} "
         f"prefer_protocol={prefer_protocol} sso={'yes' if sso_val else 'no'} "
-        f"protocol_attempts={attempts}"
+        f"protocol_attempts={attempts} rotate_before={rotate_egress_before}"
     )
 
     tokens: dict[str, Any] | None = None
@@ -111,6 +130,12 @@ def mint_and_export(
                     f"transient={transient}: {e}"
                 )
                 if attempt < attempts and transient:
+                    if rotate_egress_on_tls:
+                        eg = rotate_mint_egress(log)
+                        if eg.get("proxy"):
+                            resolved = _apply_proxy(str(eg.get("proxy")))
+                        elif eg.get("ok"):
+                            resolved = _apply_proxy(proxy if proxy is not None else resolved)
                     time.sleep(1.0 * attempt)
                     continue
                 if protocol_only:
@@ -129,6 +154,12 @@ def mint_and_export(
                     f"transient={transient}: {e}"
                 )
                 if attempt < attempts and transient:
+                    if rotate_egress_on_tls:
+                        eg = rotate_mint_egress(log)
+                        if eg.get("proxy"):
+                            resolved = _apply_proxy(str(eg.get("proxy")))
+                        elif eg.get("ok"):
+                            resolved = _apply_proxy(proxy if proxy is not None else resolved)
                     time.sleep(1.0 * attempt)
                     continue
                 if protocol_only:
