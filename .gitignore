@@ -64,6 +64,8 @@ databricks_auths/**
 !databricks_auths/.gitkeep
 databricks_auths_dead/
 .pytest_dbx_tmp/
+dahl_keys/
+
 .domain_rr_index
 pool_index.json
 *.bak-sync*

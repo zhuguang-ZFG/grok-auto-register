@@ -133,6 +133,12 @@ DEFAULT_CONFIG = {
     # Only applies when email_provider is cloudflare/mixed (not pure hotmail).
     "email_mix_hotmail": True,
     "email_mix_hotmail_ratio": 0.6,
+    # Mix community Cloud Mail (vip0.xyz multi-suffix) — buffer only, exclusive with hotmail roll.
+    "email_mix_cloud_mail": True,
+    "email_mix_cloud_mail_ratio": 0.1,
+    "cloud_mail_credentials_file": "vip0_mail.local.json",
+    "cloud_mail_domains": ["vip0.xyz"],
+    "cloud_mail_domain_mode": "random",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -1864,35 +1870,74 @@ def _email_mix_hotmail_ratio() -> float:
     return max(0.0, min(1.0, r))
 
 
+def _email_mix_cloud_mail_enabled() -> bool:
+    """Whether Cloudflare/mixed registration should sometimes mint Cloud Mail (vip0)."""
+    v = config.get("email_mix_cloud_mail", False)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
+def _email_mix_cloud_mail_ratio() -> float:
+    try:
+        r = float(config.get("email_mix_cloud_mail_ratio", 0.0) or 0.0)
+    except Exception:
+        r = 0.0
+    return max(0.0, min(1.0, r))
+
+
 def _try_hotmail_inbox():
     import hotmail_pool as _hp
 
     return _hp.pick_inbox(config)
 
 
+def _try_cloud_mail_inbox():
+    import cloud_mail_otp as _cm
+
+    return _cm.create_inbox(config, root=Path(__file__).resolve().parent)
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
-    # Diversify: under cloudflare/mixed, roll Hotmail ratio (risk spread).
-    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail") and _email_mix_hotmail_enabled():
-        ratio = _email_mix_hotmail_ratio()
-        if ratio > 0 and random.random() < ratio:
+    # Diversify under cloudflare/mixed: exclusive buckets
+    # [0, hotmail) → Hotmail; [hotmail, hotmail+cloud_mail) → vip0 Cloud Mail; else CF.
+    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail", "cf+mix"):
+        hm = _email_mix_hotmail_ratio() if _email_mix_hotmail_enabled() else 0.0
+        cm = _email_mix_cloud_mail_ratio() if _email_mix_cloud_mail_enabled() else 0.0
+        # Cap combined diversion at 1.0; prefer hotmail slice when overflow.
+        if hm + cm > 1.0:
+            cm = max(0.0, 1.0 - hm)
+        roll = random.random()
+        if hm > 0 and roll < hm:
             try:
                 email, tok = _try_hotmail_inbox()
-                # lightweight stderr so auto logs show mix hits without GUI callback
                 try:
                     print(f"[*] email_mix: hotmail {email}", flush=True)
                 except Exception:
                     pass
                 return email, tok
             except Exception as exc:
-                # Pool empty / all dead RT → fall back to CF domains
                 try:
-                    print(f"[!] email_mix hotmail failed, fallback CF: {exc}", flush=True)
+                    print(f"[!] email_mix hotmail failed, fallback next: {exc}", flush=True)
+                except Exception:
+                    pass
+        elif cm > 0 and roll < hm + cm:
+            try:
+                email, tok = _try_cloud_mail_inbox()
+                try:
+                    print(f"[*] email_mix: cloud_mail {email}", flush=True)
+                except Exception:
+                    pass
+                return email, tok
+            except Exception as exc:
+                try:
+                    print(f"[!] email_mix cloud_mail failed, fallback CF: {exc}", flush=True)
                 except Exception:
                     pass
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
-    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail"):
+    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail", "cf+mix"):
         if not get_mail_backends() and not get_cloudflare_api_base():
             raise Exception("Cloudflare API Base / mail_backends 未配置")
         # 多后端四域名负载均衡（mail_backends + 池内最少域名优先）
@@ -1917,6 +1962,13 @@ def get_email_and_token(api_key=None):
             raise Exception(f"hotmail_pool module missing: {e}") from e
         # Pop one Hotmail line: (email, json account blob for IMAP OTP)
         return _hp.pick_inbox(config)
+    if provider in ("cloud_mail", "cloudmail", "vip0", "vip0_xyz", "skymail"):
+        try:
+            import cloud_mail_otp as _cm
+        except ImportError as e:
+            raise Exception(f"cloud_mail_otp module missing: {e}") from e
+        # Community Cloud Mail (vip0.xyz etc.) — buffer only, not own domains
+        return _cm.create_inbox(config, root=Path(__file__).resolve().parent)
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -1939,7 +1991,7 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
-    # Route by actual mailbox used (mixed CF+Hotmail must not use CF poll for @hotmail.com)
+    # Route by actual mailbox used (mixed CF+Hotmail/CloudMail must not use wrong poller)
     if _is_hotmail_session(dev_token, email) or (
         provider in ("hotmail", "outlook", "hotmail_pool", "ms_mail")
     ):
@@ -1957,6 +2009,29 @@ def get_oai_code(
             cancel=cancel_callback,
             resend=resend_callback,
         )
+    # Cloud Mail mix under cloudflare: session blob must win before CF poll
+    try:
+        import cloud_mail_otp as _cm_early
+
+        if _cm_early.is_cloud_mail_token(dev_token) or provider in (
+            "cloud_mail",
+            "cloudmail",
+            "vip0",
+            "vip0_xyz",
+            "skymail",
+        ):
+            return _cm_early.wait_code(
+                dev_token,
+                email,
+                cfg=config,
+                timeout=timeout,
+                poll_interval=max(2.0, float(poll_interval or 3)),
+                log=log_callback,
+                cancel=cancel_callback,
+                resend=resend_callback,
+            )
+    except ImportError:
+        pass
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1967,7 +2042,7 @@ def get_oai_code(
             jwt=get_yyds_jwt(),
             cancel_callback=cancel_callback,
         )
-    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail"):
+    if provider in ("cloudflare", "mixed", "mix", "cf+hotmail", "cf+mix"):
         # Optional: fixed Gmail/OTP map for a known email without switching provider
         try:
             import mailsapi_otp as _mo
@@ -2027,6 +2102,29 @@ def get_oai_code(
             resend=resend_callback,
             root=Path(__file__).resolve().parent,
         )
+    # Cloud Mail session blob (also when mixed provider left a cloud_mail token)
+    try:
+        import cloud_mail_otp as _cm
+
+        if _cm.is_cloud_mail_token(dev_token) or provider in (
+            "cloud_mail",
+            "cloudmail",
+            "vip0",
+            "vip0_xyz",
+            "skymail",
+        ):
+            return _cm.wait_code(
+                dev_token,
+                email,
+                cfg=config,
+                timeout=timeout,
+                poll_interval=max(2.0, float(poll_interval or 3)),
+                log=log_callback,
+                cancel=cancel_callback,
+                resend=resend_callback,
+            )
+    except ImportError:
+        pass
     # pure hotmail already handled at top via _is_hotmail_session
     return duckmail_get_oai_code(
         dev_token,
@@ -4295,7 +4393,7 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "tempmail_lol", "mailsapi", "hotmail"],
+            ["duckmail", "yyds", "cloudflare", "tempmail_lol", "mailsapi", "hotmail", "cloud_mail"],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)

@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html><head>
+  <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+</head><body>
+  <form id="signup-form">
+    <input type="email" name="email" placeholder="Email">
+    <div class="g-recaptcha" data-sitekey="6LfX4v4UAAAAAGnVc6jBmYFhVgX8eQkMZn0R1a2b" data-theme="light"></div>
+    <button type="submit">Continue</button>
+  </form>
+  <textarea id="g-recaptcha-response" name="g-recaptcha-response"></textarea>
+  <script>
+    window.___grecaptcha_cfg = {
+      clients: {
+        '0': { callback: function(token) { window.___last_captcha_callback_token = token; } }
+      }
+    };
+  </script>
+</body></html>

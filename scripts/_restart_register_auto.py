@@ -42,7 +42,7 @@ def main() -> int:
 
     LOG.parent.mkdir(parents=True, exist_ok=True)
     logf = open(LOG, "a", encoding="utf-8")
-    logf.write("\n=== RESTART auto (cf resend fix + mix 0.6) ===\n")
+    logf.write("\n=== RESTART auto (cloud_mail 4-domain mix + hotmail mix) ===\n")
     logf.flush()
     subprocess.Popen(
         [PY, "-u", str(ROOT / "grok_register_ttk.py"), "auto"],

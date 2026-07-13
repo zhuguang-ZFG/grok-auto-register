@@ -1,41 +1,49 @@
-version: 1
-# CSS / text hints for DrissionPage. Update when Databricks DOM changes.
+version: 2
+# SISU (login.databricks.com) flow — updated after 2026-07 DOM probe
 signup:
   email_inputs:
-    - "input[type=email]"
     - "input[name=email]"
-    - "#email"
+    - "input[type=email]"
+    - "input[placeholder=Email]"
   password_inputs:
     - "input[type=password]"
     - "input[name=password]"
   first_name:
     - "input[name=firstName]"
     - "input[name=first_name]"
-    - "#firstName"
   last_name:
     - "input[name=lastName]"
     - "input[name=last_name]"
-  submit_texts:
-    - "Get started"
-    - "Sign up"
+  continue_email_texts:
+    - "Continue with email"
     - "Continue"
-    - "Start free trial"
+  submit_texts:
+    - "Continue"
     - "Create account"
+    - "Sign up"
+    - "Get started"
+    - "Next"
   express_texts:
     - "Express"
-    - "express setup"
-    - "Get started with Express"
+  # select-product page (2026-07 SISU): two product buttons
+  product_trial_texts:
+    - "Start trial with express setup"
+    - "Start trial"
+    - "Start your free trial"
+  product_free_texts:
+    - "Get Free Edition"
+    - "Free Edition"
 human_gates:
   phone_patterns:
     - "phone number"
     - "mobile number"
     - "verify your phone"
     - "sms code"
-  captcha_patterns:
-    - "captcha"
-    - "cf-turnstile"
-    - "hcaptcha"
-    - "recaptcha"
+  # Do NOT list bare "recaptcha" — SISU always loads the script
+  captcha_block_patterns:
+    - "solve this puzzle"
+    - "select all images"
+    - "unusual traffic"
 onboarding:
   skip_texts:
     - "Skip"
@@ -48,6 +56,7 @@ token:
   settings_paths:
     - "/settings/user"
     - "/settings/account"
+    - "/#setting/account"
   developer_texts:
     - "Developer"
     - "Access tokens"

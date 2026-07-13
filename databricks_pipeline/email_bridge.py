@@ -19,7 +19,16 @@ _VERIFY_HREF = re.compile(
     re.I,
 )
 _ANY_HREF = re.compile(r"https?://[^\s\"'<>]+", re.I)
+# SISU 2026: subject "Your verification code is Q6Y-HMB" (alnum + hyphen)
+_DBX_CODE = re.compile(
+    r"(?:verification\s+code\s+is|your\s+code\s+is|code\s+is)\s*[:\s]*([A-Za-z0-9]{3,4}[- ]?[A-Za-z0-9]{3,4})",
+    re.I,
+)
 _CODE = re.compile(r"\b(\d{6})\b")
+_CODE_LABELED = re.compile(
+    r"(?:code|verification|one[-\s]?time|otp)[^\d]{0,40}(\d{6})",
+    re.I,
+)
 
 
 def _log(log: Optional[LogFn], msg: str) -> None:
@@ -74,19 +83,68 @@ def create_mailbox(
     return address, jwt, "cloudflare"
 
 
+_BAD_CODES = frozenset(
+    {
+        "000000",
+        "111111",
+        "123456",
+        "654321",
+        "999999",
+        "123123",
+        "000001",
+        "959595",
+        "380135",
+    }
+)
+
+
+def _normalize_dbx_code(raw: str) -> str:
+    """Return 6-char code without hyphen/space for box fill (Q6Y-HMB -> Q6YHMB)."""
+    s = re.sub(r"[^A-Za-z0-9]", "", (raw or "").strip().upper())
+    return s
+
+
+def _plausible_otp(code: str) -> bool:
+    """Accept 6-digit numeric or 6-char alphanumeric SISU codes."""
+    if not code:
+        return False
+    norm = _normalize_dbx_code(code)
+    if len(norm) != 6:
+        return False
+    if norm in _BAD_CODES or len(set(norm)) == 1:
+        return False
+    # pure hex colors / css noise often all digits with repeated patterns — still allow mixed
+    if norm.isdigit() and norm in _BAD_CODES:
+        return False
+    return True
+
+
 def _extract_verify(subject: str, body: str) -> Tuple[Optional[str], Optional[str]]:
+    """Prefer SISU alphanumeric OTP, then numeric, then verify links."""
     blob = f"{subject}\n{body}"
+    # Subject is the most reliable for Databricks: "... code is Q6Y-HMB"
+    for src in (subject, blob):
+        m = _DBX_CODE.search(src or "")
+        if m and _plausible_otp(m.group(1)):
+            return None, _normalize_dbx_code(m.group(1))
+    low = blob.lower()
+    looks_dbx = "databricks" in low or "verification code" in low
+    if looks_dbx:
+        for lm in _CODE_LABELED.finditer(blob):
+            code = lm.group(1)
+            if _plausible_otp(code):
+                return None, code
+        for cm in _CODE.finditer(blob):
+            code = cm.group(1)
+            if _plausible_otp(code):
+                return None, code
     m = _VERIFY_HREF.search(blob)
     if m:
         return m.group(0).rstrip(").,]}>\"'"), None
-    # any databricks-looking link
     for m in _ANY_HREF.finditer(blob):
         url = m.group(0).rstrip(").,]}>\"'")
-        if "databricks" in url.lower() or "auth" in url.lower():
+        if "databricks" in url.lower() and "verify" in url.lower():
             return url, None
-    cm = _CODE.search(blob)
-    if cm:
-        return None, cm.group(1)
     return None, None
 
 
@@ -138,7 +196,7 @@ def wait_verification(
             time.sleep(poll_interval)
         raise TimeoutError(f"no databricks mail for {email} within {timeout}s")
 
-    # cloudflare
+    # cloudflare — prefer Subject from raw MIME (Databricks puts code there)
     import cf_mail_debug as cf
 
     api_base = str(raw.get("cloudflare_api_base") or "").rstrip("/")
@@ -148,23 +206,30 @@ def wait_verification(
         mails = cf.fetch_box(api_base, secret, path, {"limit": 20, "offset": 0})
         for item in mails:
             mid = item.get("id") or item.get("mail_id")
-            key = str(mid or item.get("subject"))
+            key = str(mid or item.get("subject") or item.get("message_id") or id(item))
             if key in seen:
                 continue
             seen.add(key)
             detail = cf.get_detail(api_base, secret, mid) if mid else {}
             subject, text = cf.flatten_mail_text(item, detail)
-            # prefer databricks-related
-            blob = f"{subject}\n{text}".lower()
-            if "databricks" not in blob and "verify" not in blob and "confirm" not in blob:
-                # still try extract
-                pass
+            raw_mime = ""
+            if isinstance(detail, dict):
+                raw_mime = str(detail.get("raw") or "")
+            if not raw_mime and isinstance(item, dict):
+                raw_mime = str(item.get("raw") or "")
+            if raw_mime:
+                sm = re.search(r"^Subject:\s*(.+)$", raw_mime, re.M | re.I)
+                if sm:
+                    # unfold simple subject
+                    subject = sm.group(1).strip()
+                # include raw for pattern match (header is enough)
+                text = f"{text}\n{raw_mime[:8000]}"
             link, code = _extract_verify(subject, text)
+            if code:
+                _log(log, f"[email] verify code subject={subject[:80]!r} code={code}")
+                return "code", code
             if link:
                 _log(log, f"[email] verify link subject={subject[:50]!r}")
                 return "link", link
-            if code:
-                _log(log, f"[email] verify code subject={subject[:50]!r}")
-                return "code", code
         time.sleep(poll_interval)
     raise TimeoutError(f"no databricks mail for {email} within {timeout}s")
