@@ -73,6 +73,10 @@ config.json.bak*
 # local community dump (not for publish)
 _community_ref/
 
+# side OpenAI gateways (Kiro-Go binary + data/credentials; not Grok cpa_auths)
+side_pools/
+!side_pools/README.md
+
 # local import / community ref dumps (may contain tokens)
 _import_*/
 _sso_ref/
