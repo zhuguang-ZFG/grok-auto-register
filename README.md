@@ -63,7 +63,6 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持页面卡住检测、当前账号重试、每账号浏览器重启和内存清理。
 - 自用加固基线见 [docs/HARDEN.md](docs/HARDEN.md)、号池运维见 [POOL.md](POOL.md)。
 - 可选：独立 **Databricks Express 试用** 流水线（号池 `databricks_auths/`，不写 CPA）见 [docs/DATABRICKS_PIPELINE.md](docs/DATABRICKS_PIPELINE.md)。
-- 可选：**Dahl Inference** 全自动领 key + chat + 本地 OpenAI 代理见 [docs/DAHL_PIPELINE.md](docs/DAHL_PIPELINE.md)。
 
 ## 环境要求
 

@@ -12,7 +12,6 @@
 | 注册机 `grok_register_ttk.py auto` | **运行中** | 15:34 经 `start_register_hidden.vbs` 恢复；`register_count=8` / `concurrent_count=1` |
 | `quota_watch` | **运行中** | 15:34 经 `start_quota_watch_hidden.vbs` 恢复；`poll=15s` / soft-disable + pool rotate |
 | Kimi CLI | `local-cpa/grok-4.5` → `http://127.0.0.1:8317/v1` | key 与 CLIProxy `api-keys` 一致；短 chat 实测 **200 / pong** |
-| Dahl proxy（支线） | 可选 `:8330` | `start_dahl_proxy_hidden.vbs`；本地 key `sk-local-dahl`（非密钥，固定本地口令） |
 
 路由（CLIProxy）：
 
@@ -99,20 +98,20 @@ Hotmail 铸造进 CPA（当缓冲弹药，不当 own 水位）：
 - `clash_rotate_per_account` + `clash_rotate_every_n=5`（弱多 IP，非每号独立住宅 IP）
 - `http_proxy_enabled=false`（`all_proxies.txt` 未作主路径）
 
-## 4. 支线：Dahl / Databricks / GLM
+## 4. 支线：Databricks / GLM
 
 | 路径 | 状态 | 备注 |
 |------|------|------|
 | **Grok CPA + CLIProxy** | **主粮** | 见上；Kimi `local-cpa/grok-4.5` |
-| **Dahl Inference** | 可用支线 | `docs/DAHL_PIPELINE.md`；chat 需浏览器会话；catalog 中 `zai-org/GLM-5.2-FP8` **chat unsupported** |
 | **智谱 coding plan GLM-5.2** | 可用 | Kimi `zhipuai-coding-plan/glm-5.2`（非 Databricks） |
 | **Databricks 14 天 $400** | **自动化未通 / 已停手** | `databricks_pipeline/` 保留；无 live host+token |
+| **Dahl Inference** | **已删除（2026-07-13）** | 代码/文档/Kimi provider 已移除；不用 `:8330` |
 
 ## 5. 本阶段已落地（相对 06:00 快照）
 
 1. 号池扩到 ~3600+；Hotmail CPA 增至 ~171  
 2. **Cloud Mail** 模块与测试：`cloud_mail_otp.py`、`tests/test_cloud_mail_otp.py`  
-3. **Dahl 流水线**：`dahl_pipeline/`、隐藏启动、文档、quota 单测  
+3. **Dahl 流水线**：已移除（无用）  
 4. **Databricks**：Express 选择器、CapSolver 解 reCAPTCHA、email_bridge 加固；**setup-account 未过，用户放弃 CDP 深挖**  
 5. 运维：注册机/quota 中断后用 VBS 恢复；CLIProxy 自带 token auto-refresh  
 
@@ -127,7 +126,6 @@ python hotmail_pool.py
 python hotmail_pool.py --smoke --imap-list
 wscript start_register_hidden.vbs
 wscript start_quota_watch_hidden.vbs
-wscript start_dahl_proxy_hidden.vbs
 python grok_register_ttk.py auto
 ```
 
@@ -141,4 +139,4 @@ python grok_register_ttk.py auto
 
 ## 8. 不提交内容
 
-`config.json`、`cpa_auths/`、`cpa_auths_dead/`、`data/hotmail_pool.txt`、`mail_credentials.txt`、`token.json`、`dahl_keys/*.local.json`、`vip0_mail.local.json`、`logs/`、`screenshots/`、代理明文列表、导入包 `_import_*` / `_community_ref/`。
+`config.json`、`cpa_auths/`、`cpa_auths_dead/`、`data/hotmail_pool.txt`、`mail_credentials.txt`、`token.json`、`vip0_mail.local.json`、`logs/`、`screenshots/`、代理明文列表、导入包 `_import_*` / `_community_ref/`。

@@ -310,7 +310,7 @@ def create_browser(cfg: Optional[Dict[str, Any]] = None) -> Any:
             co.set_proxy(proxy)
         except Exception:
             pass
-    # CRITICAL: use a free local debug port so we never attach to Dahl/Grok Chrome
+    # CRITICAL: use a free local debug port so we never attach to other Chrome
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
