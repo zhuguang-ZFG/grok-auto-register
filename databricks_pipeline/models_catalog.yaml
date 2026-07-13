@@ -1,0 +1,15 @@
+# Community / short aliases -> Databricks serving endpoint names
+aliases:
+  system.ai.qwen35-122b-a10b: databricks-qwen35-122b-a10b
+  system.ai.gpt-oss-120b: databricks-gpt-oss-120b
+  system.ai.gemma-3-12b: databricks-gemma-3-12b
+  system.ai.glm-5.2: databricks-glm-5-2
+  qwen35-122b-a10b: databricks-qwen35-122b-a10b
+  gpt-oss-120b: databricks-gpt-oss-120b
+  gemma-3-12b: databricks-gemma-3-12b
+  glm-5.2: databricks-glm-5-2
+
+# Optional extra probe candidates (tried only if listed in config probe_models)
+optional_endpoints:
+  - databricks-glm-5-2
+  - databricks-meta-llama-3-3-70b-instruct

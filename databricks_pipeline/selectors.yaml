@@ -1,0 +1,59 @@
+version: 1
+# CSS / text hints for DrissionPage. Update when Databricks DOM changes.
+signup:
+  email_inputs:
+    - "input[type=email]"
+    - "input[name=email]"
+    - "#email"
+  password_inputs:
+    - "input[type=password]"
+    - "input[name=password]"
+  first_name:
+    - "input[name=firstName]"
+    - "input[name=first_name]"
+    - "#firstName"
+  last_name:
+    - "input[name=lastName]"
+    - "input[name=last_name]"
+  submit_texts:
+    - "Get started"
+    - "Sign up"
+    - "Continue"
+    - "Start free trial"
+    - "Create account"
+  express_texts:
+    - "Express"
+    - "express setup"
+    - "Get started with Express"
+human_gates:
+  phone_patterns:
+    - "phone number"
+    - "mobile number"
+    - "verify your phone"
+    - "sms code"
+  captcha_patterns:
+    - "captcha"
+    - "cf-turnstile"
+    - "hcaptcha"
+    - "recaptcha"
+onboarding:
+  skip_texts:
+    - "Skip"
+    - "Not now"
+    - "I'll do this later"
+    - "Continue"
+    - "Get started"
+    - "Next"
+token:
+  settings_paths:
+    - "/settings/user"
+    - "/settings/account"
+  developer_texts:
+    - "Developer"
+    - "Access tokens"
+    - "Personal access tokens"
+  generate_texts:
+    - "Generate new token"
+    - "Generate token"
+    - "Create token"
+  token_comment: "grok-auto-register-dbx"

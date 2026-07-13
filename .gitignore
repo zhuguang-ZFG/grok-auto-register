@@ -18,6 +18,10 @@ screenshots/
 
 config.json
 config.local.json
+vip0_mail.local.json
+secrets/
+.cloud_mail_domain_health.json
+.cloud_mail_domain_health.json.tmp
 
 # grok2api token pool (contains sso credentials)
 token.json
@@ -56,6 +60,10 @@ autoPortData/
 logs/
 # pool runtime / dead accounts
 cpa_auths_dead/
+databricks_auths/**
+!databricks_auths/.gitkeep
+databricks_auths_dead/
+.pytest_dbx_tmp/
 .domain_rr_index
 pool_index.json
 *.bak-sync*
