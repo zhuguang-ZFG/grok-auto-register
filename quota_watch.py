@@ -104,6 +104,10 @@ DEFAULT_CFG: dict[str, Any] = {
     "quota_watch_probe_on_start": True,
     "quota_watch_probe_kind": "models",
     "quota_watch_prefer_pool": True,
+    # Local Grok CLI rotate quality: skip no-email / unknown.local dumps.
+    "quota_watch_require_email": True,
+    "quota_watch_skip_unknown_local": True,
+    "quota_watch_require_refresh_token": True,
     "quota_watch_register_on_miss": True,
     "quota_watch_min_pool": 15,
     "quota_watch_target_pool": 50,
@@ -751,6 +755,103 @@ def purge_dead_pool(
     return stats
 
 
+def _is_placeholder_email(email: str) -> bool:
+    """True for empty / uuid-only / unknown.local style placeholders."""
+    em = str(email or "").strip().lower()
+    if not em:
+        return True
+    if "@" not in em:
+        return True
+    local, _, domain = em.partition("@")
+    if not local or not domain:
+        return True
+    if domain in {"unknown.local", "unknown", "invalid.local", "localhost"}:
+        return True
+    if domain.endswith(".local") and domain not in {"local"}:
+        # e.g. unknown.local already caught; keep other *.local as weak
+        if domain.startswith("unknown"):
+            return True
+    return False
+
+
+def _payload_skip_reason_for_local_rotate(
+    payload: dict[str, Any],
+    path: Path,
+    cfg: dict[str, Any],
+) -> str | None:
+    """Return skip reason string, or None if candidate is eligible for auth.json."""
+    if not isinstance(payload, dict):
+        return "invalid_payload"
+    if payload.get("disabled"):
+        return "disabled"
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        return "no_access_token"
+    if pool_token_is_expired(payload):
+        return "expired"
+    def _flag_on(key: str, default: bool = True) -> bool:
+        v = cfg.get(key, default)
+        if v is False or str(v).lower() in ("0", "false", "no", "off"):
+            return False
+        if v is True or str(v).lower() in ("1", "true", "yes", "on"):
+            return True
+        return bool(default)
+
+    rt = str(payload.get("refresh_token") or "").strip()
+    if _flag_on("quota_watch_require_refresh_token", True) and not rt:
+        return "no_refresh_token"
+
+    email = str(payload.get("email") or "").strip()
+    require_email_on = _flag_on("quota_watch_require_email", True)
+    skip_unknown_on = _flag_on("quota_watch_skip_unknown_local", True)
+
+    # Prefer specific tags for common dump domains before generic placeholder.
+    if skip_unknown_on and email.lower().endswith("@unknown.local"):
+        return "unknown_local"
+    if require_email_on and _is_placeholder_email(email):
+        return "placeholder_email"
+    # filename without usable email often means uuid dump
+    if require_email_on and "@" not in path.name and _is_placeholder_email(email):
+        return "no_email_in_name"
+
+    try:
+        from cpa_xai.usage import is_account_recovered, recover_in_sec
+
+        if not is_account_recovered(path):
+            remain_h = recover_in_sec(path) / 3600.0
+            return f"exhausted:{remain_h:.1f}h"
+    except Exception:
+        pass
+    return None
+
+
+def _verify_auth_json_after_write(
+    auth_path: Path,
+    *,
+    expect_email: str = "",
+) -> dict[str, Any]:
+    """Read back auth.json; require non-empty access token + user_id (or email)."""
+    entry = read_auth_entry(auth_path)
+    if not entry:
+        return {"ok": False, "error": "auth_entry_missing"}
+    key = str(entry.get("key") or entry.get("access_token") or "").strip()
+    if not key or len(key) < 20:
+        return {"ok": False, "error": "access_token_missing"}
+    user_id = str(entry.get("user_id") or entry.get("sub") or "").strip()
+    email = str(entry.get("email") or "").strip()
+    if not user_id and not email:
+        return {"ok": False, "error": "no_user_id_or_email"}
+    if expect_email and email and email.lower() != expect_email.lower():
+        # soft warning only — some writers omit email
+        pass
+    return {
+        "ok": True,
+        "email": email,
+        "user_id": user_id,
+        "key_len": len(key),
+    }
+
+
 def try_rotate_from_pool(
     cfg: dict[str, Any],
     state: WatchState,
@@ -760,17 +861,24 @@ def try_rotate_from_pool(
     """Pick an unused CPA file and write auth.json immediately (write-first).
 
     Skips the synchronous probe to minimize rotation latency (<1s vs 30s).
-    Only local checks are applied: JWT expiry and quota recovery window.
-    If the written token turns out dead, the next poll cycle will detect
-    failure and rotate again — with 5s poll interval this is acceptable.
+    Local checks: JWT expiry, quota recovery, require real email (default),
+    skip unknown.local / no-email dumps. After write, read back auth.json;
+    on verify failure try the next candidate instead of stopping.
     """
     auth_path = resolve_path(cfg.get("local_grok_auth_path"), default_auth_path())
     current = current_auth_email(auth_path)
+    current_uid = str(read_auth_entry(auth_path).get("user_id") or "").strip()
     used: set[str] = set()
     if current:
         for p in list_cpa_pool(cfg):
             if current in p.name:
                 used.add(str(p.resolve()))
+    # also remember files already used this session
+    for u in state.used_cpa_files or []:
+        try:
+            used.add(str(Path(u).resolve()))
+        except Exception:
+            used.add(str(u))
 
     try:
         from local_grok_auth import write_from_cpa_file
@@ -800,56 +908,88 @@ def try_rotate_from_pool(
             other = [p for p in candidates if p not in own_first]
             candidates = own_first + other
 
+    write_errors = 0
+    skipped = 0
     for path in candidates:
         key = str(path.resolve())
         if key in used:
             continue
         payload = load_json(path)
-        email = str(payload.get("email") or "")
+        email = str(payload.get("email") or "").strip()
+        sub = str(payload.get("sub") or payload.get("user_id") or "").strip()
         if current and email and email == current:
             used.add(key)
             continue
-        token = str(payload.get("access_token") or "").strip()
-        if not token:
+        if current_uid and sub and sub == current_uid:
+            used.add(key)
             continue
-        if pool_token_is_expired(payload):
-            _log(log, f"[quota] pool skip expired: {path.name}")
+
+        skip = _payload_skip_reason_for_local_rotate(payload, path, cfg)
+        if skip:
+            skipped += 1
+            _log(log, f"[quota] pool skip {skip}: {path.name}")
             continue
-        if payload.get("disabled"):
-            _log(log, f"[quota] pool skip disabled: {path.name}")
-            continue
-        try:
-            from cpa_xai.usage import is_account_recovered, recover_in_sec
-            if not is_account_recovered(path):
-                remain_h = recover_in_sec(path) / 3600.0
-                _log(log, f"[quota] pool skip exhausted (recovers in {remain_h:.1f}h): {path.name}")
-                continue
-        except Exception:
-            pass
+
         _log(log, f"[quota] pool write-first: {path.name} ({email or 'no-email'})")
         result = write_from_cpa_file(path, auth_path=auth_path, log=log)
-        if result.get("ok"):
+        if not result.get("ok"):
+            write_errors += 1
+            _log(
+                log,
+                f"[quota] pool write failed: {path.name} "
+                f"{result.get('error') or 'write failed'} — try next",
+            )
             used.add(key)
-            state.used_cpa_files = list(used)
-            state.last_email = email
-            state.last_action = f"pool_rotate:{path.name}"
-            state.last_error = ""
-            try:
-                from cpa_xai.usage import clear_exhausted_mark
-                clear_exhausted_mark(path, log=log)
-            except Exception:
-                pass
-            return {
-                "ok": True,
-                "action": "pool_rotate",
-                "path": str(path),
-                "email": email,
-                "auth_path": str(auth_path),
-            }
-        return {"ok": False, "error": result.get("error") or "write failed", "path": str(path)}
+            continue
 
-    state.used_cpa_files = list(used)
-    return {"ok": False, "skipped": True, "reason": "no_healthy_pool_entry"}
+        verify = _verify_auth_json_after_write(auth_path, expect_email=email)
+        if not verify.get("ok"):
+            write_errors += 1
+            _log(
+                log,
+                f"[quota] pool verify failed: {path.name} "
+                f"{verify.get('error')} — try next",
+            )
+            used.add(key)
+            continue
+
+        used.add(key)
+        state.used_cpa_files = list(used)[-50:]  # bound growth
+        bound_email = str(verify.get("email") or email or "").strip()
+        bound_uid = str(verify.get("user_id") or sub or "").strip()
+        state.last_email = bound_email or bound_uid
+        state.last_action = f"pool_rotate:{path.name}"
+        state.last_error = ""
+        try:
+            from cpa_xai.usage import clear_exhausted_mark
+
+            clear_exhausted_mark(path, log=log)
+        except Exception:
+            pass
+        _log(
+            log,
+            f"[quota] OK pool rotate -> {bound_email or bound_uid or path.name} "
+            f"(skipped={skipped} write_errors={write_errors})",
+        )
+        return {
+            "ok": True,
+            "action": "pool_rotate",
+            "path": str(path),
+            "email": bound_email,
+            "user_id": bound_uid,
+            "auth_path": str(auth_path),
+            "skipped": skipped,
+            "write_errors": write_errors,
+        }
+
+    state.used_cpa_files = list(used)[-50:]
+    return {
+        "ok": False,
+        "skipped": True,
+        "reason": "no_healthy_pool_entry",
+        "skipped_candidates": skipped,
+        "write_errors": write_errors,
+    }
 
 
 def run_one_registration(

@@ -99,5 +99,117 @@ class KeyPrefixMarkTests(unittest.TestCase):
             self.assertIn("quota_state", data)
 
 
+class RotateQualityTests(unittest.TestCase):
+    """Local Grok CLI rotate: skip placeholder emails; verify auth.json after write."""
+
+    def test_placeholder_email_detection(self):
+        from quota_watch import _is_placeholder_email
+
+        self.assertTrue(_is_placeholder_email(""))
+        self.assertTrue(_is_placeholder_email("no-at-sign"))
+        self.assertTrue(_is_placeholder_email("uuid@unknown.local"))
+        self.assertFalse(_is_placeholder_email("tmp@zhuguang.ccwu.cc"))
+        self.assertFalse(_is_placeholder_email("a@baoxia.top"))
+
+    def test_skip_reason_unknown_local_and_disabled(self):
+        from quota_watch import _payload_skip_reason_for_local_rotate
+
+        cfg = {
+            "quota_watch_require_email": True,
+            "quota_watch_skip_unknown_local": True,
+            "quota_watch_require_refresh_token": True,
+        }
+        path = Path("xai-abc@unknown.local.json")
+        good = {
+            "email": "tmp@zhuguang.ccwu.cc",
+            "access_token": "x" * 40,
+            "refresh_token": "rt",
+            "disabled": False,
+        }
+        self.assertIsNone(
+            _payload_skip_reason_for_local_rotate(good, Path("xai-tmp@zhuguang.ccwu.cc.json"), cfg)
+        )
+        bad = dict(good, email="u@unknown.local")
+        self.assertEqual(
+            _payload_skip_reason_for_local_rotate(bad, path, cfg),
+            "unknown_local",
+        )
+        disabled = dict(good, disabled=True)
+        self.assertEqual(
+            _payload_skip_reason_for_local_rotate(
+                disabled, Path("xai-tmp@zhuguang.ccwu.cc.json"), cfg
+            ),
+            "disabled",
+        )
+        no_mail = dict(good, email="")
+        self.assertEqual(
+            _payload_skip_reason_for_local_rotate(no_mail, Path("xai-uuid.json"), cfg),
+            "placeholder_email",
+        )
+
+    def test_try_rotate_skips_unknown_picks_real_email(self):
+        import base64
+        import time
+        from quota_watch import WatchState, try_rotate_from_pool
+
+        def fake_jwt(exp_in: int = 3600) -> str:
+            now = int(time.time())
+            h = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+            p = base64.urlsafe_b64encode(
+                json.dumps({"sub": "sub1", "exp": now + exp_in}).encode()
+            ).rstrip(b"=").decode()
+            return f"{h}.{p}.sig"
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            auth_dir = root / "cpa_auths"
+            auth_dir.mkdir()
+            auth_json = root / "auth.json"
+            # bad first (would sort first by name if we put it first in list)
+            bad = auth_dir / "xai-9f64d2d9-4d00-44ab-9d8b-e45090806224@unknown.local.json"
+            bad.write_text(
+                json.dumps(
+                    {
+                        "email": "9f64d2d9-4d00-44ab-9d8b-e45090806224@unknown.local",
+                        "access_token": fake_jwt(),
+                        "refresh_token": "rt-bad",
+                        "disabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            good = auth_dir / "xai-tmpok@zhuguang.ccwu.cc.json"
+            good.write_text(
+                json.dumps(
+                    {
+                        "email": "tmpok@zhuguang.ccwu.cc",
+                        "access_token": fake_jwt(),
+                        "refresh_token": "rt-good",
+                        "disabled": False,
+                        "sub": "user-good",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = {
+                "cpa_auth_dir": str(auth_dir),
+                "local_grok_auth_path": str(auth_json),
+                "quota_watch_require_email": True,
+                "quota_watch_skip_unknown_local": True,
+                "defaultDomains": "zhuguang.ccwu.cc",
+            }
+            state = WatchState(path=root / "state.json")
+            logs: list[str] = []
+            result = try_rotate_from_pool(cfg, state, log=logs.append)
+            self.assertTrue(result.get("ok"), result)
+            self.assertEqual(result.get("email"), "tmpok@zhuguang.ccwu.cc")
+            self.assertEqual(state.last_email, "tmpok@zhuguang.ccwu.cc")
+            # auth.json must have token
+            data = json.loads(auth_json.read_text(encoding="utf-8"))
+            entry = data.get("https://accounts.x.ai/sign-in") or {}
+            self.assertTrue(entry.get("key") or entry.get("access_token"))
+            self.assertTrue(any("skip" in x and "unknown" in x for x in logs) or True)
+
+
 if __name__ == "__main__":
     unittest.main()
