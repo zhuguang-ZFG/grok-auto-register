@@ -20,20 +20,23 @@
   "browser_proxy": "http://127.0.0.1:7897",
   "stealth_patch": true,
   "hide_window": false,
-  "block_media_fonts": false
+  "block_media_fonts": true
 }
 ```
+
+- 满池省流默认 **`block_media_fonts=true`**（`page.set.blocked_urls` 拦图/字体/媒体/分析域；见 `apply_bandwidth_saver`）。  
+- 若 Turnstile/CF **成功率掉**，再临时改 `false` 对照。
 
 弹窗挑战失败时，优先：
 
 1. 确认本地代理端口通
 2. `hide_window=false`（有头窗口）
-3. `block_media_fonts=false`
+3. 对照 `block_media_fonts`（先 true 观察；掉成功率再 false）
 4. `stealth_patch=true`
 
 ## 相关代码
 
-- `create_browser_options` / `resolve_browser_proxy`
+- `create_browser_options` / `resolve_browser_proxy` / `apply_bandwidth_saver`
 - `BrowserSession._apply_stealth_patch`
 - `getTurnstileToken` / `_click_turnstile_checkbox`
 - `dismiss_cookie_banner`

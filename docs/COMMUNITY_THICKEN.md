@@ -101,8 +101,19 @@ python scripts/hotmail_cpa_health.py
 
 细则：`docs/K12_POOL_HARDEN.md`、`docs/STATUS.md`。
 
-### 浏览器省内存档（2026-07-14）
+### 浏览器省内存 / 省流档（2026-07-15）
 
-- `chromium_slim: true` + `browser_restart_every: 4` + `concurrent_count: 1` + `chromium_mute_audio: true`
-- 注册机需**重启 auto 进程**后生效（配置在启动时读入）
-- 若 CF/资料页成功率明显掉，回滚：`chromium_slim: false`，`browser_restart_every: 6`
+| 键 | 本机值 | 社区对齐点 |
+|----|--------|------------|
+| `concurrent_count` | `1` | 多开 = 流量×N（站内挂号/403 帖亦劝降并发） |
+| `register_count` | `3`（满水位维持） | 自有域达标后别冲量 |
+| `browser_restart_every` | `3` | 勤清 profile，防泄漏 |
+| `chromium_slim` / `mute_audio` | `true` | 减后台网络 |
+| **`block_media_fonts`** | **`true`** | CDP `Network.setBlockedURLs`（`apply_bandwidth_saver`）；拦图/字体/媒体/分析域 |
+| `enable_nsfw` | **`false`** | grok.com `set_birth_date` 常被 CF 403，白耗流量；CPA 编码池不需要 |
+| `cpa_probe_after_write` / `cpa_probe_chat` | **`false`** | 铸造后 probe 易误杀 + 费额度 |
+| `email_mix_tempmail_lol` / `mailtm` / `yunmeng` | **关** | 站内大量「临时邮注册秒 403 / OTP 不到」；主用自有 CF 域 + 少量 hotmail |
+| `register_daily_success_cap` | `120` | 防尖刺 |
+
+- 注册机改代码后必须**重启 auto 进程**；仅改 `config.json` 部分路径会 `load_config`，仍建议重启一次。  
+- 若 CF/资料页成功率明显掉：先 `block_media_fonts: false` 对照，再考虑 `chromium_slim: false`。

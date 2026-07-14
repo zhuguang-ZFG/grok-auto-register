@@ -19,7 +19,8 @@ SSO cookie
 | `cpa_prefer_authcode_fallback` | `true` | device 挂时社区授权码路径 |
 | `cpa_authcode_attempts` | `1` | 失败再 browser，不硬重试炸代理 |
 | `cpa_protocol_attempts` | `3` | TLS/56 瞬时错误重试 |
-| `cpa_probe_after_write` | **`false`** | 铸造后 probe 费额度且误杀 |
+| `cpa_probe_after_write` | **`false`**（本机已关） | 铸造后立刻 chat probe 易 `permission-denied` 误杀；延后交给 `quota_watch`；亦省上游流量 |
+| `cpa_probe_chat` | **`false`** | 与上配套；勿 mint 后立刻 chat |
 | `cpa_base_url` | `https://cli-chat-proxy.grok.com/v1` | Build free 路径，非 api.x.ai 计费 |
 | `cpa_mint_rotate_egress` | `false` | 默认不每号换 IP；`rotate_on_tls=true` |
 
@@ -49,20 +50,34 @@ SSO cookie
 
 可选彻底隔离：见 **[CLASH_ISOLATE.md](CLASH_ISOLATE.md)**（rule 模式 + 分组 `注册专用` + `clash_selector`）。
 
-## 4. 本机性能（号池已大时）
+## 4. 本机性能 / 省流（号池已大时）
 
-| 键 | 建议 |
-|----|------|
-| `concurrent_count` | `1`（2 仅在成功率稳定且内存够时） |
-| `register_count` | `4` |
-| `auto_loop_pause_sec` | `≥120` |
-| `cpa_mint_workers` | `1` |
-| `quota_watch_poll_sec` | `15` |
-| `quota_watch_sample_probe_n` | `0` |
-| `sso_cookie_timeout_sec` | `150`（等 SSO 窗口，社区稳妥值） |
-| `sso_timeout_rotate_after` | `2`（连续 SSO 超时强制换 Clash 节点） |
-| `reg_metrics_enabled` | `true` → `logs/reg_metrics.jsonl` |
-| `register_daily_success_cap` | `0` 关闭；长期可设 `200`–`500` |
+注册机流量大头在 **有头 Chromium 拉注册页静态资源**（图/字体/追踪），不是 CPA 协议 mint。
+
+| 键 | 建议（本机已落地） | 原因 |
+|----|-------------------|------|
+| `concurrent_count` | **`1`** | 多开浏览器 = 流量×N + 内存 |
+| `register_count` | **`3`**（满水位维持） | 自有域已达标时别每轮 8 号 |
+| `enable_nsfw` | **`false`** | 跳过 grok.com 生日/NSFW（常 403），省一次 CF 往返 |
+| `auto_loop_pause_sec` | **`180`** | 降 CF/出口压力与失败重试流量 |
+| `browser_restart_every` | **`3`** | 更勤清 profile，防泄漏；略增启动成本但减异常 |
+| `block_media_fonts` | **默认 `false`（本机当前）**；满池可试 `true` | 省流；若资料页/Turnstile 掉成功率立刻改回 `false` |
+| `chromium_slim` | `true` | mute + 减后台网络等 flag |
+| `chromium_mute_audio` | `true` | |
+| `cpa_mint_workers` | **`1`** | |
+| `cpa_probe_after_write` | **`false`** | 铸造后不 probe，省上游流量 + 减误杀 |
+| `cpa_probe_chat` | **`false`** | 同上；存活交给 `quota_watch` |
+| `register_daily_success_cap` | **`120`** | 满池后限制日成功，防尖刺与浪费流量 |
+| `sso_timeout_rotate_after` | **`2`** | 少因单次超时就换节点（换节点也费流量） |
+| `clash_rotate_every_n` | **`8`** | 降频换出口 |
+| `quota_watch_sample_probe_n` | `0` | 禁止抽样 chat 扫池 |
+| `pool_probe_on_health` | `false` | 禁止全池 `/models` |
+
+### 4.0 省流注意
+
+- `block_media_fonts=true` 后若 **CF/OTP 成功率明显掉**，改回 `false` 并看 `TURNSTILE.md`。  
+- 协议 mint（`cpa_prefer_protocol`）本身很轻；**别为了省流去 headless**（CF 更重、重试更费流量）。  
+- 水位已满时最大省流 = **少开浏览器轮次**（count/pause/cap），比抠静态资源更有效。
 
 ### 4.1 注册指标（2026-07-14）
 

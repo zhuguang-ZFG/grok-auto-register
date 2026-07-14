@@ -45,6 +45,25 @@ LOG = ROOT / "logs" / "k12_pool_refill.log"
 LOCK = ROOT / "logs" / "k12_pool_refill.watch.lock"
 BATCH = 100
 
+# Shared snapshots whose workspace is known-dead (deactivated_workspace).
+# Never refill these account_id prefixes from pre_slim backups.
+DEAD_WORKSPACE_PREFIXES: tuple[str, ...] = (
+    "fc4f8db5-72cd-44cb-ae0d-fef1370a16c8",
+    "fc4f8db5",
+)
+
+
+def is_dead_workspace(acc: dict[str, Any]) -> bool:
+    """True if account belongs to a blacklisted dead K12 workspace."""
+    for key in ("account_id", "chatgpt_account_id", "workspace_id"):
+        val = str(acc.get(key) or "").strip().lower()
+        if not val:
+            continue
+        for pref in DEAD_WORKSPACE_PREFIXES:
+            if val == pref.lower() or val.startswith(pref.lower()):
+                return True
+    return False
+
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -294,6 +313,8 @@ def sample_candidates(
                 if only_unused and is_used(acc):
                     # used accounts in backup may already be burned; still allow if pool empty
                     continue
+                if is_dead_workspace(acc):
+                    continue
                 if not is_normal_status(acc.get("status")):
                     continue
                 # normalize status for re-import
@@ -371,19 +392,28 @@ def chat_probe(model: str = "gpt-5-mini") -> dict[str, Any]:
     return {"ok": False, "latency_s": elapsed, "http": code, "error": str(body)[:160]}
 
 
-def cmd_status(_: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> int:
     c = live_counts()
     ready = int(c.get("normal") or 0)
     total = int(c.get("total") or 0)
+    disabled = int(c.get("disabled") or 0)
     log(
         f"pool source={c.get('source')} total={total} normal/ready={ready} "
-        f"limited={c.get('limited')} abnormal={c.get('abnormal')} disabled={c.get('disabled')}"
+        f"limited={c.get('limited')} abnormal={c.get('abnormal')} disabled={disabled}"
     )
     src = find_default_source()
     if src:
         log(f"default refill source: {src.name} ({src.stat().st_size / 1e6:.1f} MB)")
     else:
         log("no large backup source found under backups/k12_db")
+    # All-disabled / paused K12 pool: skip chat probe (saves traffic; probe can be
+    # misleading when gateway still returns 200 on disabled rows).
+    skip_probe = bool(getattr(args, "no_probe", False))
+    if total > 0 and ready == 0 and disabled >= total:
+        log("all accounts disabled; skip chat probe (pool paused / dead workspace)")
+        skip_probe = True
+    if skip_probe:
+        return 0
     probe = chat_probe()
     if probe.get("ok"):
         log(f"chat probe OK {probe['latency_s']}s")
@@ -401,10 +431,20 @@ def cmd_refill(args: argparse.Namespace) -> int:
     c = live_counts()
     ready = int(c.get("normal") or 0)
     total = int(c.get("total") or 0)
+    disabled = int(c.get("disabled") or 0)
     log(
         f"before total={total} ready={ready} min_ready={min_ready} "
         f"target={target} hard_cap={hard_cap} source_counts={c.get('source')}"
     )
+
+    # Intentional full-disable (e.g. fc4f8db5 deactivated): do NOT refill from
+    # pre_slim — candidates are the same dead workspace (also filtered in sample).
+    if total > 0 and ready == 0 and disabled >= total and not bool(getattr(args, "force", False)):
+        log(
+            "all accounts disabled; skip refill "
+            "(pass --force only when importing a NEW live workspace)"
+        )
+        return 0
 
     if total >= hard_cap:
         log(f"at/above hard_cap={hard_cap}; refuse refill (run slim first)")
@@ -480,7 +520,12 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="K12 pool auto-refill from backup")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("status")
+    p_s = sub.add_parser("status")
+    p_s.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="skip chat probe (also auto-skipped when all accounts disabled)",
+    )
 
     def add_refill_args(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--source", default="", help="source accounts.db (default: largest pre_slim)")
@@ -493,6 +538,11 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--random", action="store_true", help="random sample instead of newest")
         sp.add_argument("--dry-run", action="store_true")
         sp.add_argument("--probe", action="store_true", help="chat probe after refill")
+        sp.add_argument(
+            "--force",
+            action="store_true",
+            help="allow refill even when live pool is all-disabled (new workspace only)",
+        )
 
     p_r = sub.add_parser("refill")
     add_refill_args(p_r)

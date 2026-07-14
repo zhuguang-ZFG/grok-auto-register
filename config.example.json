@@ -11,7 +11,9 @@
   "mail_backends": [
     {
       "api_base": "https://your-worker.example.workers.dev",
-      "domains": ["example.com"],
+      "domains": [
+        "example.com"
+      ],
       "path_accounts": "/api/new_address",
       "path_messages": "/api/mails",
       "auth_mode": "none",
@@ -19,7 +21,9 @@
     },
     {
       "api_base": "https://second-worker.example.workers.dev",
-      "domains": ["second.example.com"],
+      "domains": [
+        "second.example.com"
+      ],
       "path_accounts": "/api/new_address",
       "path_messages": "/api/mails",
       "auth_mode": "none",
@@ -27,7 +31,7 @@
     }
   ],
   "proxy": "http://127.0.0.1:7897",
-  "enable_nsfw": true,
+  "enable_nsfw": false,
   "register_count": 4,
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
   "grok2api_auto_add_local": false,
@@ -133,7 +137,7 @@
   "cpa_server_auth_dir": "",
   "token_only_file": "",
   "concurrent_count": 1,
-  "browser_restart_every": 4,
+  "browser_restart_every": 3,
   "cpa_mint_async": true,
   "cpa_mint_workers": 1,
   "cpa_mint_queue_max": 20,
@@ -223,7 +227,7 @@
   "sso_cookie_timeout_sec": 150,
   "sso_timeout_rotate_enabled": true,
   "sso_timeout_rotate_after": 2,
-  "register_daily_success_cap": 0,
+  "register_daily_success_cap": 120,
   "databricks": {
     "enabled": true,
     "register_count": 1,
@@ -246,5 +250,6 @@
     "human_gate_on_captcha": true
   },
   "chromium_slim": true,
-  "chromium_mute_audio": true
+  "chromium_mute_audio": true,
+  "block_media_fonts": true
 }

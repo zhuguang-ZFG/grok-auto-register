@@ -1,136 +1,116 @@
 # 运行状态快照
 
-> 记录时间：2026-07-15（本机墙钟；会话续写）  
+> 记录时间：2026-07-15（墙钟；**Grok 维持档 + K12 全禁 + 路由切离**）  
 > 仓库：`zhuguang-ZFG/grok-auto-register`  
 > 不含密钥 / 号池 JSON / 订阅 token / `mail_credentials` / Hotmail 号池正文。
+
+## 0. 一句话
+
+| 线 | 状态 |
+|----|------|
+| **Grok CPA 主粮** | 正常；注册机维持补号；近数小时 metrics 成功率 **~75%–80%** |
+| **K12 共享池** | **全 disabled**（`fc4f8db5`）；勿作默认；禁止 pre_slim 灌回 |
+| **默认路由** | Kimi → `local-cpa/grok-4.5`；Codex → `mycodex`（非 k12-local） |
 
 ## 1. 进程与入口
 
 | 组件 | 状态 | 备注 |
 |------|------|------|
 | CLIProxyAPI | **主粮** `:8317` | Grok CPA；`auth-dir=cpa_auths`；`proxy-url=http://127.0.0.1:7897` |
-| 注册机 `grok_register_ttk.py auto` | 长期稳跑 | SSO 超时 180s；连续 1 次 sso_timeout 即换 Clash 节点 |
-| `quota_watch` | 主粮配套 | soft-disable + pool rotate |
-| **chatgpt2api（K12）** | **运行中** `:8124` | 本地 clone（**不入库**）；`STORAGE_BACKEND=sqlite` → `data/accounts.db`；auth-key 本机 only |
-| FlareSolverr | **运行中** `:8191` | scoop `flaresolverr@3.5.0` |
-| K12 stack watchdog | 计划任务 `K12StackWatchdog` | 登录自启；`scripts/k12_stack_watchdog.ps1` |
-| Kimi CLI | 多 provider | 默认 `local-cpa/grok-4.5`；K12 见 `/model k12/gpt-5.6` |
-| Codex | 本地 K12 provider | `k12-local-chatgpt2api`；CLI schema 见下 |
+| 注册机 `grok_register_ttk.py auto` | **维持档在跑** | 见 §4 |
+| `quota_watch` | 在跑 | soft-disable + pool rotate（长跑 CPU 偏高时可加大 interval） |
+| **chatgpt2api（K12）** | 可运行 / **池全禁** `:8124` | clone **不入库**；勿当默认 provider |
+| FlareSolverr | 可选 | K12 死池时可减负只留 1 实例或停 |
+| K12 stack / pool maintain | 计划任务 | maintain：**无头** Hidden；全 disabled 时 skip refill/probe |
+| Kimi CLI | **默认 Grok CPA** | `local-cpa/grok-4.5`；备源 `cunai/*`；`k12/*` 勿手选 |
+| Codex | **已切离 K12** | `mycodex-1782970213160`（sharedchat） |
 
-### Kimi 模型别名（K12 池）
+### 注册机维持档（2026-07-15 固化）
 
-| 别名 | 上游 model | max_context | 备注 |
-|------|------------|-------------|------|
-| `k12/gpt-5.6` / `sol` / `terra` / `luna` | 同名 | **1_000_000** | 无 thinking capability（防 reasoning_effort 422） |
-| `k12/gpt-5-5` 等 | `gpt-5-5`… | **1_000_000** | |
-| `k12/gpt-5` 等 | `gpt-5`… | **400_000** | |
-| 全局 `reserved_context_size` | — | **50_000** | |
+| 键 | 值 | 说明 |
+|----|-----|------|
+| `register_count` | **3** | 自有域已超 target，维持而非冲量 |
+| `concurrent_count` | **1** | |
+| `block_media_fonts` | **false** | true 时资料页/Turnstile 成功率掉；代码已接线 `apply_bandwidth_saver`，默认关 |
+| `enable_nsfw` | **false** | 跳过 grok.com 生日/NSFW（常 CF 403） |
+| `cpa_probe_after_write` / `cpa_probe_chat` | **false** | mint 后不 probe，减误杀与上游流量 |
+| `email_mix_tempmail_lol` / `mailtm` / `yunmeng` / `cloud_mail` | **关** | OTP 空等 / 501 disabled |
+| `email_mix_hotmail_ratio` | ~0.30 | 主路径自有 CF 域 |
+| `register_daily_success_cap` | **120** | |
+| `sso_timeout_rotate_after` | **2** | |
+| `clash_rotate_every_n` | **8** | |
+
+**近期成功率（`logs/reg_metrics.jsonl`）**
+
+| 窗 | 约成功率 |
+|----|----------|
+| 近 1h | ~73% |
+| 近 3–6h / 今日 | **~76%–77%** |
+| 铸造 protocol | 明显高于失败；主损耗在浏览器页/SSO |
+
+### Kimi / Codex
 
 ```text
-[providers.k12]
-base_url = http://127.0.0.1:8124/v1
-# api_key 仅本机 config.toml（勿提交）
+default_model = "local-cpa/grok-4.5"
+# cunai: https://capi.cun.ai/v1 （本机 key；实测 glm 组）
+# k12/* 别名可保留，勿默认
+# Codex: mycodex-1782970213160，勿切回 k12-local 除非有新活 K12
 ```
 
-### Codex / cc-switch
-
-| 项 | 说明 |
-|----|------|
-| Provider id | `k12-local-chatgpt2api` → `http://127.0.0.1:8124/v1`，`wire_api=responses`，`model=gpt-5.6`，`reasoning=none` |
-| 启动 | `scripts/codex_k12.ps1` / `codex_k12.sh`（清 muyuan `OPENAI_*` env） |
-| CLI 卡壳 | GUI **3.17** 把 DB 升到 **schema v13**；SaladDay CLI **5.9.0 最高 v11** |
-| 绕过 | `python scripts/cc_switch_codex_provider.py list\|current\|switch <id>` |
-
-## 2. K12 号池水位（瘦身后 · 自动取回）
+## 2. K12 号池（全禁收口）
 
 | 指标 | 数值 |
 |------|------|
-| 网关 live | **~1.5k–1.6k**（`used` 全留 + 最新候补；**禁止**再灌 8 万） |
-| 冷备份源 | `backups/k12_db/accounts.db.pre_slim_*`（~80k / ~750MB，仅抽样 refill） |
-| DB 体积 | slim 后 **~14MB**（曾 714MB → VACUUM） |
-| 主来源 | 共享 K12 快照（同 `account_id=fc4f8db5-…`） |
-| plan_type | **k12** |
-| refresh_token | **无**（短窗口，约至 **2026-07-23**） |
-| 服务健康 | **`GET /healthz`** + chat probe（SSOT） |
-| 自动取回 | `scripts/k12_pool_refill.py`：水位 &lt; min-ready / target 时从备份 UPSERT，**hard-cap 2500** |
-| 定时瘦身 | `scripts/k12_pool_slim.py` + `run_k12_pool_maintain.ps1` / 任务 `K12-Pool-Maintain` |
+| live | **total≈1541，normal/ready=0，disabled=全量** |
+| workspace | `fc4f8db5-…` 共享快照，无 RT |
+| refill | **全 disabled → skip**；死 id 前缀黑名单 `fc4f8db5*` |
+| maintain | Hidden 任务；`status --no-probe`；无浏览器 |
+| 假活 | 全 disable 后 chat 仍可能 200 → **不以 chat 当复活** |
 
-**不要**把 hotmail 自注册 free 当 K12 补号源：
+禁止：从 `pre_slim` 整库灌回同 workspace；free hotmail 当 K12 补号。
 
-- free 可注册且常有 RT  
-- `invites/request` → `401 same domain`  
-- `invites/accept` 可能 **假成功**（HTTP 200 仍 personal free）
+## 3. Grok 主粮水位（约数，会变）
 
-## 3. 本阶段已落地（K12 支线 · 加厚）
+| 项 | 约值 |
+|----|------|
+| CPA 文件 | ~6.3k–6.4k |
+| 自有域 | **≥ own_register_target（2000+）** |
+| prefer | `buffer_first` |
+| 域名健康 | 自有 CF 域 ok 率多在 **0.96+**；hotmail 略低 |
 
-1. **网关**：SQLite 迁库；`auto_remove_invalid_accounts`；FlareSolverr clearance  
-2. **空响应轮换**（本机 clone，不入库）：`stream_text_deltas` 在 200 无 SSE 内容时换号  
-3. **探活**：`GET /healthz` 轻量；`/health?format=json` 仍做完整 stats  
-4. **运维脚本（入库）**  
-   - `scripts/k12_pool_ops.py` — watch 默认 `--probe-n 0`；单实例 lock；日志轮转  
-   - `scripts/k12_pool_monitor.py` — 单实例 lock  
-   - `scripts/k12_stack_watchdog.ps1` + `install_k12_stack_watchdog_task.ps1`  
-   - `scripts/k12_rt_import.py` / `k12_mother_invite.py` / `chatgpt2api_watchdog.ps1`（启网关带 sqlite env）  
-   - `scripts/k12_pool_slim.py` / `k12_pool_refill.py` — 瘦身 + 备份抽样自动取回  
-   - `scripts/run_k12_pool_maintain.ps1` + `install_k12_pool_maintain_task.ps1`  
-   - `scripts/codex_k12.ps1` / `.sh`  
-   - `scripts/cc_switch_codex_provider.py`  
-   - `scripts/sso_batch_to_cpa.py` — **Grok SSO→CPA**（非 K12）  
+## 4. 本阶段入库改动（相对上一推送）
 
-5. **文档**：`docs/K12_POOL_HARDEN.md`、`docs/K12_DOMAIN_RESEARCH.md`、`docs/COMMUNITY_THICKEN.md`  
-6. **模块骨架**：`chatgpt_k12/`  
+1. **`apply_bandwidth_saver`**：`block_media_fonts` 真正接线（CDP blocked_urls）；默认建议 **false**  
+2. 注册维持：count/日 cap/关 NSFW/关坏邮箱 mix/关 mint chat probe  
+3. **K12 refill**：死 workspace 过滤；全 disabled skip probe/refill；maintain 无头  
+4. 文档：`HARDEN` / `COMMUNITY_THICKEN` / `TURNSTILE` / 本文件  
 
-## 4. Grok 主粮（摘要）
+**不入库（本机 only）**
 
-| 路径 | 状态 |
-|------|------|
-| Grok CPA + CLIProxy `:8317` | **主粮** |
-| `cpa_auths/` | 持续自注册 + 社区 SSO 批量 mint（binbim 等） |
-| 社区 CPA zip（已 revoke RT） | **熔断不入库**（`import_cpa_with_probe`） |
-| 智谱 coding plan | 可用 |
-| Databricks 试用自动化 | **已停手** |
-| Kiro 旁路号池 | 秒封率高；见 `side_pools/README.md` |
+- `config.json`、`cpa_auths/`、`chatgpt2api/`、Kimi `config.toml` / `mcp.json`  
+- serial-mirror（`~/.kimi-code/tools/serial-mirror`，Agent 串口旁路，非本仓）
 
-## 5. 运维命令速查
+## 5. 运维速查
 
 ```bat
-REM --- Grok 主粮 ---
 python pool_status.py
 wscript start_register_hidden.vbs
 wscript start_quota_watch_hidden.vbs
-python scripts/import_cpa_with_probe.py D:\Downloads\pack.zip
-python scripts/sso_batch_to_cpa.py D:\Downloads\output.zip --concurrency 2
 
-REM --- K12 网关 ---
-curl http://127.0.0.1:8124/healthz
-python scripts/k12_pool_ops.py status
-python scripts/k12_pool_ops.py watch --interval 300 --probe-n 0 --auto-purge-abnormal
-python scripts/k12_pool_monitor.py --watch --interval 300
-python scripts/k12_pool_refill.py status
-python scripts/k12_pool_refill.py refill --min-ready 800 --target 1800 --hard-cap 2500 --probe
-python scripts/k12_pool_slim.py --keep-recent 1500 --dry-run
-powershell -ExecutionPolicy Bypass -File scripts\run_k12_pool_maintain.ps1
-powershell -ExecutionPolicy Bypass -File scripts\install_k12_pool_maintain_task.ps1
-python scripts/k12_rt_import.py inspect D:\Downloads\new_export.zip
-powershell -ExecutionPolicy Bypass -File scripts\k12_stack_watchdog.ps1
-powershell -ExecutionPolicy Bypass -File scripts\install_k12_stack_watchdog_task.ps1
+python scripts/k12_pool_refill.py status --no-probe
+python scripts/k12_pool_refill.py refill --min-ready 800 --target 1800
+REM 全 disabled 会 skip；新 workspace 才 --force
 
-REM --- Codex 切 K12 ---
-python scripts\cc_switch_codex_provider.py switch k12-local-chatgpt2api
-.\scripts\codex_k12.ps1
-
-REM FlareSolverr（若未常驻）
-flaresolverr
+python scripts\cc_switch_codex_provider.py current
+python scripts\cc_switch_codex_provider.py switch mycodex-1782970213160
 ```
 
-## 6. 已知边界 / 社区结论
+## 6. 边界
 
-- 共享 K12 **无 RT** → 到期即废；优先用、监控掉号  
-- 裸 `GET /backend-api/accounts/check` 常 401 → **禁止** direct-check 批量禁用  
-- free→K12：需 **母号 invite** 或同域邮箱；无造假入学/SheerID  
-- 网关忙时完整 `/health` 可能慢 → 用 **`/healthz`**  
-- cc-switch CLI 等上游支持 schema v13 后再 `cc-switch update`  
-- 合盖/睡眠影响无人值守（见 `docs/UNATTENDED.md`）
+- 共享 K12 无 RT；空间可整锅死  
+- 16GB 机：双 Kimi / 双 A2A MCP / 注册 Chrome 易把 CPU 打满 → 减负见会话运维笔记  
+- 合盖睡眠：`docs/UNATTENDED.md` / `ensure_power_awake.ps1`  
+- 不提交：号池、密钥、代理明文、logs 正文、本机 clone 网关数据  
 
 ## 7. 不提交内容
 

@@ -3103,6 +3103,76 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
+# CDN / static patterns safe to block on signup (CF challenge + x.ai HTML still load).
+# Do NOT block cloudflare/challenge scripts or accounts.x.ai document itself.
+_BANDWIDTH_BLOCK_URLS = (
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.gif",
+    "*.webp",
+    "*.svg",
+    "*.ico",
+    "*.bmp",
+    "*.woff",
+    "*.woff2",
+    "*.ttf",
+    "*.otf",
+    "*.eot",
+    "*.mp4",
+    "*.webm",
+    "*.mp3",
+    "*.wav",
+    "*.ogg",
+    "*.m4a",
+    "*googlevideo.com*",
+    "*doubleclick.net*",
+    "*google-analytics.com*",
+    "*googletagmanager.com*",
+    "*facebook.net*",
+    "*hotjar.com*",
+    "*segment.io*",
+    "*sentry.io*",
+    "*clarity.ms*",
+)
+
+
+def apply_bandwidth_saver(page=None, log_callback=None) -> bool:
+    """Block heavy static/media URLs via CDP Network.setBlockedURLs (DrissionPage).
+
+    Controlled by config ``block_media_fonts`` (default False historically; ops may
+    enable when pool is full and traffic is the bottleneck). Safe patterns only —
+    never blocks Cloudflare/x.ai challenge documents.
+    """
+    if not config.get("block_media_fonts", False):
+        return False
+    pg = page if page is not None else _get_page()
+    if pg is None:
+        return False
+
+    def _log(msg: str) -> None:
+        if log_callback:
+            try:
+                log_callback(msg)
+            except Exception:
+                pass
+
+    try:
+        setter = getattr(pg, "set", None)
+        if setter is None or not hasattr(setter, "blocked_urls"):
+            _log("[!] bandwidth saver: page.set.blocked_urls unavailable")
+            return False
+        setter.blocked_urls(list(_BANDWIDTH_BLOCK_URLS))
+        _log(
+            f"[*] bandwidth saver on: blocked {len(_BANDWIDTH_BLOCK_URLS)} url patterns "
+            "(images/fonts/media/analytics)"
+        )
+        return True
+    except Exception as exc:
+        _log(f"[!] bandwidth saver failed: {exc}")
+        return False
+
+
 def start_browser(log_callback=None):
     last_exc = None
     for attempt in range(1, 5):
@@ -3110,6 +3180,7 @@ def start_browser(log_callback=None):
             _set_browser(Chromium(create_browser_options()))
             tabs = _get_browser().get_tabs()
             _set_page(tabs[-1] if tabs else _get_browser().new_tab())
+            apply_bandwidth_saver(_get_page(), log_callback=log_callback)
             if log_callback and getattr(_get_browser(), "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {_get_browser().user_data_path}")
             # start_browser 仍返回 (browser, page)；不再调用 apply_register_window_hide
@@ -3275,6 +3346,7 @@ def refresh_active_page():
             _set_page(tabs[-1])
         else:
             _set_page(_get_browser().new_tab())
+        apply_bandwidth_saver(_get_page())
     except Exception:
         restart_browser()
     return _get_page()
@@ -3530,6 +3602,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                 _set_page(tabs[0] if tabs else browser.new_tab())
             except Exception:
                 _set_page(browser.new_tab())
+            apply_bandwidth_saver(_get_page(), log_callback=log_callback)
             _get_page().get(SIGNUP_URL)
             _get_page().wait.doc_loaded()
             # 给 CF/前端一点渲染时间
