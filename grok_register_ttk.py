@@ -139,6 +139,14 @@ DEFAULT_CONFIG = {
     "cloud_mail_credentials_file": "vip0_mail.local.json",
     "cloud_mail_domains": ["vip0.xyz"],
     "cloud_mail_domain_mode": "random",
+    # 云梦无限邮箱 (ym-mail.ymmynb.com) — public temp domains, buffer only.
+    "yunmeng_base": "https://ym-mail.ymmynb.com",
+    "yunmeng_api_version": "1.4",
+    "yunmeng_domain": "",
+    "yunmeng_domains": [],
+    "yunmeng_prefix_len": 12,
+    "email_mix_yunmeng": False,
+    "email_mix_yunmeng_ratio": 0.05,
     # Long-run stability (community-aligned): metrics + SSO egress heal + daily cap
     "reg_metrics_enabled": True,
     "reg_metrics_path": "logs/reg_metrics.jsonl",
@@ -2030,6 +2038,22 @@ def _email_mix_cloud_mail_ratio() -> float:
     return max(0.0, min(1.0, r))
 
 
+def _email_mix_yunmeng_enabled() -> bool:
+    """Whether Cloudflare/mixed registration should sometimes mint Yunmeng buffer mail."""
+    v = config.get("email_mix_yunmeng", False)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
+def _email_mix_yunmeng_ratio() -> float:
+    try:
+        r = float(config.get("email_mix_yunmeng_ratio", 0.0) or 0.0)
+    except Exception:
+        r = 0.0
+    return max(0.0, min(1.0, r))
+
+
 def _try_hotmail_inbox():
     import hotmail_pool as _hp
 
@@ -2042,16 +2066,27 @@ def _try_cloud_mail_inbox():
     return _cm.create_inbox(config, root=Path(__file__).resolve().parent)
 
 
+def _try_yunmeng_inbox():
+    import yunmeng_mail_otp as _ym
+
+    return _ym.create_inbox(config)
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
     # Diversify under cloudflare/mixed: exclusive buckets
-    # [0, hotmail) → Hotmail; [hotmail, hotmail+cloud_mail) → vip0 Cloud Mail; else CF.
+    # [0,hm) hotmail; [hm,hm+cm) cloud_mail; [hm+cm,hm+cm+ym) yunmeng; else CF.
     if provider in ("cloudflare", "mixed", "mix", "cf+hotmail", "cf+mix"):
         hm = _email_mix_hotmail_ratio() if _email_mix_hotmail_enabled() else 0.0
         cm = _email_mix_cloud_mail_ratio() if _email_mix_cloud_mail_enabled() else 0.0
-        # Cap combined diversion at 1.0; prefer hotmail slice when overflow.
-        if hm + cm > 1.0:
-            cm = max(0.0, 1.0 - hm)
+        ym = _email_mix_yunmeng_ratio() if _email_mix_yunmeng_enabled() else 0.0
+        # Cap combined diversion at 1.0; prefer hotmail → cloud_mail → yunmeng.
+        if hm + cm + ym > 1.0:
+            rest = max(0.0, 1.0 - hm)
+            if cm > rest:
+                cm, ym = rest, 0.0
+            else:
+                ym = max(0.0, rest - cm)
         roll = random.random()
         if hm > 0 and roll < hm:
             try:
@@ -2076,7 +2111,20 @@ def get_email_and_token(api_key=None):
                 return email, tok
             except Exception as exc:
                 try:
-                    print(f"[!] email_mix cloud_mail failed, fallback CF: {exc}", flush=True)
+                    print(f"[!] email_mix cloud_mail failed, fallback next: {exc}", flush=True)
+                except Exception:
+                    pass
+        elif ym > 0 and roll < hm + cm + ym:
+            try:
+                email, tok = _try_yunmeng_inbox()
+                try:
+                    print(f"[*] email_mix: yunmeng {email}", flush=True)
+                except Exception:
+                    pass
+                return email, tok
+            except Exception as exc:
+                try:
+                    print(f"[!] email_mix yunmeng failed, fallback CF: {exc}", flush=True)
                 except Exception:
                     pass
     if provider == "yyds":
@@ -2113,6 +2161,13 @@ def get_email_and_token(api_key=None):
             raise Exception(f"cloud_mail_otp module missing: {e}") from e
         # Community Cloud Mail (vip0.xyz etc.) — buffer only, not own domains
         return _cm.create_inbox(config, root=Path(__file__).resolve().parent)
+    if provider in ("yunmeng", "ym", "yunmeng_mail", "ymmail", "ymmynb"):
+        try:
+            import yunmeng_mail_otp as _ym
+        except ImportError as e:
+            raise Exception(f"yunmeng_mail_otp module missing: {e}") from e
+        # 云梦公开临时域 — buffer only
+        return _ym.create_inbox(config)
     key = api_key or get_duckmail_api_key()
     domain = pick_domain(api_key=key)
     username = generate_username(10)
@@ -2170,6 +2225,29 @@ def get_oai_code(
                 cfg=config,
                 timeout=timeout,
                 poll_interval=max(2.0, float(poll_interval or 3)),
+                log=log_callback,
+                cancel=cancel_callback,
+                resend=resend_callback,
+            )
+    except ImportError:
+        pass
+    # Yunmeng mix under cloudflare / pure yunmeng
+    try:
+        import yunmeng_mail_otp as _ym_early
+
+        if _ym_early.is_yunmeng_token(dev_token) or provider in (
+            "yunmeng",
+            "ym",
+            "yunmeng_mail",
+            "ymmail",
+            "ymmynb",
+        ):
+            return _ym_early.wait_code(
+                dev_token,
+                email,
+                cfg=config,
+                timeout=timeout,
+                poll_interval=max(1.0, float(poll_interval or 2)),
                 log=log_callback,
                 cancel=cancel_callback,
                 resend=resend_callback,
@@ -4574,7 +4652,16 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "tempmail_lol", "mailsapi", "hotmail", "cloud_mail"],
+            [
+                "duckmail",
+                "yyds",
+                "cloudflare",
+                "tempmail_lol",
+                "mailsapi",
+                "hotmail",
+                "cloud_mail",
+                "yunmeng",
+            ],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
