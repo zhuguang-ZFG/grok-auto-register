@@ -40,7 +40,7 @@ function Start-Gateway {
     $env:DATABASE_URL = "sqlite:///" + ((Join-Path $ProjectDir "chatgpt2api/data/accounts.db") -replace "\\", "/")
     $env:CHATGPT2API_AUTH_KEY = $AuthKey
     $proc = Start-Process -FilePath "uv" `
-        -ArgumentList "run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning" `
+        -ArgumentList "run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning", "--timeout-keep-alive", "30", "--limit-concurrency", "10" `
         -WorkingDirectory $GatewayDir `
         -WindowStyle Hidden `
         -PassThru

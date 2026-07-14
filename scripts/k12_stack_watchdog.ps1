@@ -114,7 +114,7 @@ function Start-Gateway {
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     if ($uv) {
         $proc = Start-Process -FilePath $uv.Source `
-            -ArgumentList @("run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning") `
+            -ArgumentList @("run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning", "--timeout-keep-alive", "30", "--limit-concurrency", "10") `
             -WorkingDirectory $GatewayDir `
             -WindowStyle Hidden `
             -PassThru
@@ -125,7 +125,7 @@ function Start-Gateway {
     $venvUvicorn = Join-Path $GatewayDir ".venv\Scripts\uvicorn.exe"
     if (Test-Path $venvUvicorn) {
         $proc = Start-Process -FilePath $venvUvicorn `
-            -ArgumentList @("main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning") `
+            -ArgumentList @("main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning", "--timeout-keep-alive", "30", "--limit-concurrency", "10") `
             -WorkingDirectory $GatewayDir `
             -WindowStyle Hidden `
             -PassThru
