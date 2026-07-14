@@ -7,6 +7,25 @@
   "cloudflare_path_accounts": "/api/new_address",
   "cloudflare_path_token": "/api/token",
   "cloudflare_path_messages": "/api/mails",
+  "defaultDomains": "example.com,second.example.com",
+  "mail_backends": [
+    {
+      "api_base": "https://your-worker.example.workers.dev",
+      "domains": ["example.com"],
+      "path_accounts": "/api/new_address",
+      "path_messages": "/api/mails",
+      "auth_mode": "none",
+      "api_key": ""
+    },
+    {
+      "api_base": "https://second-worker.example.workers.dev",
+      "domains": ["second.example.com"],
+      "path_accounts": "/api/new_address",
+      "path_messages": "/api/mails",
+      "auth_mode": "none",
+      "api_key": ""
+    }
+  ],
   "proxy": "http://127.0.0.1:7897",
   "enable_nsfw": true,
   "register_count": 4,
@@ -17,7 +36,6 @@
   "grok2api_auto_add_remote": false,
   "grok2api_remote_base": "",
   "grok2api_remote_app_key": "",
-  "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
   "yyds_jwt": "",

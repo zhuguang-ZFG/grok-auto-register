@@ -63,8 +63,29 @@ admin 备选（匿名失败时）：`cloudflare_auth_mode=x-admin-auth`，`cloud
 
 ---
 
-## 五、风险与注意
+## 五、多 Worker / 多域名分摊（P1）
+
+`mail_backends` 支持 **≥2 套** Cloudflare 临时邮箱 Worker，按域名路由创建与收信：
+
+| Worker | 域名 | 创建路径 |
+|--------|------|----------|
+| `cloudflare_temp_email.barbarhonmamxi20.workers.dev` | `zhuguang.ccwu.cc` / `lima.cc.cd` / `zhuguang.de5.net` | 匿名 `/api/new_address` |
+| `mail.kanxue.workers.dev` | `baoxia.top` | **匿名** `/api/new_address`（勿用错 `/admin/new_address` 除非 admin 密码可用） |
+
+探活（创建 + 列信）：
+
+```bat
+python scripts/cf_mail_backends_health.py
+```
+
+要求：`create=200` 且 `mails=200`（`Authorization: Bearer <jwt>` + `limit/offset`）。  
+`domain_health` 会临时降权连续失败域名；修后端后可清 `demoted_until` 或等冷却。
+
+再挂第三套时：新域名 Email Routing → 新/同 Worker → `mail_backends` 追加一项 → 跑 health → 重启 register。
+
+## 六、风险与注意
 
 - 勿把 token / admin 密码提交仓库；对话里用过的 token 建议轮换。
-- ccwu.cc 免费后缀存在整域拉黑风险。
+- ccwu.cc 免费后缀存在整域拉黑风险；**用第二 Worker + 不同 TLD（如 baoxia.top）分摊**。
 - 注册成功率仍主要取决于代理 IP 与 Turnstile。
+- admin 路径 401 时优先改回匿名 `path_accounts=/api/new_address`，不要硬扛错误 admin key。

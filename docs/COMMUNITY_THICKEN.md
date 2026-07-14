@@ -31,6 +31,7 @@
 | `register_cli.py --threads N` | 多浏览器吃内存/代理 | 自有水位低且代理稳 |
 | `chromium_slim: true` | 可能影响页面脚本 | 内存紧时试 |
 | Hotmail 号池 + IMAP XOAUTH2 | 已接 `email_provider=hotmail` + **CF 混用** | `email_mix_hotmail=true` + `email_mix_hotmail_ratio=0.35`；巡检 `scripts/hotmail_cpa_health.py` |
+| 多 CF Worker / 多 TLD | `mail_backends` ≥2（主 worker 三域 + kanxue/`baoxia.top`） | `python scripts/cf_mail_backends_health.py` 全绿后再开跑 |
 | HTTP 代理池文件 | 与 Clash 注册组二选一为主 | 节点池更稳时 |
 | 无头注册 | CF 常拦 | 协议+打码足够时再碰 |
 
