@@ -154,6 +154,11 @@ DEFAULT_CONFIG = {
     "email_mix_mailtm_ratio": 0.05,
     "mailtm_api_base": "https://api.mail.tm",
     "mailtm_domain": "",
+    # GPTMail (mail.chatgpt.org.uk) — public key gpt-test may be disabled; set gptmail_api_key
+    "gptmail_base": "https://mail.chatgpt.org.uk",
+    "gptmail_api_key": "gpt-test",
+    "email_mix_gptmail": False,
+    "email_mix_gptmail_ratio": 0.03,
     # Long-run stability (community-aligned): metrics + SSO egress heal + daily cap
     "reg_metrics_enabled": True,
     "reg_metrics_path": "logs/reg_metrics.jsonl",
@@ -2106,6 +2111,12 @@ def _try_mailtm_inbox():
     return _mt.create_inbox(config)
 
 
+def _try_gptmail_inbox():
+    import gptmail_otp as _gm
+
+    return _gm.create_inbox(config)
+
+
 def _cf_mix_buckets():
     """Ordered exclusive mix buckets for cloudflare/mixed (name, ratio, factory)."""
     buckets = []
@@ -2122,6 +2133,10 @@ def _cf_mix_buckets():
     if _email_mix_flag("email_mix_mailtm", False):
         buckets.append(
             ("mailtm", _email_mix_ratio("email_mix_mailtm_ratio", 0.05), _try_mailtm_inbox)
+        )
+    if _email_mix_flag("email_mix_gptmail", False):
+        buckets.append(
+            ("gptmail", _email_mix_ratio("email_mix_gptmail_ratio", 0.03), _try_gptmail_inbox)
         )
     # scale down if sum>1, keep order (hotmail first)
     total = sum(r for _, r, _ in buckets)
@@ -2183,6 +2198,12 @@ def get_email_and_token(api_key=None):
         except ImportError as e:
             raise Exception(f"mailtm_otp module missing: {e}") from e
         return _mt.create_inbox(config)
+    if provider in ("gptmail", "gpt_mail", "gpt-mail", "chatgpt_org_uk"):
+        try:
+            import gptmail_otp as _gm
+        except ImportError as e:
+            raise Exception(f"gptmail_otp module missing: {e}") from e
+        return _gm.create_inbox(config)
     if provider in ("mailsapi", "mailsapi_otp", "fixed_otp"):
         try:
             import mailsapi_otp as _mo
@@ -2309,6 +2330,28 @@ def get_oai_code(
             "mail.gw",
         ):
             return _mt_early.wait_code(
+                dev_token,
+                email,
+                cfg=config,
+                timeout=timeout,
+                poll_interval=max(1.0, float(poll_interval or 2)),
+                log=log_callback,
+                cancel=cancel_callback,
+                resend=resend_callback,
+            )
+    except ImportError:
+        pass
+    # GPTMail session
+    try:
+        import gptmail_otp as _gm_early
+
+        if _gm_early.is_gptmail_token(dev_token) or provider in (
+            "gptmail",
+            "gpt_mail",
+            "gpt-mail",
+            "chatgpt_org_uk",
+        ):
+            return _gm_early.wait_code(
                 dev_token,
                 email,
                 cfg=config,
@@ -4724,6 +4767,7 @@ class GrokRegisterGUI:
                 "cloudflare",
                 "tempmail_lol",
                 "mailtm",
+                "gptmail",
                 "mailsapi",
                 "hotmail",
                 "cloud_mail",
