@@ -1,6 +1,6 @@
 # 运行状态快照
 
-> 记录时间：2026-07-13 15:37（本机 Asia/Shanghai 墙钟）  
+> 记录时间：2026-07-14 17:00（本机 Asia/Shanghai 墙钟）  
 > 仓库：`zhuguang-ZFG/grok-auto-register`  
 > 不含密钥 / 号池 JSON / 订阅 token / `mail_credentials` / Hotmail 号池正文。
 
@@ -8,135 +8,102 @@
 
 | 组件 | 状态 | 备注 |
 |------|------|------|
-| CLIProxyAPI | **运行中** `:8317` | `D:\cli-proxy-api\cli-proxy-api.exe`；`auth-dir=cpa_auths`；`proxy-url=http://127.0.0.1:7897` |
-| 注册机 `grok_register_ttk.py auto` | **运行中** | 15:34 经 `start_register_hidden.vbs` 恢复；`register_count=8` / `concurrent_count=1` |
-| `quota_watch` | **运行中** | 15:34 经 `start_quota_watch_hidden.vbs` 恢复；`poll=15s` / soft-disable + pool rotate |
-| Kimi CLI | `local-cpa/grok-4.5` → `http://127.0.0.1:8317/v1` | key 与 CLIProxy `api-keys` 一致；短 chat 实测 **200 / pong** |
+| CLIProxyAPI | **主粮** `:8317` | Grok CPA；`auth-dir=cpa_auths`；`proxy-url=http://127.0.0.1:7897` |
+| 注册机 `grok_register_ttk.py auto` | 长期稳跑路径 | 见 `HARDEN.md` / `COMMUNITY_THICKEN.md` |
+| `quota_watch` | 主粮配套 | soft-disable + pool rotate |
+| **chatgpt2api（K12）** | **运行中** `:8124` | 本地 clone（**不入库**）；auth-key 本机配置 |
+| FlareSolverr | **运行中** `:8191` | scoop `flaresolverr@3.5.0`；给注册/CF 清障 |
+| Kimi CLI | 多 provider | 默认见本机 `config.toml`；K12 别名见下 |
 
-路由（CLIProxy）：
+### Kimi 模型别名（K12 池）
+
+| 别名 | 上游 model | max_context | 备注 |
+|------|------------|-------------|------|
+| `k12/gpt-5-5` | `gpt-5-5` | **1_000_000** | 已修正；`max_output=128k` |
+| `k12/gpt-5` 等 | `gpt-5`… | **400_000** | 系列统一 |
+| 全局 `reserved_context_size` | — | **50_000** | 长仓库更激进（文档默认） |
+
+Provider：
 
 ```text
-strategy=round-robin
-session-affinity=true
-session-affinity-ttl=4h
-auth-auto-refresh-workers=16
+[providers.k12]
+base_url = http://127.0.0.1:8124/v1
+# api_key 仅本机 config.toml
 ```
 
-### 中午中断与恢复（同日）
+网关注意：Kimi 默认 `reasoning_effort` 会触发 chatgpt2api → backend 422；本机已在  
+`chatgpt2api/services/protocol/reasoning.py` **忽略 `reasoning_effort`**（只认原生 `thinking_effort`）。
 
-- ~12:54：`register_auto` / `quota_watch` 日志停更（进程不在）；号池文件仍有 `last_refresh`（CLIProxy 自刷新）。
-- ~15:34：用 **VBS 隐藏启动** 恢复注册机 + 额度轮换；`scripts/_restart_register_auto.py` 在 Git Bash 下易误匹配命令行字符串，优先用 `start_register_hidden.vbs`。
-- **Databricks 试用自动化**：OTP + select-product + CapSolver 可出 token；卡在 `setup-account` Continue（reCAPTCHA Enterprise 原生 getResponse）。**用户已放弃深挖 CDP**，不再推进 live 出号；代码与文档保留作半成品。
-
-## 2. 号池水位（约 15:36）
+## 2. K12 号池水位（约 16:50）
 
 | 指标 | 数值 |
 |------|------|
-| CPA 文件 | **~3631** |
-| 未 disabled（粗判） | **~3140** |
-| disabled | **~491** |
-| 近 1h mtime 刷新 | ~223（多为 token refresh，非新注册） |
-| `@hotmail.com` CPA | ~171 |
-| 策略 | 见 `config.json` 的 `pool_prefer_mode`（本机，不入库） |
+| 网关账号 | **~80_503** |
+| 主来源 | `sub2api_…80500…zip` 真实 K12 快照 |
+| plan_type | **k12** |
+| refresh_token | **无**（短窗口，约至 **2026-07-23**） |
+| workspace_id | `fc4f8db5-72cd-44cb-ae0d-fef1370a16c8` |
+| chat 探测 | **OK**（经 Clash `:7897`） |
+| 同批子集 | `k12.zip` / `sub2api-normal-…csv` 已 inspect，无额外 RT |
 
-粗分域（文件名后缀，含缓冲导入）：
+**不要**把 hotmail 自注册 free 当 K12 补号源：
 
-| 域 | 约数 |
-|----|------|
-| `*.oo-ooo.fun` 系（缓冲） | ~1500+ |
-| `baoxia.top` | ~351 |
-| `zhuguang.ccwu.cc` / `lima.cc.cd` / `zhuguang.de5.net` | 各 ~351 |
+- free 可注册且常有 RT  
+- `invites/request` → `401 same domain`  
+- `invites/accept` 可能 **假成功**（HTTP 200 仍 personal free）
 
-自有域名（`defaultDomains`）：
+## 3. 本阶段已落地（K12 支线）
 
-- `zhuguang.ccwu.cc`
-- `lima.cc.cd`
-- `zhuguang.de5.net`
-- `baoxia.top`（第二 CF 后端）
+1. **网关**：chatgpt2api 本地跑通 + 代理 + FlareSolverr clearance  
+2. **导入**：80_500 真 K12 灌入网关；合成假数据已识别并拒绝  
+3. **Kimi 接入**：`providers.k12` + 多模型别名；修上下文窗口与 `reasoning_effort` 422  
+4. **运维脚本（入库）**  
+   - `scripts/k12_pool_ops.py` — 状态 / 抽样 / 清 abnormal / watch（**默认不因 direct-check 误杀**）  
+   - `scripts/k12_pool_monitor.py` — 存活率 + chat probe  
+   - `scripts/k12_rt_import.py` — RT 感知导入（inspect/import/refresh-gateway）  
+   - `scripts/k12_mother_invite.py` — 母号邀请链路（需母号 session）  
+   - `scripts/k12_auto_register.py` — 调 chatgpt2api 内置注册机（free 后备，非 K12）  
+   - `scripts/chatgpt2api_watchdog.ps1` — 网关看门狗  
+5. **文档**：`docs/K12_POOL_HARDEN.md`（A/B/C 三线）  
+6. **模块骨架**：`chatgpt_k12/`（注册/join/导出 pipeline；join 限制已写明）
 
-社区 Cloud Mail 缓冲（`vip0.xyz` 等，**不进** `defaultDomains`）：
+## 4. Grok 主粮（摘要）
 
-- 模块：`cloud_mail_otp.py`；纯用：`email_provider=cloud_mail`
-- **混投**（主粮仍 CF）：`email_mix_cloud_mail=true` + `email_mix_cloud_mail_ratio=0.1`
-  - 与 Hotmail 互斥切片：`[0,hm)` Hotmail，`[hm,hm+cm)` Cloud Mail，其余自有 CF
-- 多后缀：`cloud_mail_domains`（默认 `["vip0.xyz"]`）+ `cloud_mail_domain_mode=random|rr|first`
-  - 服务端 `domainList` 还有 vip9.cyou / sismi6.bond / news.cc.cd；主机常 403/停放，**默认只开 vip0**
-  - 要扩域：`cloud_mail_domains: ["vip0.xyz","vip9.cyou",...]`，建箱失败会换下一域重试
-- 凭证：`vip0_mail.local.json`（gitignore）；CapSolver + `POST /api/account/add`
-- 收信：`GET /api/email/list?type=0`
-
-缓冲来源示例：
-
-- 社区包 `777.zip` → `*.oo-ooo.fun`（777，已 probe+全量 refresh）
-- 其它共享域 / `unknown.local` 历史导入
-- **未入库**：`D:\Downloads\auth-dir.7z`（@dogdogwang.xyz 抽样全 revoked）
-
-Hotmail 铸造进 CPA（当缓冲弹药，不当 own 水位）：
-
-| 指标 | 约值 |
+| 路径 | 状态 |
 |------|------|
-| `@hotmail.com` CPA | ~171 |
-| 池文件 | `data/hotmail_pool.txt`（gitignore） |
+| Grok CPA + CLIProxy `:8317` | **主粮** |
+| 智谱 coding plan | 可用 |
+| Databricks 试用自动化 | **已停手**（setup-account reCAPTCHA） |
+| Kiro 旁路号池 | 能出 token，**秒封率高**；见 `side_pools/README.md` |
 
-巡检：`python scripts/hotmail_cpa_health.py`
-
-## 3. 邮箱与注册策略
-
-| 项 | 值 |
-|----|-----|
-| `email_provider` | `cloudflare`（主路径） |
-| CF Worker | `cloudflare_temp_email`（dreamhunter2333 系 API） |
-| `mail_backends` | 自有三域 + `baoxia.top` 第二后端 |
-| `email_mix_hotmail` | **true** |
-| `email_mix_hotmail_ratio` | **0.35**（约 35% Hotmail / 65% 自有域） |
-| Hotmail 池 | `data/hotmail_pool.txt`（gitignore） |
-| 固定 OTP 备用 | `mailsapi_otp` + `mail_credentials.txt`（不进 bulk 主路径） |
-
-出口：
-
-- 统一 `http://127.0.0.1:7897`（Clash）
-- `clash_rotate_per_account` + `clash_rotate_every_n=5`（弱多 IP，非每号独立住宅 IP）
-- `http_proxy_enabled=false`（`all_proxies.txt` 未作主路径）
-
-## 4. 支线：Databricks / GLM
-
-| 路径 | 状态 | 备注 |
-|------|------|------|
-| **Grok CPA + CLIProxy** | **主粮** | 见上；Kimi `local-cpa/grok-4.5` |
-| **智谱 coding plan GLM-5.2** | 可用 | Kimi `zhipuai-coding-plan/glm-5.2`（非 Databricks） |
-| **Databricks 14 天 $400** | **自动化未通 / 已停手** | `databricks_pipeline/` 保留；无 live host+token |
-| **Dahl Inference** | **已删除（2026-07-13）** | 代码/文档/Kimi provider 已移除；不用 `:8330` |
-
-## 5. 本阶段已落地（相对 06:00 快照）
-
-1. 号池扩到 ~3600+；Hotmail CPA 增至 ~171  
-2. **Cloud Mail** 模块与测试：`cloud_mail_otp.py`、`tests/test_cloud_mail_otp.py`  
-3. **Dahl 流水线**：已移除（无用）  
-4. **Databricks**：Express 选择器、CapSolver 解 reCAPTCHA、email_bridge 加固；**setup-account 未过，用户放弃 CDP 深挖**  
-5. 运维：注册机/quota 中断后用 VBS 恢复；CLIProxy 自带 token auto-refresh  
-
-## 6. 运维命令速查
+## 5. 运维命令速查
 
 ```bat
+REM --- Grok 主粮 ---
 python pool_status.py
-python set_pool_prefer.py status
-python set_pool_prefer.py check
-python scripts/hotmail_cpa_health.py
-python hotmail_pool.py
-python hotmail_pool.py --smoke --imap-list
 wscript start_register_hidden.vbs
 wscript start_quota_watch_hidden.vbs
-python grok_register_ttk.py auto
+
+REM --- K12 网关 ---
+python scripts/k12_pool_ops.py status
+python scripts/k12_pool_ops.py sample-probe --n 20
+python scripts/k12_pool_ops.py watch --interval 300 --probe-n 5 --auto-purge-abnormal
+python scripts/k12_pool_monitor.py
+python scripts/k12_rt_import.py inspect D:\Downloads\new_export.zip
+python scripts/k12_mother_invite.py plan --workspace fc4f8db5-72cd-44cb-ae0d-fef1370a16c8
+
+REM FlareSolverr（若未常驻）
+flaresolverr
 ```
 
-## 7. 已知边界
+## 6. 已知边界 / 社区结论
 
-- 合盖/睡眠仍影响无人值守（见 `docs/UNATTENDED.md` / power 脚本）  
-- sticky reselect 偏高时：查 soft-disable / REMOVE，勿硬删 live  
-- 共享缓冲与 Hotmail 野号：注册成功率高 ≠ 长期不废；持续用 `hotmail_cpa_health` + hard_purge 盯  
-- 避免同时跑多个 `auto`/`start`（抢浏览器）  
-- Databricks setup-account reCAPTCHA Enterprise 未解；不要默认指望其出 live 号  
+- 共享 K12 **无 RT** → 到期即废；优先用、监控掉号  
+- 裸 `GET /backend-api/accounts/check` 对共享 token 常 401，**网关 conversation 仍可能可用** → 禁止用 direct-check 批量禁用  
+- free→K12：社区无“任意 hotmail 硬塞共享 workspace”稳解；需 **母号 invite** 或同域邮箱  
+- chatgpt2api 注册需 **FlareSolverr + 代理**，否则 authorize CF 403  
+- 合盖/睡眠影响无人值守（见 `docs/UNATTENDED.md`）
 
-## 8. 不提交内容
+## 7. 不提交内容
 
-`config.json`、`cpa_auths/`、`cpa_auths_dead/`、`data/hotmail_pool.txt`、`mail_credentials.txt`、`token.json`、`vip0_mail.local.json`、`logs/`、`screenshots/`、代理明文列表、导入包 `_import_*` / `_community_ref/`。
+`config.json`、`cpa_auths/`、`chatgpt2api/`（含 `data/accounts.json`）、`chatgpt_auths/`、`data/hotmail_pool*.txt`、`mail_credentials.txt`、`token.json`、`vip0_mail.local.json`、`logs/`、`screenshots/`、代理明文、导入包 `_import_*` / `_community_ref/`、本机 Kimi `config.toml`。

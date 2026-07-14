@@ -1,0 +1,51 @@
+# ChatGPT K12 registration pipeline config
+#
+# Copy to config.local.yaml and edit. config.local.yaml overrides this file.
+# workspace.ids is the K12 parent workspace UUID — fill in when obtained.
+
+mail:
+  pool_file: "data/hotmail_pool.txt"
+  used_file: "data/hotmail_pool.used.txt"
+  dead_file: "data/hotmail_pool.dead.txt"
+  k12_used_file: "data/chatgpt_k12_mail_used.txt"
+  wait_timeout: 120
+  wait_interval: 5
+
+proxy:
+  clash_api: "http://127.0.0.1:9097"
+  clash_secret: ""
+  proxy_url: "http://127.0.0.1:7897"
+  flaresolverr_url: ""
+
+registration:
+  threads: 3
+  total: 10
+  max_per_ip: 3            # max registrations per IP before rotating
+  password_chars: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!"
+  password_len: 16
+
+workspace:
+  enabled: true
+  ids: ["fc4f8db5-72cd-44cb-ae0d-fef1370a16c8"]  # shared K12 workspace from 80500 export
+  route: "request"         # "request" (child asks to join) or "accept"
+  max_retries: 3
+  retry_backoff_ms: 5000
+
+# OpenAI OAuth client (chatgpt2api upstream value)
+oauth:
+  client_id: "app_2SKx67EdpoN0G6j64rFvigXD"
+  auth_base: "https://auth.openai.com"
+  redirect_uri: "https://platform.openai.com/auth/callback"
+  chatgpt_api: "https://chatgpt.com/backend-api"
+
+export:
+  output_file: "data/chatgpt_k12_bundle.json"
+  auth_dir: "chatgpt_auths"
+  format: "cpa"            # "cpa" for chatgpt2api native import
+
+gateway:
+  base_url: "http://127.0.0.1:8124"
+  auth_key: "k12-pool-local"
+
+logging:
+  level: "INFO"

@@ -77,6 +77,14 @@ _community_ref/
 side_pools/
 !side_pools/README.md
 
+# local chatgpt2api clone + runtime (accounts.json / register.json / tokens)
+chatgpt2api/
+chatgpt_auths/
+data/chatgpt_k12_*.json
+data/chatgpt_register_mail_used.txt
+data/k12_*.json
+chatgpt_k12/config.local.yaml
+
 # local import / community ref dumps (may contain tokens)
 _import_*/
 _sso_ref/

@@ -14,13 +14,16 @@
 | 死号 vs 额度冷却 | `hard_purge` + `rescue_quota_holds` |
 | 导入抽检熔断 + 只收存活 | `import_cpa_with_probe --refresh-all` |
 | 水位只计自有 | `pool_watermark_own_only` |
-| Turnstile 补丁 | `turnstilePatch/script.js`（screenXY + webdriver 合并） |
+| Turnstile 补丁 | `turnstilePatch/script.js`（screenXY + webdriver 合并；本机已含社区 anti-detect，强于上游纯 screenXY） |
 | Chromium 轻量 flag | `chromium_mute_audio` 默认；`chromium_slim` 可选 |
 | TabPool / 多线程 CLI | `tab_pool.py` + `register_cli.py`（可选，不改默认 auto） |
 | 缓冲抽检 | `scripts/buffer_health_sample.py` |
 | 分层号池：先烧缓冲 | `set_pool_prefer.py buffer` + soft-hold own |
 | 缓冲低水位自动接自有 | `pool_policy.ensure_buffer_failover`（maintain / quota_watch / `check`） |
-
+| SSO 超时换出口 | `sso_timeout_rotate_after` + 强制 `rotate_node`（不改 global） |
+| 注册指标 JSONL | `logs/reg_metrics.jsonl`（成功/失败原因/换节点） |
+| 日成功上限 | `register_daily_success_cap`（0=关；长期建议 200–500） |
+| SSO 等待 + warmup | `sso_cookie_timeout_sec` + 等待期鼠标/滚动 + accounts 刷新 |
 ## 社区有、仍可选（未默认打开）
 
 | 项 | 原因 | 何时开 |
@@ -66,3 +69,28 @@ python set_pool_prefer.py buffer
 python set_pool_prefer.py own
 python scripts/hotmail_cpa_health.py
 ```
+
+## K12 / chatgpt2api（2026-07-14）
+
+社区参考：`basketikun/chatgpt2api`、`yukkcat/chatgpt2api`、NodeLoc join 油猴、`chatgpt-register-sub2api` / `chatgpt-register-k12`。
+
+| 社区能力 | 本机固化 |
+|----------|----------|
+| 号池导入 CPA/sub2api | `scripts/k12_rt_import.py`（先 inspect，优先 K12+RT） |
+| 失效剔除 | 网关 `auto_remove_invalid_accounts` + `k12_pool_ops purge-abnormal` |
+| 定时刷新 | `refresh_account_interval_minute`；有 RT 时 `k12_rt_import refresh-gateway` |
+| CF 清障 | FlareSolverr `:8191` + `proxy_runtime.clearance.mode=flaresolverr` |
+| 注册机补号 | `scripts/k12_auto_register.py` 调内置 register API（**free 后备，非 K12**） |
+| 子号 join workspace | `k12_mother_invite.py`（**必须母号 invite**；request 同域限制；accept 需硬校验 plan_type） |
+| 网关守护 | `scripts/chatgpt2api_watchdog.ps1` |
+| 健康探测 | `k12_pool_monitor.py` / `k12_pool_ops.py status`（chat probe 为准） |
+
+### 踩坑固化
+
+1. **不要**用裸 `/accounts/check` 批量禁用共享 K12：常 401，但 conversation 仍可用。  
+2. Kimi 默认 `reasoning_effort` → chatgpt2api 透传 → backend **422**；忽略该字段。  
+3. Kimi `max_context_size`：`gpt-5-5`=1M，其它 gpt-5 系=400k；`reserved_context_size=50k`。  
+4. 共享 K12 快照无 RT → 短窗口；可持续补号只能母号邀请或带 RT 新货。  
+5. **不入库** `chatgpt2api/data/`、`chatgpt_auths/`、本机 auth-key 与号池正文。
+
+细则：`docs/K12_POOL_HARDEN.md`、`docs/STATUS.md`。
