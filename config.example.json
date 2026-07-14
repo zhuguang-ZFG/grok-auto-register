@@ -38,7 +38,12 @@
   "cloud_mail_password": "",
   "cloud_mail_sitekey": "0x4AAAAAAD0dY6S9OmQL32yO",
   "cloud_mail_domain": "vip0.xyz",
-  "cloud_mail_domains": ["vip0.xyz", "vip9.cyou", "sismi6.bond", "news.cc.cd"],
+  "cloud_mail_domains": [
+    "vip0.xyz",
+    "vip9.cyou",
+    "sismi6.bond",
+    "news.cc.cd"
+  ],
   "cloud_mail_domain_mode": "weighted",
   "cloud_mail_delete_after_code": true,
   "cloud_mail_turnstile_max": 2,
@@ -93,7 +98,7 @@
   "cpa_server_auth_dir": "",
   "token_only_file": "",
   "concurrent_count": 1,
-  "browser_restart_every": 6,
+  "browser_restart_every": 4,
   "cpa_mint_async": true,
   "cpa_mint_workers": 1,
   "cpa_mint_queue_max": 20,
@@ -204,5 +209,7 @@
     ],
     "human_gate_on_phone": true,
     "human_gate_on_captcha": true
-  }
+  },
+  "chromium_slim": true,
+  "chromium_mute_audio": true
 }

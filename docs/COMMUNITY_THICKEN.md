@@ -98,3 +98,9 @@ python scripts/hotmail_cpa_health.py
 5. **不入库** `chatgpt2api/data/`、`chatgpt_auths/`、本机 auth-key 与号池正文。
 
 细则：`docs/K12_POOL_HARDEN.md`、`docs/STATUS.md`。
+
+### 浏览器省内存档（2026-07-14）
+
+- `chromium_slim: true` + `browser_restart_every: 4` + `concurrent_count: 1` + `chromium_mute_audio: true`
+- 注册机需**重启 auto 进程**后生效（配置在启动时读入）
+- 若 CF/资料页成功率明显掉，回滚：`chromium_slim: false`，`browser_restart_every: 6`
