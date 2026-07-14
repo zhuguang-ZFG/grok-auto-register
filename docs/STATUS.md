@@ -1,6 +1,6 @@
 # 运行状态快照
 
-> 记录时间：2026-07-14 19:50（本机 Asia/Shanghai 墙钟）  
+> 记录时间：2026-07-15（本机墙钟；会话续写）  
 > 仓库：`zhuguang-ZFG/grok-auto-register`  
 > 不含密钥 / 号池 JSON / 订阅 token / `mail_credentials` / Hotmail 号池正文。
 
@@ -41,17 +41,19 @@ base_url = http://127.0.0.1:8124/v1
 | CLI 卡壳 | GUI **3.17** 把 DB 升到 **schema v13**；SaladDay CLI **5.9.0 最高 v11** |
 | 绕过 | `python scripts/cc_switch_codex_provider.py list\|current\|switch <id>` |
 
-## 2. K12 号池水位（约 19:40）
+## 2. K12 号池水位（瘦身后 · 自动取回）
 
 | 指标 | 数值 |
 |------|------|
-| 网关账号 | **~80_507**（导入 skip 后略有浮动） |
-| 主来源 | `sub2api_…80500…zip` 真 K12 快照 |
+| 网关 live | **~1.5k–1.6k**（`used` 全留 + 最新候补；**禁止**再灌 8 万） |
+| 冷备份源 | `backups/k12_db/accounts.db.pre_slim_*`（~80k / ~750MB，仅抽样 refill） |
+| DB 体积 | slim 后 **~14MB**（曾 714MB → VACUUM） |
+| 主来源 | 共享 K12 快照（同 `account_id=fc4f8db5-…`） |
 | plan_type | **k12** |
 | refresh_token | **无**（短窗口，约至 **2026-07-23**） |
-| workspace | 以 `fc4f8db5-72cd-44cb-ae0d-fef1370a16c8` 为主 |
-| 服务健康 | **`GET /healthz`** + chat/responses 探针（SSOT） |
-| 同批子集 | `alive.zip` / `authconv_500…zip` / 前 500 split → **import skip 全量** |
+| 服务健康 | **`GET /healthz`** + chat probe（SSOT） |
+| 自动取回 | `scripts/k12_pool_refill.py`：水位 &lt; min-ready / target 时从备份 UPSERT，**hard-cap 2500** |
+| 定时瘦身 | `scripts/k12_pool_slim.py` + `run_k12_pool_maintain.ps1` / 任务 `K12-Pool-Maintain` |
 
 **不要**把 hotmail 自注册 free 当 K12 补号源：
 
@@ -69,9 +71,12 @@ base_url = http://127.0.0.1:8124/v1
    - `scripts/k12_pool_monitor.py` — 单实例 lock  
    - `scripts/k12_stack_watchdog.ps1` + `install_k12_stack_watchdog_task.ps1`  
    - `scripts/k12_rt_import.py` / `k12_mother_invite.py` / `chatgpt2api_watchdog.ps1`（启网关带 sqlite env）  
+   - `scripts/k12_pool_slim.py` / `k12_pool_refill.py` — 瘦身 + 备份抽样自动取回  
+   - `scripts/run_k12_pool_maintain.ps1` + `install_k12_pool_maintain_task.ps1`  
    - `scripts/codex_k12.ps1` / `.sh`  
    - `scripts/cc_switch_codex_provider.py`  
    - `scripts/sso_batch_to_cpa.py` — **Grok SSO→CPA**（非 K12）  
+
 5. **文档**：`docs/K12_POOL_HARDEN.md`、`docs/K12_DOMAIN_RESEARCH.md`、`docs/COMMUNITY_THICKEN.md`  
 6. **模块骨架**：`chatgpt_k12/`  
 
@@ -101,6 +106,11 @@ curl http://127.0.0.1:8124/healthz
 python scripts/k12_pool_ops.py status
 python scripts/k12_pool_ops.py watch --interval 300 --probe-n 0 --auto-purge-abnormal
 python scripts/k12_pool_monitor.py --watch --interval 300
+python scripts/k12_pool_refill.py status
+python scripts/k12_pool_refill.py refill --min-ready 800 --target 1800 --hard-cap 2500 --probe
+python scripts/k12_pool_slim.py --keep-recent 1500 --dry-run
+powershell -ExecutionPolicy Bypass -File scripts\run_k12_pool_maintain.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install_k12_pool_maintain_task.ps1
 python scripts/k12_rt_import.py inspect D:\Downloads\new_export.zip
 powershell -ExecutionPolicy Bypass -File scripts\k12_stack_watchdog.ps1
 powershell -ExecutionPolicy Bypass -File scripts\install_k12_stack_watchdog_task.ps1

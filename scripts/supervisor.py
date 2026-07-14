@@ -65,7 +65,7 @@ SERVICES: list[Service] = [
         kind="http",
         port=8124,
         http_path="/healthz",
-        note="chatgpt2api (GPT-5.x) — revived by K12StackWatchdog task",
+        note="chatgpt2api (GPT-5.x) — K12StackWatchdog; slim/refill: k12_pool_*.py / K12-Pool-Maintain",
     ),
     Service(
         name="cpa_inspect",

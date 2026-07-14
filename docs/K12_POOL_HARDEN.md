@@ -123,6 +123,34 @@ python scripts/k12_mother_invite.py run --mother-session mother_session.json --w
 2. `k12_pool_ops.py watch` 清死号  
 3. 有 RT 新货：`k12_rt_import.py inspect/import`  
 4. 有母号：`k12_mother_invite.py run` 补真 K12  
+5. **日常瘦身 + 自动取回**（共享 K12 费得快、8 万全量进内存不划算）：
+
+```bat
+REM 水位 / 源备份
+python scripts/k12_pool_refill.py status
+
+REM 从 pre_slim 备份抽样补到 target（禁止全量 8 万灌回）
+python scripts/k12_pool_refill.py refill --min-ready 800 --target 1800 --hard-cap 2500 --max-add 400 --probe
+
+REM 瘦身：保留 ever-used + 最新 never-used N
+python scripts/k12_pool_slim.py --dry-run
+python scripts/k12_pool_slim.py --keep-recent 1500
+
+REM 日维（备份 → 条件 slim → refill）
+powershell -ExecutionPolicy Bypass -File scripts\run_k12_pool_maintain.ps1
+powershell -ExecutionPolicy Bypass -File scripts\install_k12_pool_maintain_task.ps1
+```
+
+策略（16GB 主机）：
+
+| 项 | 值 |
+|----|-----|
+| 在线池 | **~1.5k–2.5k**（used 全留 + 最新候补） |
+| 冷源 | `backups/k12_db/accounts.db.pre_slim_*`（~80k，只抽样 UPSERT） |
+| hard-cap | **2500**（超则拒绝 refill，先 slim） |
+| 备份 | `k12_daily_backup.py` + slim 前 online backup |
+
+**禁止**无过滤把 pre_slim 全量恢复进 live DB（会回到 ~2GB 网关内存）。
 
 ## 当前资源判断
 
