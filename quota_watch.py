@@ -822,6 +822,23 @@ def _payload_skip_reason_for_local_rotate(
             return f"exhausted:{remain_h:.1f}h"
     except Exception:
         pass
+
+    # Domain-level graylist: skip accounts from domains with high failure rates
+    # (StormBreaker pattern applied at domain granularity — prevents "dead domain
+    # drag" where rotation wastes time cycling through poisoned-domain accounts)
+    try:
+        import sys as _sys
+        _root = Path(__file__).resolve().parent
+        if str(_root) not in _sys.path:
+            _sys.path.insert(0, str(_root))
+        from domain_health_graylist import is_domain_graylisted, _domain_of
+
+        domain = _domain_of(email) if email else _domain_of(path.name)
+        if domain and is_domain_graylisted(domain):
+            return f"graylisted_domain:{domain}"
+    except Exception:
+        pass
+
     return None
 
 

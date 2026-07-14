@@ -334,5 +334,28 @@ def mint_and_export(
             log(f"probe chat: ok={ch.get('ok')} model={ch.get('model')} text={ch.get('text')!r}")
             if not ch.get("ok"):
                 result["ok"] = False
-                result["error"] = f"chat probe failed: {ch.get('error') or ch.get('status')}"
+                err_s = str(ch.get("error") or ch.get("status") or "")
+                result["error"] = f"chat probe failed: {err_s}"
+                # Disable immediately so CLIProxy does not rotate onto chat-denied
+                # credentials (permission-denied / 403 / chat endpoint denied).
+                err_l = err_s.lower()
+                if any(
+                    x in err_l
+                    for x in (
+                        "permission-denied",
+                        "access to the chat endpoint is denied",
+                        "forbidden",
+                        "403",
+                    )
+                ):
+                    try:
+                        from cpa_xai.usage import mark_account_permission_denied
+
+                        mark_account_permission_denied(
+                            Path(path), error=err_s, log=log
+                        )
+                        result["disabled"] = True
+                        result["disable_reason"] = "permission-denied"
+                    except Exception as exc:
+                        log(f"disable after chat probe fail: {exc}")
     return result

@@ -321,6 +321,18 @@ def run_round(
             elif "FAIL" in status:
                 stats["fail"] += 1
 
+            # Domain-level health tracking (StormBreaker-style domain graylist)
+            try:
+                import sys as _sys
+                _root = Path(__file__).resolve().parent.parent
+                if str(_root) not in _sys.path:
+                    _sys.path.insert(0, str(_root))
+                from domain_health_graylist import record_result, _domain_of
+                email = acc.get("email") or acc.get("sub") or acc["file"].stem
+                record_result(_domain_of(email), status == "OK")
+            except Exception:
+                pass
+
     elapsed = time.time() - t0
     pool_after = count_pool()
     log(f"\n[keepalive] round done in {elapsed:.0f}s: "

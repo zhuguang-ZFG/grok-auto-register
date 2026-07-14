@@ -121,6 +121,43 @@ def find_cpa_by_key_prefix(auth_dir: Path, key_prefix: str) -> Path | None:
     return None
 
 
+def mark_account_permission_denied(
+    cpa_file: Path,
+    *,
+    error: str = "",
+    log: LogFn | None = None,
+) -> None:
+    """Disable a CPA file after chat endpoint permission-denied (403).
+
+    Mint can succeed (token + models list OK) while chat is denied. Leaving such
+    files enabled makes CLIProxy rotate onto dead-chat credentials and slow every
+    request. Unlike quota exhaustion this is treated as terminal-ish for free
+    chat access until re-minted (no auto recover_after).
+    """
+    if not cpa_file.is_file():
+        return
+    try:
+        data = json.loads(cpa_file.read_text(encoding="utf-8"))
+        if data.get("disabled") and (data.get("quota_state") or {}).get("reason") == "permission-denied":
+            return
+        qs = data.setdefault("quota_state", {})
+        qs["reason"] = "permission-denied"
+        qs["exhausted_at"] = time.time()
+        # No recover_after: need re-mint / reauth, not time wait
+        qs.pop("recover_after", None)
+        if error:
+            qs["last_error"] = str(error)[:300]
+        data["disabled"] = True
+        qs["proxy_disabled"] = True
+        _atomic_write_json(cpa_file, data)
+        if log:
+            email = data.get("email", cpa_file.name)
+            log(f"[quota] marked {email} permission-denied+disabled (chat endpoint)")
+    except Exception as exc:
+        if log:
+            log(f"[quota] mark permission-denied failed for {cpa_file.name}: {exc}")
+
+
 def mark_account_exhausted(
     cpa_file: Path,
     *,
@@ -233,7 +270,12 @@ def reenable_recovered_accounts(
     Never re-enables terminal dead reasons (revoked RT / missing RT / bad json).
     """
     stats = {"scanned": 0, "reenabled": 0, "still_exhausted": 0, "skipped_terminal": 0}
-    _TERMINAL = frozenset({"refresh_revoked", "missing_refresh_token", "bad_json"})
+    _TERMINAL = frozenset({
+        "refresh_revoked",
+        "missing_refresh_token",
+        "bad_json",
+        "permission-denied",  # chat endpoint denied — needs re-mint, not time wait
+    })
     if not auth_dir.is_dir():
         return stats
     n = 0

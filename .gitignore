@@ -89,3 +89,10 @@ chatgpt_k12/config.local.yaml
 _import_*/
 _sso_ref/
 .proxy_health.json
+
+# session-local imports / third-party clones / backups (do not commit)
+k12_marely_import.json
+k12_marely.json
+backups/
+_tools/cpa-auth-inspect/
+_tools/authconv/
