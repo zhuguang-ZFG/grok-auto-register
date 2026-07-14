@@ -6,23 +6,26 @@
 Grok free 号注册后如果不使用，xAI 反滥用系统会在 30 分钟到数小时内封号。
 "用了就不会死，不用就死" —— 注册后立即使用过的号会进入"活跃"状态存活更久。
 
-此脚本做三件事：
+此脚本做四件事：
 1. **续期**：access_token 过期或即将过期（< 30 min）时用 refresh_token 换新
 2. **保活**：发一个轻量 grok-4.5 chat 请求，让账号保持活跃
 3. **清理**：连续保活失败的号移到 cpa_auths_dead/（不删，留审计）
+4. **告警**：活号数低于阈值时输出 WARN 到日志
 
 策略：
 - 按 expired 时间升序排列（最先过期的优先处理）
 - access_token 过期 → 先 refresh，refresh 失败 → 标死
 - refresh 成功或 token 仍有效 → 发 keepalive chat
 - 保活失败连续 >= max_fail_streak → 移到 dead 目录
+- 多线程并发（默认 5 线程），大幅缩短一轮耗时
 
 用法:
-    python scripts/cpa_keepalive.py                     # 跑一轮，默认 100 号
-    python scripts/cpa_keepalive.py --max 200           # 每轮最多 200 号
+    python scripts/cpa_keepalive.py                     # 跑一轮，默认 150 号
+    python scripts/cpa_keepalive.py --max 200 --workers 8
     python scripts/cpa_keepalive.py --interval 3h       # 循环模式，每 3 小时一轮
     python scripts/cpa_keepalive.py --dry-run           # 只探测不写文件
     python scripts/cpa_keepalive.py --proxy http://127.0.0.1:7897
+    python scripts/cpa_keepalive.py --warn-below 200    # 活号 < 200 时告警
 """
 from __future__ import annotations
 
@@ -31,11 +34,14 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 import urllib.error
+import urllib.parse
 import urllib.request
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -50,7 +56,7 @@ KEEPALIVE_TIMEOUT = 60
 REFRESH_TIMEOUT = 30
 REFRESH_MARGIN_MINUTES = 30  # access_token 距过期 < 30 min 就续期
 MAX_FAIL_STREAK = 3          # 连续失败 N 次移到 dead
-INTER_ACCOUNT_DELAY = 2      # 号间间隔秒数，防 rate limit
+WARN_BELOW_DEFAULT = 200     # 活号低于此数告警
 
 DEFAULT_HEADERS = {
     "x-grok-client-version": "0.2.93",
@@ -59,6 +65,14 @@ DEFAULT_HEADERS = {
     "x-grok-client-identifier": "grok-shell",
     "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
 }
+
+# 线程安全的全局文件写锁（多个 worker 不会同时写同一个文件，
+# 但 shutil.move 和 write 可能竞态，用锁保护）。
+_file_lock = threading.Lock()
+
+# 实时日志输出（flush=True 解决 powershell Out-File 缓冲问题）。
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 def _now() -> datetime:
@@ -81,7 +95,15 @@ def _build_opener(proxy: str | None = None) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers) if handlers else urllib.request.build_opener()
 
 
-def load_accounts(max_count: int = 100) -> list[dict]:
+def count_pool() -> int:
+    """统计当前活号总数。"""
+    try:
+        return sum(1 for _ in CPA_AUTH_DIR.glob("xai-*.json"))
+    except Exception:
+        return 0
+
+
+def load_accounts(max_count: int = 150) -> list[dict]:
     """加载 cpa_auths/ 下所有未禁用的号，按 expired 升序排列。"""
     accounts: list[dict] = []
     for f in CPA_AUTH_DIR.glob("xai-*.json"):
@@ -112,8 +134,6 @@ def load_accounts(max_count: int = 100) -> list[dict]:
 
 def refresh_one(account: dict, proxy: str | None = None) -> dict:
     """用 refresh_token 换新 access_token。成功返回新 token dict。"""
-    import urllib.parse
-
     rt = account.get("refresh_token", "").strip()
     if not rt:
         return {"ok": False, "error": "no refresh_token"}
@@ -184,13 +204,26 @@ def move_to_dead(account: dict) -> None:
     src = account["file"]
     dst = CPA_DEAD_DIR / src.name
     try:
-        shutil.move(str(src), str(dst))
+        with _file_lock:
+            shutil.move(str(src), str(dst))
+    except Exception:
+        pass
+
+
+def save_account(account: dict) -> None:
+    """线程安全地写回 account json。"""
+    try:
+        with _file_lock:
+            account["file"].write_text(
+                json.dumps(account["data"], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
     except Exception:
         pass
 
 
 def process_one(account: dict, proxy: str | None, dry_run: bool) -> str:
-    """处理一个号：续期 → 保活。返回状态字符串。"""
+    """处理一个号：续期 → 保活。返回状态字符串。线程安全。"""
     now = _now()
     needs_refresh = (account["expired"] - now).total_seconds() < REFRESH_MARGIN_MINUTES * 60
 
@@ -218,11 +251,7 @@ def process_one(account: dict, proxy: str | None, dry_run: bool) -> str:
             if account["fail_streak"] >= MAX_FAIL_STREAK:
                 move_to_dead(account)
                 return "DEAD_REFRESH"
-            if not dry_run:
-                account["file"].write_text(
-                    json.dumps(account["data"], ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+            save_account(account)
             return f"REFRESH_FAIL({r.get('status', '')})"
 
     # Step 2: 保活
@@ -234,61 +263,88 @@ def process_one(account: dict, proxy: str | None, dry_run: bool) -> str:
         account["fail_streak"] = 0
         account["data"]["_keepalive_fail_streak"] = 0
         account["data"]["_last_keepalive"] = now.isoformat()
-        account["file"].write_text(
-            json.dumps(account["data"], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_account(account)
         return "OK"
     else:
         account["fail_streak"] += 1
         account["data"]["_keepalive_fail_streak"] = account["fail_streak"]
-        account["file"].write_text(
-            json.dumps(account["data"], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        save_account(account)
         if account["fail_streak"] >= MAX_FAIL_STREAK:
             move_to_dead(account)
             return "DEAD_CHAT"
         return f"CHAT_FAIL(streak={account['fail_streak']})"
 
 
-def run_round(max_count: int, proxy: str | None, dry_run: bool) -> dict:
-    """跑一轮保活。"""
+def run_round(
+    max_count: int,
+    proxy: str | None,
+    dry_run: bool,
+    workers: int = 5,
+    warn_below: int = WARN_BELOW_DEFAULT,
+) -> dict:
+    """跑一轮保活（多线程并发）。"""
+    pool_total = count_pool()
     accounts = load_accounts(max_count=max_count)
+
+    # 水位告警
+    if pool_total < warn_below:
+        log(f"[keepalive] ⚠️  WARN: pool size {pool_total} below threshold {warn_below}!")
+
     if not accounts:
-        print("[keepalive] no accounts found")
-        return {"total": 0, "ok": 0, "fail": 0, "dead": 0}
+        log(f"[keepalive] no accounts to process (pool={pool_total})")
+        return {"total": 0, "ok": 0, "fail": 0, "dead": 0, "pool_total": pool_total}
+
+    log(f"[keepalive] round start: {len(accounts)} accounts, {workers} workers, pool={pool_total}")
+    t0 = time.time()
 
     stats = {"total": len(accounts), "ok": 0, "fail": 0, "dead": 0, "refresh_fail": 0}
-    for i, acc in enumerate(accounts):
-        status = process_one(acc, proxy, dry_run)
-        label = acc.get("email") or acc.get("sub") or acc["file"].stem[:30]
-        print(f"  [{i+1}/{len(accounts)}] {label[:40]:40s} {status}")
+    done = 0
 
-        if status == "OK":
-            stats["ok"] += 1
-        elif status.startswith("DEAD"):
-            stats["dead"] += 1
-        elif "REFRESH_FAIL" in status:
-            stats["refresh_fail"] += 1
-        elif "FAIL" in status:
-            stats["fail"] += 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_acc = {
+            pool.submit(process_one, acc, proxy, dry_run): acc
+            for acc in accounts
+        }
+        for future in as_completed(future_to_acc):
+            acc = future_to_acc[future]
+            status = future.result()
+            done += 1
+            label = (acc.get("email") or acc.get("sub") or acc["file"].stem)[:35]
+            log(f"  [{done}/{len(accounts)}] {label:35s} {status}")
 
-        if i < len(accounts) - 1:
-            time.sleep(INTER_ACCOUNT_DELAY)
+            if status == "OK":
+                stats["ok"] += 1
+            elif status.startswith("DEAD"):
+                stats["dead"] += 1
+            elif "REFRESH_FAIL" in status:
+                stats["refresh_fail"] += 1
+            elif "FAIL" in status:
+                stats["fail"] += 1
 
-    print(f"\n[keepalive] round done: ok={stats['ok']} fail={stats['fail']} "
-          f"refresh_fail={stats['refresh_fail']} dead={stats['dead']} total={stats['total']}")
+    elapsed = time.time() - t0
+    pool_after = count_pool()
+    log(f"\n[keepalive] round done in {elapsed:.0f}s: "
+        f"ok={stats['ok']} fail={stats['fail']} refresh_fail={stats['refresh_fail']} "
+        f"dead={stats['dead']} total={stats['total']} "
+        f"pool={pool_total}→{pool_after}")
+
+    if pool_after < warn_below:
+        log(f"[keepalive] ⚠️  WARN: pool size {pool_after} below threshold {warn_below}!")
+
+    stats["pool_total"] = pool_after
     return stats
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="CPA pool keepalive + dead cleanup")
-    parser.add_argument("--max", type=int, default=100, help="每轮最多处理号数 (default: 100)")
+    parser.add_argument("--max", type=int, default=150, help="每轮最多处理号数 (default: 150)")
+    parser.add_argument("--workers", type=int, default=5, help="并发线程数 (default: 5)")
     parser.add_argument("--proxy", type=str, default=None, help="HTTP 代理 (e.g. http://127.0.0.1:7897)")
     parser.add_argument("--interval", type=str, default=None,
                         help="循环模式间隔 (e.g. 3h, 30m)；不设则跑一轮退出")
     parser.add_argument("--dry-run", action="store_true", help="只探测不写文件、不发请求")
+    parser.add_argument("--warn-below", type=int, default=WARN_BELOW_DEFAULT,
+                        help=f"活号低于此数告警 (default: {WARN_BELOW_DEFAULT})")
     args = parser.parse_args()
 
     if args.interval:
@@ -296,19 +352,22 @@ def main() -> None:
         try:
             val = int(args.interval[:-1])
         except ValueError:
-            print(f"Invalid interval: {args.interval}")
+            log(f"Invalid interval: {args.interval}")
             sys.exit(1)
         seconds = val * {"h": 3600, "m": 60, "s": 1}.get(unit, 3600)
-        print(f"[keepalive] loop mode: interval={seconds}s max={args.max} proxy={args.proxy or '(none)'}")
+        log(f"[keepalive] loop mode: interval={seconds}s max={args.max} "
+            f"workers={args.workers} proxy={args.proxy or '(none)'}")
         while True:
             try:
-                run_round(args.max, args.proxy, args.dry_run)
+                run_round(args.max, args.proxy, args.dry_run,
+                          workers=args.workers, warn_below=args.warn_below)
             except Exception as e:
-                print(f"[keepalive] round error: {e}")
-            print(f"[keepalive] sleeping {seconds}s...")
+                log(f"[keepalive] round error: {e}")
+            log(f"[keepalive] sleeping {seconds}s...")
             time.sleep(seconds)
     else:
-        run_round(args.max, args.proxy, args.dry_run)
+        run_round(args.max, args.proxy, args.dry_run,
+                  workers=args.workers, warn_below=args.warn_below)
 
 
 if __name__ == "__main__":
