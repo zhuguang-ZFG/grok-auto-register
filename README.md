@@ -118,6 +118,8 @@ powershell -ExecutionPolicy Bypass -File scripts\k12_stack_watchdog.ps1
 
 硬边界：free hotmail **不能**稳定 request 进共享 K12 workspace；社区死 CPA 包必须 probe；**不要**提交号池 DB / auth-key。
 
+Codex / Claude Code 本机启动与常见坑见 [docs/CODEX_CLAUDE_OPS.md](docs/CODEX_CLAUDE_OPS.md)；`scripts/codex_k12.ps1`、`scripts/claude_code_start.ps1`。
+
 ## 配置
 
 常用配置项：
