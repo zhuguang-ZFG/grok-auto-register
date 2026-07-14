@@ -117,3 +117,35 @@ python scripts/k12_mother_invite.py run --mother-session mother_session.json --w
 | 80500 共享 K12（无 RT） | 短期可打，尽快用 |
 | hotmail 自注册 free（有 RT） | 无母号邀请前，不作为 K12 补号源 |
 | free request 进共享 K12 | 社区无稳解 |
+
+## 社区调优补充（2026-07-14 晚）
+
+### 大号池存储：JSON → SQLite
+
+`chatgpt2api/data/accounts.json` 在 8 万号时约 **230MB+**，每次读写/启动成本高。  
+社区与上游 README 推荐大号池用：
+
+```bat
+set STORAGE_BACKEND=sqlite
+set DATABASE_URL=sqlite:///D:/Users/grok-auto-register/chatgpt2api/data/accounts.db
+```
+
+迁移脚本（网关需先停）：
+
+```bat
+python scripts/k12_migrate_sqlite.py
+python scripts/k12_migrate_sqlite.py --force
+```
+
+验证：`python scripts/k12_pool_ops.py status` 数量与 chat probe 正常后，再考虑挪走 `accounts.json` 冷备份。
+
+### 其它已固化调优
+
+| 项 | 设置 |
+|----|------|
+| 失效剔除 | `auto_remove_invalid_accounts=true` |
+| 刷新间隔 | `refresh_account_interval_minute=30` |
+| CF 清障 | FlareSolverr + `clearance.mode=flaresolverr` |
+| Kimi reasoning | 网关忽略 `reasoning_effort`（防 422） |
+| 上下文 | `gpt-5-5` 1M / 其它 400k；`reserved_context_size=50k` |
+| 死号判定 | **chat probe + 网关剔除**；勿用裸 check 批量禁用共享 K12 |
