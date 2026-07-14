@@ -11,7 +11,7 @@
 | CLIProxyAPI | **主粮** `:8317` | Grok CPA；`auth-dir=cpa_auths`；`proxy-url=http://127.0.0.1:7897` |
 | 注册机 `grok_register_ttk.py auto` | 长期稳跑路径 | 见 `HARDEN.md` / `COMMUNITY_THICKEN.md` |
 | `quota_watch` | 主粮配套 | soft-disable + pool rotate |
-| **chatgpt2api（K12）** | **运行中** `:8124` | 本地 clone（**不入库**）；auth-key 本机配置 |
+| **chatgpt2api（K12）** | **运行中** `:8124` | 本地 clone（**不入库**）；**STORAGE_BACKEND=sqlite**（`data/accounts.db`）；auth-key 本机配置 |
 | FlareSolverr | **运行中** `:8191` | scoop `flaresolverr@3.5.0`；给注册/CF 清障 |
 | Kimi CLI | 多 provider | 默认见本机 `config.toml`；K12 别名见下 |
 
