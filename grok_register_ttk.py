@@ -147,6 +147,13 @@ DEFAULT_CONFIG = {
     "yunmeng_prefix_len": 12,
     "email_mix_yunmeng": False,
     "email_mix_yunmeng_ratio": 0.05,
+    # TempMail.lol / mail.tm public buffers (small mix only)
+    "email_mix_tempmail_lol": False,
+    "email_mix_tempmail_lol_ratio": 0.05,
+    "email_mix_mailtm": False,
+    "email_mix_mailtm_ratio": 0.05,
+    "mailtm_api_base": "https://api.mail.tm",
+    "mailtm_domain": "",
     # Long-run stability (community-aligned): metrics + SSO egress heal + daily cap
     "reg_metrics_enabled": True,
     "reg_metrics_path": "logs/reg_metrics.jsonl",
@@ -2054,6 +2061,21 @@ def _email_mix_yunmeng_ratio() -> float:
     return max(0.0, min(1.0, r))
 
 
+def _email_mix_flag(key: str, default: bool = False) -> bool:
+    v = config.get(key, default)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
+def _email_mix_ratio(key: str, default: float = 0.0) -> float:
+    try:
+        r = float(config.get(key, default) or 0.0)
+    except Exception:
+        r = float(default or 0.0)
+    return max(0.0, min(1.0, r))
+
+
 def _try_hotmail_inbox():
     import hotmail_pool as _hp
 
@@ -2072,61 +2094,76 @@ def _try_yunmeng_inbox():
     return _ym.create_inbox(config)
 
 
+def _try_tempmail_lol_inbox():
+    import tempmail_lol as _tml
+
+    return _tml.create_inbox(config)
+
+
+def _try_mailtm_inbox():
+    import mailtm_otp as _mt
+
+    return _mt.create_inbox(config)
+
+
+def _cf_mix_buckets():
+    """Ordered exclusive mix buckets for cloudflare/mixed (name, ratio, factory)."""
+    buckets = []
+    if _email_mix_hotmail_enabled():
+        buckets.append(("hotmail", _email_mix_hotmail_ratio(), _try_hotmail_inbox))
+    if _email_mix_cloud_mail_enabled():
+        buckets.append(("cloud_mail", _email_mix_cloud_mail_ratio(), _try_cloud_mail_inbox))
+    if _email_mix_yunmeng_enabled():
+        buckets.append(("yunmeng", _email_mix_yunmeng_ratio(), _try_yunmeng_inbox))
+    if _email_mix_flag("email_mix_tempmail_lol", False):
+        buckets.append(
+            ("tempmail_lol", _email_mix_ratio("email_mix_tempmail_lol_ratio", 0.05), _try_tempmail_lol_inbox)
+        )
+    if _email_mix_flag("email_mix_mailtm", False):
+        buckets.append(
+            ("mailtm", _email_mix_ratio("email_mix_mailtm_ratio", 0.05), _try_mailtm_inbox)
+        )
+    # scale down if sum>1, keep order (hotmail first)
+    total = sum(r for _, r, _ in buckets)
+    if total > 1.0 and total > 0:
+        scale = 1.0 / total
+        buckets = [(n, r * scale, f) for n, r, f in buckets]
+    return buckets
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
-    # Diversify under cloudflare/mixed: exclusive buckets
-    # [0,hm) hotmail; [hm,hm+cm) cloud_mail; [hm+cm,hm+cm+ym) yunmeng; else CF.
+    # Diversify under cloudflare/mixed: exclusive buckets then CF residual.
     if provider in ("cloudflare", "mixed", "mix", "cf+hotmail", "cf+mix"):
-        hm = _email_mix_hotmail_ratio() if _email_mix_hotmail_enabled() else 0.0
-        cm = _email_mix_cloud_mail_ratio() if _email_mix_cloud_mail_enabled() else 0.0
-        ym = _email_mix_yunmeng_ratio() if _email_mix_yunmeng_enabled() else 0.0
-        # Cap combined diversion at 1.0; prefer hotmail → cloud_mail → yunmeng.
-        if hm + cm + ym > 1.0:
-            rest = max(0.0, 1.0 - hm)
-            if cm > rest:
-                cm, ym = rest, 0.0
-            else:
-                ym = max(0.0, rest - cm)
+        buckets = _cf_mix_buckets()
         roll = random.random()
-        if hm > 0 and roll < hm:
-            try:
-                email, tok = _try_hotmail_inbox()
+        acc = 0.0
+        chosen = None
+        for i, (name, ratio, factory) in enumerate(buckets):
+            if ratio <= 0:
+                continue
+            if roll < acc + ratio:
+                chosen = i
+                break
+            acc += ratio
+        if chosen is not None:
+            # try chosen + later buckets on failure, then residual CF
+            for name, ratio, factory in buckets[chosen:]:
+                if ratio <= 0:
+                    continue
                 try:
-                    print(f"[*] email_mix: hotmail {email}", flush=True)
-                except Exception:
-                    pass
-                return email, tok
-            except Exception as exc:
-                try:
-                    print(f"[!] email_mix hotmail failed, fallback next: {exc}", flush=True)
-                except Exception:
-                    pass
-        elif cm > 0 and roll < hm + cm:
-            try:
-                email, tok = _try_cloud_mail_inbox()
-                try:
-                    print(f"[*] email_mix: cloud_mail {email}", flush=True)
-                except Exception:
-                    pass
-                return email, tok
-            except Exception as exc:
-                try:
-                    print(f"[!] email_mix cloud_mail failed, fallback next: {exc}", flush=True)
-                except Exception:
-                    pass
-        elif ym > 0 and roll < hm + cm + ym:
-            try:
-                email, tok = _try_yunmeng_inbox()
-                try:
-                    print(f"[*] email_mix: yunmeng {email}", flush=True)
-                except Exception:
-                    pass
-                return email, tok
-            except Exception as exc:
-                try:
-                    print(f"[!] email_mix yunmeng failed, fallback CF: {exc}", flush=True)
-                except Exception:
-                    pass
+                    email, tok = factory()
+                    try:
+                        print(f"[*] email_mix: {name} {email}", flush=True)
+                    except Exception:
+                        pass
+                    return email, tok
+                except Exception as exc:
+                    try:
+                        print(f"[!] email_mix {name} failed, fallback next: {exc}", flush=True)
+                    except Exception:
+                        pass
+        # residual → CF below
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider in ("cloudflare", "mixed", "mix", "cf+hotmail", "cf+mix"):
@@ -2140,6 +2177,12 @@ def get_email_and_token(api_key=None):
         except ImportError as e:
             raise Exception(f"tempmail_lol module missing: {e}") from e
         return _tml.create_inbox(config)
+    if provider in ("mailtm", "mail.tm", "mail_tm", "mailgw", "mail.gw"):
+        try:
+            import mailtm_otp as _mt
+        except ImportError as e:
+            raise Exception(f"mailtm_otp module missing: {e}") from e
+        return _mt.create_inbox(config)
     if provider in ("mailsapi", "mailsapi_otp", "fixed_otp"):
         try:
             import mailsapi_otp as _mo
@@ -2243,6 +2286,29 @@ def get_oai_code(
             "ymmynb",
         ):
             return _ym_early.wait_code(
+                dev_token,
+                email,
+                cfg=config,
+                timeout=timeout,
+                poll_interval=max(1.0, float(poll_interval or 2)),
+                log=log_callback,
+                cancel=cancel_callback,
+                resend=resend_callback,
+            )
+    except ImportError:
+        pass
+    # mail.tm / mail.gw session
+    try:
+        import mailtm_otp as _mt_early
+
+        if _mt_early.is_mailtm_token(dev_token) or provider in (
+            "mailtm",
+            "mail.tm",
+            "mail_tm",
+            "mailgw",
+            "mail.gw",
+        ):
+            return _mt_early.wait_code(
                 dev_token,
                 email,
                 cfg=config,
@@ -4657,6 +4723,7 @@ class GrokRegisterGUI:
                 "yyds",
                 "cloudflare",
                 "tempmail_lol",
+                "mailtm",
                 "mailsapi",
                 "hotmail",
                 "cloud_mail",
