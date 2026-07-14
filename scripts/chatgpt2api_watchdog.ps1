@@ -35,6 +35,9 @@ function Test-Gateway {
 }
 
 function Start-Gateway {
+    # Keep SQLite backend (community harden: JSON cold-backup only)
+    $env:STORAGE_BACKEND = "sqlite"
+    $env:DATABASE_URL = "sqlite:///" + ((Join-Path $ProjectDir "chatgpt2api/data/accounts.db") -replace "\\", "/")
     $env:CHATGPT2API_AUTH_KEY = $AuthKey
     $proc = Start-Process -FilePath "uv" `
         -ArgumentList "run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning" `
@@ -42,7 +45,7 @@ function Start-Gateway {
         -WindowStyle Hidden `
         -PassThru
     $proc.Id | Out-File -FilePath $PidFile -Encoding UTF8
-    Write-Log "Gateway started: PID $($proc.Id)"
+    Write-Log "Gateway started: PID $($proc.Id) storage=sqlite"
     return $proc
 }
 

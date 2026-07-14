@@ -36,6 +36,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [安装](#安装)
 - [配置](#配置)
 - [运行](#运行)
+- [ChatGPT K12 旁路（可选）](#chatgpt-k12-旁路可选)
 - [输出文件](#输出文件)
 - [稳定性机制](#稳定性机制)
 - [常见问题](#常见问题)
@@ -59,10 +60,12 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持 CPA xAI 凭证异步导出（默认独立 mint 浏览器，不占用注册页）。
 - 支持协议铸造：Device Flow → Auth-code PKCE fallback → 浏览器兜底。
 - 支持号池 soft-disable、静默 JWT 刷新、CLIProxy sticky 对接。
+- 支持 CPA 共享包 **probe 熔断导入**（`scripts/import_cpa_with_probe.py`）与 **SSO→CPA 批量铸造**（`scripts/sso_batch_to_cpa.py`）。
 - 支持日志级别（`quiet` / `info` / `debug`）与每分钟创建速度统计。
 - 支持页面卡住检测、当前账号重试、每账号浏览器重启和内存清理。
-- 自用加固基线见 [docs/HARDEN.md](docs/HARDEN.md)、号池运维见 [POOL.md](POOL.md)。
+- 自用加固基线见 [docs/HARDEN.md](docs/HARDEN.md)、号池运维见 [POOL.md](POOL.md)、运行快照见 [docs/STATUS.md](docs/STATUS.md)。
 - 可选：独立 **Databricks Express 试用** 流水线（号池 `databricks_auths/`，不写 CPA）见 [docs/DATABRICKS_PIPELINE.md](docs/DATABRICKS_PIPELINE.md)。
+- 可选：**ChatGPT K12 共享号池旁路**（本地 chatgpt2api + 运维脚本，clone 不入库）见下节与 [docs/K12_POOL_HARDEN.md](docs/K12_POOL_HARDEN.md)。
 
 ## 环境要求
 
@@ -92,6 +95,28 @@ cp config.example.json config.json
 ```
 
 然后按需编辑 `config.json`。
+
+## ChatGPT K12 旁路（可选）
+
+与 Grok 主粮（CLIProxy + `cpa_auths/`）**独立**：本机另起 chatgpt2api 类网关（仓库内 `chatgpt2api/` 为本地 clone，**gitignore**），用 OpenAI 兼容 API 消耗 **共享 K12 会话快照**（多数 **无 refresh_token**，窗口短）。
+
+| 能力 | 脚本 / 入口 |
+|------|-------------|
+| 状态 / watch / 清 abnormal | `scripts/k12_pool_ops.py`（默认 **不以** 裸 `/accounts/check` 禁号） |
+| 存活监控 | `scripts/k12_pool_monitor.py` |
+| RT 感知导入 | `scripts/k12_rt_import.py inspect\|import` |
+| 栈守护 + 开机任务 | `scripts/k12_stack_watchdog.ps1`、`install_k12_stack_watchdog_task.ps1` |
+| Codex 走本地 K12 | `scripts/codex_k12.ps1`；切 provider：`scripts/cc_switch_codex_provider.py` |
+| 设计说明 | [docs/K12_POOL_HARDEN.md](docs/K12_POOL_HARDEN.md)、[docs/K12_DOMAIN_RESEARCH.md](docs/K12_DOMAIN_RESEARCH.md)、[docs/STATUS.md](docs/STATUS.md) |
+
+```bat
+curl http://127.0.0.1:8124/healthz
+python scripts/k12_pool_ops.py status
+python scripts/k12_rt_import.py inspect D:\Downloads\export.zip
+powershell -ExecutionPolicy Bypass -File scripts\k12_stack_watchdog.ps1
+```
+
+硬边界：free hotmail **不能**稳定 request 进共享 K12 workspace；社区死 CPA 包必须 probe；**不要**提交号池 DB / auth-key。
 
 ## 配置
 

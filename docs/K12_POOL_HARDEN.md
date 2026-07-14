@@ -13,6 +13,20 @@
 - `chatgpt-register-sub2api` / `chatgpt-register-k12`（注册+join+导出）
 - chatgpt2api 号池：失效剔除 / 刷新 / 代理 clearance
 
+
+### 运维固化（2026-07-14 社区调优落地）
+
+- **单实例**：`k12_pool_ops.py watch` / `k12_pool_monitor.py --watch` 写 `logs/*.watch.lock`，重复启动会直接退出。
+- **健康 SSOT**：网关 `chat/responses` 探针；`direct /accounts/check` 默认 **不跑**（`--probe-n 0`），避免共享 K12 假 401 刷日志。
+- **日志轮转**：`k12_pool_ops.log` 超 32MiB 自动 `.1/.2/.3`；启动时已手工把 217MiB 压成 tail。
+- **推荐常驻**：
+  ```bash
+  python scripts/k12_pool_monitor.py --watch --interval 300
+  python scripts/k12_pool_ops.py watch --interval 300 --probe-n 0 --auto-purge-abnormal
+  ```
+- **Codex**：用 `scripts/codex_k12.ps1` / `codex_k12.sh`，避免 shell 里 muyuan `OPENAI_API_KEY` 盖掉网关密钥。
+
+
 ## A. 把现有 80500 用到极致
 
 脚本：`scripts/k12_pool_ops.py`
@@ -149,3 +163,49 @@ python scripts/k12_migrate_sqlite.py --force
 | Kimi reasoning | 网关忽略 `reasoning_effort`（防 422） |
 | 上下文 | `gpt-5-5` 1M / 其它 400k；`reserved_context_size=50k` |
 | 死号判定 | **chat probe + 网关剔除**；勿用裸 check 批量禁用共享 K12 |
+
+### 一键栈守护
+
+```powershell
+# 网关 + monitor + ops（单实例，含退避）
+powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File scripts/k12_stack_watchdog.ps1
+
+# 仅网关
+powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File scripts/chatgpt2api_watchdog.ps1
+
+# Codex 走 K12
+.\scripts\codex_k12.ps1
+```
+
+日志：`logs/k12_stack_watchdog.log`；锁：`logs/k12_stack_watchdog.lock`。
+
+### 开机自启（计划任务）
+
+```powershell
+# 安装（登录时拉起；MultipleInstances=IgnoreNew + 脚本自身 lock）
+powershell -ExecutionPolicy Bypass -File scripts\install_k12_stack_watchdog_task.ps1
+
+# 立刻启动一次
+powershell -ExecutionPolicy Bypass -File scripts\install_k12_stack_watchdog_task.ps1 -StartNow
+
+# 状态 / 删除
+Get-ScheduledTask -TaskName K12StackWatchdog | Get-ScheduledTaskInfo
+powershell -ExecutionPolicy Bypass -File scripts\install_k12_stack_watchdog_task.ps1 -Remove
+```
+
+任务名：`K12StackWatchdog`。与正在跑的实例不冲突：脚本发现 `logs/k12_stack_watchdog.lock` 存活会直接退出。
+
+### /healthz + cc-switch schema 绕过（2026-07-14）
+
+- 网关：`GET /healthz` → `{"status":"ok","alive":true}`（不扫 8 万号，给 watchdog 用）
+- `scripts/k12_stack_watchdog.ps1` 优先探 `/healthz`
+- GUI CC Switch **3.17** 把 DB 升到 **schema v13**；CLI **5.9.0 最高 v11**，`cc-switch provider *` 会报版本错误
+- 用 SQLite 直切 Codex provider（不依赖 CLI）：
+  ```bash
+  python scripts/cc_switch_codex_provider.py list
+  python scripts/cc_switch_codex_provider.py current
+  python scripts/cc_switch_codex_provider.py switch k12-local-chatgpt2api
+  python scripts/cc_switch_codex_provider.py switch mycodex-1782970213160
+  ```
+- CLI 升级：等 SaladDay/cc-switch-cli 发支持 v13 的版本后再 `cc-switch update`（当前 latest 仍 5.9.0 / SCHEMA=11）
+

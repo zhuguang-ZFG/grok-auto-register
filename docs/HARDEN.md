@@ -59,7 +59,26 @@ SSO cookie
 | `cpa_mint_workers` | `1` |
 | `quota_watch_poll_sec` | `15` |
 | `quota_watch_sample_probe_n` | `0` |
+| `sso_cookie_timeout_sec` | `150`（等 SSO 窗口，社区稳妥值） |
+| `sso_timeout_rotate_after` | `2`（连续 SSO 超时强制换 Clash 节点） |
+| `reg_metrics_enabled` | `true` → `logs/reg_metrics.jsonl` |
+| `register_daily_success_cap` | `0` 关闭；长期可设 `200`–`500` |
 
+### 4.1 注册指标（2026-07-14）
+
+```bash
+# 日成功/失败粗看
+python -c "import json,collections; c=collections.Counter();
+from pathlib import Path
+p=Path('logs/reg_metrics.jsonl')
+if p.exists():
+  for l in p.read_text(encoding='utf-8').splitlines():
+    try: r=json.loads(l); c[(r.get('event'), r.get('reason'))]+=1
+    except: pass
+print(c)"
+```
+
+事件：`success` / `fail`（reason: `sso_timeout|otp|cloudflare|timeout|blocked|other`）/ `egress_rotate` / `cap_hit`。
 ## 5. 一键自检
 
 ```bash

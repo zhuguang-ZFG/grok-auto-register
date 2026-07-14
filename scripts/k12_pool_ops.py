@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -37,15 +38,86 @@ ROOT = Path(__file__).resolve().parents[1]
 GATEWAY = "http://127.0.0.1:8124"
 AUTH_KEY = "k12-pool-local"
 LOG = ROOT / "logs" / "k12_pool_ops.log"
+LOCK = ROOT / "logs" / "k12_pool_ops.watch.lock"
+# community harden: keep ops log small; direct-check noise is high on shared K12
+LOG_MAX_BYTES = 32 * 1024 * 1024  # 32 MiB
+LOG_KEEP = 3
+
+
+def _rotate_log(path: Path, max_bytes: int = LOG_MAX_BYTES, keep: int = LOG_KEEP) -> None:
+    """Size-based rotate: path -> path.1 ... path.N (drop oldest)."""
+    try:
+        if not path.is_file() or path.stat().st_size < max_bytes:
+            return
+        for i in range(keep, 0, -1):
+            src = path if i == 1 else path.with_suffix(path.suffix + f".{i - 1}")
+            dst = path.with_suffix(path.suffix + f".{i}")
+            if i == keep and dst.exists():
+                dst.unlink(missing_ok=True)
+            if src.exists():
+                src.replace(dst)
+    except OSError:
+        pass
 
 
 def log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     line = f"[{ts}] {msg}"
     LOG.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_log(LOG)
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
     print(line, flush=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenProcess(SYNCHRONIZE, 0, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    except Exception:
+        try:
+            os.kill(pid, 0)  # type: ignore[name-defined]
+            return True
+        except Exception:
+            return False
+
+
+def acquire_watch_lock() -> bool:
+    """Single-instance guard for `watch` (community: don't stack monitors)."""
+    import os
+
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    if LOCK.exists():
+        try:
+            old = int((LOCK.read_text(encoding="utf-8") or "0").strip().split()[0])
+        except Exception:
+            old = 0
+        if old and old != os.getpid() and _pid_alive(old):
+            log(f"watch already running pid={old}; exit (singleton)")
+            return False
+    LOCK.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    return True
+
+
+def release_watch_lock() -> None:
+    import os
+
+    try:
+        if LOCK.exists():
+            cur = int((LOCK.read_text(encoding="utf-8") or "0").strip().split()[0])
+            if cur == os.getpid():
+                LOCK.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def http_json(
@@ -345,41 +417,53 @@ def cmd_purge_abnormal(args: argparse.Namespace) -> int:
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
+    if not acquire_watch_lock():
+        return 2
     interval = max(60, int(args.interval))
+    # Community: gateway chat/responses is SSOT; direct-check is optional noise.
+    # Default lower probe-n to cut 401 spam & log growth on shared K12 snapshots.
     probe_n = max(0, int(args.probe_n))
-    log(f"watch start interval={interval}s probe_n={probe_n}")
-    while True:
-        try:
-            st = status_counts()
-            alive = st["normal"] / st["total"] if st["total"] else 0
-            log(
-                f"watch total={st['total']} normal={st['normal']} "
-                f"abnormal={st['abnormal']} disabled={st['disabled']} alive={alive:.1%}"
-            )
-            chat = active_chat_probe()
-            if chat.get("ok"):
-                log(f"watch chat OK {chat['latency_s']}s")
-            else:
-                log(f"watch chat FAIL {chat}")
-            if probe_n > 0:
-                ns = argparse.Namespace(
-                    n=probe_n,
-                    status="normal",
-                    proxy=args.proxy,
-                    sleep=args.sleep,
-                    disable_dead=False,  # never auto-disable from direct-check in watch
-                    trust_direct_check=False,
-                    dry_run=False,
+    log(
+        f"watch start interval={interval}s probe_n={probe_n} "
+        f"auto_purge={bool(args.auto_purge_abnormal)} pid={os.getpid()}"
+    )
+    try:
+        while True:
+            try:
+                st = status_counts()
+                alive = st["normal"] / st["total"] if st["total"] else 0
+                log(
+                    f"watch total={st['total']} normal={st['normal']} "
+                    f"abnormal={st['abnormal']} disabled={st['disabled']} alive={alive:.1%}"
                 )
-                cmd_sample_probe(ns)
-            if st["abnormal"] > 0 and args.auto_purge_abnormal:
-                cmd_purge_abnormal(argparse.Namespace(max=min(200, st["abnormal"]), dry_run=False))
-        except KeyboardInterrupt:
-            log("watch stopped")
-            return 0
-        except Exception as e:
-            log(f"watch error: {e}")
-        time.sleep(interval)
+                chat = active_chat_probe()
+                if chat.get("ok"):
+                    log(f"watch chat OK {chat['latency_s']}s")
+                else:
+                    log(f"watch chat FAIL {chat}")
+                if probe_n > 0:
+                    ns = argparse.Namespace(
+                        n=probe_n,
+                        status="normal",
+                        proxy=args.proxy,
+                        sleep=args.sleep,
+                        disable_dead=False,  # never auto-disable from direct-check in watch
+                        trust_direct_check=False,
+                        dry_run=False,
+                    )
+                    cmd_sample_probe(ns)
+                if st["abnormal"] > 0 and args.auto_purge_abnormal:
+                    cmd_purge_abnormal(
+                        argparse.Namespace(max=min(200, st["abnormal"]), dry_run=False)
+                    )
+            except KeyboardInterrupt:
+                log("watch stopped")
+                return 0
+            except Exception as e:
+                log(f"watch error: {e}")
+            time.sleep(interval)
+    finally:
+        release_watch_lock()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -412,7 +496,12 @@ def main(argv: list[str] | None = None) -> int:
 
     p_w = sub.add_parser("watch")
     p_w.add_argument("--interval", type=int, default=300)
-    p_w.add_argument("--probe-n", type=int, default=10)
+    p_w.add_argument(
+        "--probe-n",
+        type=int,
+        default=0,
+        help="direct /accounts/check samples per tick (0=skip; recommended for shared K12)",
+    )
     p_w.add_argument("--proxy", default="http://127.0.0.1:7897")
     p_w.add_argument("--sleep", type=float, default=0.2)
     p_w.add_argument("--auto-purge-abnormal", action="store_true")

@@ -139,8 +139,14 @@ DEFAULT_CONFIG = {
     "cloud_mail_credentials_file": "vip0_mail.local.json",
     "cloud_mail_domains": ["vip0.xyz"],
     "cloud_mail_domain_mode": "random",
+    # Long-run stability (community-aligned): metrics + SSO egress heal + daily cap
+    "reg_metrics_enabled": True,
+    "reg_metrics_path": "logs/reg_metrics.jsonl",
+    "sso_cookie_timeout_sec": 150,
+    "sso_timeout_rotate_enabled": True,
+    "sso_timeout_rotate_after": 2,
+    "register_daily_success_cap": 0,
 }
-
 config = DEFAULT_CONFIG.copy()
 
 # Anti-detect thread-local fingerprint + timezone (set by create_browser_options,
@@ -506,9 +512,147 @@ def report_egress_result(ok: bool, egress: dict | None = None) -> None:
         pass
 
 
+def _reg_metrics_path() -> Path:
+    raw = str(config.get("reg_metrics_path") or "").strip()
+    if raw:
+        return Path(raw)
+    return Path(__file__).resolve().parent / "logs" / "reg_metrics.jsonl"
+
+
+def record_reg_metric(event: str, reason: str = "", **extra) -> None:
+    """Append one JSONL metric for long-term success/fail analysis (community ops)."""
+    if not bool(config.get("reg_metrics_enabled", True)):
+        return
+    try:
+        path = _reg_metrics_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            "reason": reason or "",
+        }
+        if extra:
+            row.update(extra)
+        with _io_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def classify_register_fail(exc: BaseException | None) -> str:
+    msg = str(exc or "")
+    low = msg.lower()
+    if "sso cookie" in low or "未获取到 sso" in msg:
+        return "sso_timeout"
+    if "验证码" in msg or "otp" in low:
+        return "otp"
+    if "turnstile" in low or "cloudflare" in low:
+        return "cloudflare"
+    if "超时" in msg or "timeout" in low:
+        return "timeout"
+    if "region" in low or "403" in msg:
+        return "blocked"
+    return "other"
+
+
+def force_rotate_egress_for_sso(log_fn=None) -> None:
+    """Force Clash node rotate after consecutive SSO timeouts (community: bad IP → switch)."""
+    if not bool(config.get("sso_timeout_rotate_enabled", True)):
+        return
+    if not bool(config.get("clash_rotate_per_account", True)):
+        return
+    try:
+        from clash_proxy import rotate_node, is_available
+
+        if not is_available():
+            if log_fn:
+                log_fn("[*] SSO超时换节点: Clash API 不可用")
+            return
+        node = rotate_node(
+            log=log_fn,
+            verify_ip=bool(config.get("clash_verify_ip", False)),
+            selector=(config.get("clash_selector") or None),
+            force_global=bool(config.get("clash_force_global", False)),
+            close_conns=bool(config.get("clash_close_conns", False)),
+        )
+        config["_clash_rotate_counter"] = 0
+        if log_fn:
+            if node:
+                safe = str(node).encode("ascii", "backslashreplace").decode("ascii")
+                log_fn(f"[*] SSO连续超时，已强制换节点: {safe}")
+            else:
+                log_fn("[*] SSO连续超时，换节点未返回名称（可能已切换）")
+        record_reg_metric("egress_rotate", reason="sso_timeout_streak")
+    except Exception as exc:
+        if log_fn:
+            safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+            log_fn(f"[*] SSO超时换节点失败: {safe}")
+
+
+def note_register_outcome(
+    ok: bool, exc: BaseException | None = None, log_fn=None
+) -> None:
+    """Metrics + SSO-timeout streak → optional forced egress rotate."""
+    reason = "ok" if ok else classify_register_fail(exc)
+    record_reg_metric("success" if ok else "fail", reason=reason)
+    if ok:
+        config["_sso_timeout_streak"] = 0
+        return
+    if reason != "sso_timeout":
+        return
+    streak = int(config.get("_sso_timeout_streak", 0) or 0) + 1
+    config["_sso_timeout_streak"] = streak
+    threshold = max(1, int(config.get("sso_timeout_rotate_after", 2) or 2))
+    if log_fn:
+        log_fn(f"[*] SSO超时 streak={streak}/{threshold}")
+    if streak >= threshold:
+        force_rotate_egress_for_sso(log_fn)
+        config["_sso_timeout_streak"] = 0
+
+
+def daily_success_count_from_metrics() -> int:
+    """Count today's success events from reg_metrics.jsonl (best-effort)."""
+    try:
+        path = _reg_metrics_path()
+        if not path.is_file():
+            return 0
+        today = datetime.date.today().isoformat()
+        n = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or '"success"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("event") == "success" and str(row.get("ts", "")).startswith(
+                    today
+                ):
+                    n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def check_daily_success_cap(log_fn=None) -> bool:
+    """Return False when daily success cap reached (0 = disabled)."""
+    cap = int(config.get("register_daily_success_cap", 0) or 0)
+    if cap <= 0:
+        return True
+    n = daily_success_count_from_metrics()
+    if n >= cap:
+        if log_fn:
+            log_fn(f"[!] 已达日成功上限 {n}/{cap}，本轮停止（长期稳跑）")
+        record_reg_metric("cap_hit", reason="daily_success", count=n, cap=cap)
+        return False
+    return True
+
+
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
-
 
 def get_cloudflare_api_base():
     return str(config.get("cloudflare_api_base", "") or "").rstrip("/")
@@ -4161,14 +4305,21 @@ return String(cfInput.value || '').trim().length;
     raise Exception("最终注册页资料填写失败")
 
 
-def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
+def wait_for_sso_cookie(timeout=None, log_callback=None, cancel_callback=None):
+    if timeout is None:
+        timeout = int(config.get("sso_cookie_timeout_sec", 150) or 150)
+    timeout = max(60, int(timeout))
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0
     last_cf_retry_at = 0.0
+    last_warmup_at = 0.0
+    last_accounts_nav_at = 0.0
     final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 25
+    if log_callback:
+        log_callback(f"[*] SSO 等待窗口: {timeout}s")
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -4178,8 +4329,38 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
-            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
+            # Community-style human signal while waiting for SSO (mouse/scroll warmup)
             now = time.time()
+            if now - last_warmup_at >= 8.0:
+                try:
+                    _get_page().run_js(
+                        r"""
+try {
+  const x = 120 + Math.floor(Math.random() * 400);
+  const y = 100 + Math.floor(Math.random() * 280);
+  window.scrollBy(0, (Math.random() > 0.5 ? 1 : -1) * (40 + Math.floor(Math.random() * 80)));
+  document.dispatchEvent(new MouseEvent('mousemove', {clientX: x, clientY: y, bubbles: true}));
+} catch (e) {}
+"""
+                    )
+                except Exception:
+                    pass
+                last_warmup_at = now
+
+            # If already past signup but cookie lagging, nudge accounts.x.ai once
+            if now - last_accounts_nav_at >= 20.0:
+                try:
+                    url = str(_get_page().url or "")
+                    if "accounts.x.ai" in url and "sign-up" not in url and "sso" not in last_seen_names:
+                        # soft reload current account page to surface cookies
+                        _get_page().refresh()
+                        if log_callback:
+                            log_callback("[*] SSO 等待中：刷新 accounts 页以促发 cookie")
+                        last_accounts_nav_at = now
+                except Exception:
+                    pass
+
+            # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             if now - last_submit_retry >= 2.5:
                 retried = _get_page().run_js(
                     r"""
@@ -4775,11 +4956,12 @@ class GrokRegisterGUI:
                 log_fn, worker_id, local_success, clash_node
             )
             report_egress_result(True, egress)
+            note_register_outcome(True, log_fn=log_fn)
             return result
-        except Exception:
+        except Exception as exc:
             report_egress_result(False, egress)
+            note_register_outcome(False, exc, log_fn=log_fn)
             raise
-
     def _register_one_account_body(self, log_fn, worker_id=0, local_success=0, clash_node=None):
         email = ""
         dev_token = ""
@@ -4882,6 +5064,8 @@ class GrokRegisterGUI:
         max_slot_retry = 3
         while i < count:
             if self.should_stop():
+                break
+            if not check_daily_success_cap(self.log):
                 break
             self.log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             try:
@@ -5007,9 +5191,11 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
             email_holder=email_holder,
         )
         report_egress_result(True, egress)
+        note_register_outcome(True, log_fn=log_fn)
         return result
     except Exception as exc:
         report_egress_result(False, egress)
+        note_register_outcome(False, exc, log_fn=log_fn)
         try:
             import domain_health as _dh
 
@@ -5021,7 +5207,6 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
         except Exception:
             pass
         raise
-
 
 def _register_one_account_cli_body(
     log_fn, stop_fn, accounts_output_file, clash_node=None, email_holder=None
@@ -5133,6 +5318,9 @@ def _cli_worker_loop(worker_id, task_queue, total_count, controller, accounts_ou
     max_slot_retry = 3
     try:
         while not controller.should_stop():
+            if not check_daily_success_cap(log_fn):
+                controller.stop()
+                break
             try:
                 task_queue.get_nowait()
             except Exception:
@@ -5364,6 +5552,8 @@ def run_registration_cli_loop(count_per_round):
         while not controller.should_stop():
             # Reload config each round so speed/concurrency tweaks apply without restart.
             load_config()
+            if not check_daily_success_cap(cli_log):
+                break
             pause_base = float(config.get("auto_loop_pause_sec", 30) or 30)
             max_rounds = int(config.get("auto_loop_max_rounds", 0) or 0)
             jitter = float(config.get("auto_loop_jitter", 0.5) or 0.5)

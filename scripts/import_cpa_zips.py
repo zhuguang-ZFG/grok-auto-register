@@ -42,6 +42,21 @@ def _email_from_payload_or_name(data: dict, name: str) -> str | None:
     # bare user@domain.json
     if "@" in stem:
         return stem.lower()
+    # CPA export often uses xai-<uuid>.json with empty email; sub is account id
+    sub = str(data.get("sub") or "").strip()
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        sub,
+    ):
+        return f"{sub.lower()}@unknown.local"
+    # filename xai-<uuid>.json without payload email
+    m = re.fullmatch(
+        r"xai-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+        stem,
+        flags=re.I,
+    )
+    if m:
+        return f"{m.group(1).lower()}@unknown.local"
     return None
 
 

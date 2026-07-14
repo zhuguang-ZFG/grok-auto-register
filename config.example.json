@@ -178,6 +178,12 @@
   "clash_selector": "",
   "clash_api": "http://127.0.0.1:9097",
   "clash_secret": "set-your-secret",
+  "reg_metrics_enabled": true,
+  "reg_metrics_path": "logs/reg_metrics.jsonl",
+  "sso_cookie_timeout_sec": 150,
+  "sso_timeout_rotate_enabled": true,
+  "sso_timeout_rotate_after": 2,
+  "register_daily_success_cap": 0,
   "databricks": {
     "enabled": true,
     "register_count": 1,

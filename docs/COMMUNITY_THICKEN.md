@@ -77,6 +77,10 @@ python scripts/hotmail_cpa_health.py
 | 社区能力 | 本机固化 |
 |----------|----------|
 | 号池导入 CPA/sub2api | `scripts/k12_rt_import.py`（先 inspect，优先 K12+RT） |
+
+| 单实例 watchdog + 日志轮转 | `scripts/k12_stack_watchdog.ps1`；`k12_pool_*` lock + log rotate；`chatgpt2api_watchdog.ps1` 启网关带 `STORAGE_BACKEND=sqlite` |
+| Codex 本地 K12 | `scripts/codex_k12.ps1` / `.sh`（清 muyuan env 再起） |
+| CPA 共享包熔断 | `import_cpa_with_probe`（本批 cpa-grok4.5-100 采样 0% 未入库） |
 | 失效剔除 | 网关 `auto_remove_invalid_accounts` + `k12_pool_ops purge-abnormal` |
 | 定时刷新 | `refresh_account_interval_minute`；有 RT 时 `k12_rt_import refresh-gateway` |
 | CF 清障 | FlareSolverr `:8191` + `proxy_runtime.clearance.mode=flaresolverr` |
