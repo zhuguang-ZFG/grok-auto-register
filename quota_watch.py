@@ -725,6 +725,13 @@ def purge_dead_pool(
             atomic_write_json(p, payload)
             stats["refreshed"] += 1
         except _terminal_exc:
+            # Rotation-race guard: another refresher may have just rotated this RT.
+            # Re-read the file; if the on-disk RT changed, the account is alive.
+            from cpa_xai.raceguard import rt_rotated_by_other
+
+            if rt_rotated_by_other(p, rt):
+                stats["skipped_rotated"] = stats.get("skipped_rotated", 0) + 1
+                continue
             # Revoked RT: soft-disable once; never rewrite every cycle.
             if payload.get("disabled") and reason == "refresh_revoked":
                 stats["skipped_terminal"] += 1

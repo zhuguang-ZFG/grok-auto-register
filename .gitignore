@@ -96,3 +96,7 @@ k12_marely.json
 backups/
 _tools/cpa-auth-inspect/
 _tools/authconv/
+
+# temp scratch scripts
+_tmp_*.ps1
+_tmp_*.py

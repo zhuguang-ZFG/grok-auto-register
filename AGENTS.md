@@ -1,0 +1,31 @@
+# AGENTS.md — grok-auto-register 项目级指引
+
+> 面向任何在本仓干活的 agent。先读「判死铁律」，再动手。
+
+## ⛔ 判死铁律（读 `docs/RT_ROTATION_RACE.md` 全文）
+
+判定一个 xAI/Grok 号「死 / RT 失效」之前，**必须**遵守，否则会把好号误杀：
+
+1. **`invalid_grant` ≠ 号死。** xAI 的 refresh_token 每次刷新即轮换、旧的立即作废；
+   本仓有 6 个互不协调的 refresh 端（keepalive/quota_watch/pool_health/refresh_pool/
+   hard_purge/local_grok_auth），并发刷同一号时输家必得 `invalid_grant`——这是
+   **轮换竞态假死**，不是账号真死。判死前重读文件：RT 变了 = 别的进程刷过 = 号活着。
+2. **测活先测 AT，别只测 RT。** 测 RT 是破坏性操作（消耗轮换）；测 AT 只读。
+   AT 能用 = 号现在能用。用 `cpa_xai.probe.probe_models(at, base_url=...)`。
+3. **AT 探测 URL 别拼错。** `base_url` 已含 `/v1`，正确地址
+   `https://cli-chat-proxy.grok.com/v1/models`；别再拼出 `/v1/v1`。
+
+**任何 refresh 消费端，判死/禁用/搬号前必须调
+`cpa_xai.raceguard.rt_rotated_by_other(path, tried_rt)`。** 已接入 5 处，新增端照做。
+
+## 号池布局
+
+- `cpa_auths/`：活号（网关读取）。
+- `cpa_auths_dead/`：死号（不删，留审计；部分可能是假死，可按上面方法复核救回）。
+- own 自注册域：`baoxia.top`、`lima.cc.cd`、`zhuguang.ccwu.cc`、`zhuguang.de5.net`、`hotmail.com`。
+
+## 改动纪律
+
+- 改完 `.py` 跑 `python -m py_compile <files>` 验证。
+- 危险命令（`rm -rf`、`git push --force`、`git reset --hard`、写 `.env`）被 config 硬 deny。
+- git 提交/推送必须经用户明确同意。

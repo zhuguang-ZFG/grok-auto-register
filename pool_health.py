@@ -434,6 +434,16 @@ def main() -> int:
             else:
                 stats["refresh_fail"] += 1
                 print(f"[!] refresh FAIL {email}: {msg}")
+                # Rotation-race guard: on invalid_grant, re-read the file. If
+                # another refresher already rotated the RT, the account is alive.
+                from cpa_xai.raceguard import rt_rotated_by_other
+
+                if "invalid_grant" in msg.lower() and rt_rotated_by_other(
+                    path, str(data.get("refresh_token") or "")
+                ):
+                    stats["skipped_rotated"] = stats.get("skipped_rotated", 0) + 1
+                    live.append(path)
+                    continue
                 quarantine(path, dead_dir, msg)
                 stats["quarantined"] += 1
                 continue

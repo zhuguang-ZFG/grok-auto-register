@@ -47,6 +47,8 @@ import urllib.request
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from cpa_xai.raceguard import rt_rotated_by_other  # noqa: E402
+
 CPA_AUTH_DIR = PROJECT_ROOT / "cpa_auths"
 CPA_DEAD_DIR = PROJECT_ROOT / "cpa_auths_dead"
 BASE_URL = "https://cli-chat-proxy.grok.com/v1"
@@ -245,6 +247,17 @@ def process_one(account: dict, proxy: str | None, dry_run: bool) -> str:
             account["data"]["last_refresh"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             account["expired"] = new_expired
         else:
+            err = str(r.get("error", ""))
+            # Rotation-race guard: on invalid_grant, re-read the file. If another
+            # refresher already rotated the RT, the account is alive — do NOT
+            # count it as a failure or move it to dead.
+            if "invalid_grant" in err and rt_rotated_by_other(
+                account["file"], account.get("refresh_token", "")
+            ):
+                account["fail_streak"] = 0
+                account["data"]["_keepalive_fail_streak"] = 0
+                save_account(account)
+                return "ROTATED_SKIP"
             # refresh 失败 → 号已死
             account["fail_streak"] += 1
             account["data"]["_keepalive_fail_streak"] = account["fail_streak"]

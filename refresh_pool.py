@@ -110,6 +110,7 @@ def refresh_one(
     os.replace churn as REMOVE and breaks session-affinity.
     """
     from cpa_xai.oauth_device import OAuthDeviceError, refresh_access_token
+    from cpa_xai.raceguard import rt_rotated_by_other
     from cpa_xai.schema import expired_from_access_token
 
     try:
@@ -155,6 +156,10 @@ def refresh_one(
     except OAuthDeviceError as exc:
         msg = str(exc)
         dead = "invalid_grant" in msg.lower() or "400" in msg or "401" in msg
+        # Rotation-race guard: another refresher may have just rotated this RT.
+        # Re-read the file; if the on-disk RT changed, the account is alive.
+        if dead and rt_rotated_by_other(path, rt):
+            return {"file": path.name, "ok": True, "error": "rotated_by_other", "skipped": True}
         if dead and soft_disable_dead:
             # Prefer soft-disable over MOVE (sticky-safe)
             payload["disabled"] = True

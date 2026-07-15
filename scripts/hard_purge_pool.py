@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""True-refresh CPA files; move only terminal-dead into cpa_auths_dead/.
+"""Probe / soft-disable terminal CPA files. Moving to dead is opt-in.
 
-Soft holds (free-usage-exhausted) stay in live so quota_watch can re-enable.
-Default scope is **buffer** (shared imports) to limit token-endpoint load;
-use --scope all for a full sweep.
+Policy (2026-07-15, after pool collapse incident):
+  - Default **dirty_only**: only disabled / missing RT (never mass-refresh healthy).
+  - Default **no move**: terminal → soft-disable in place (`disabled=true` + reason).
+  - Soft holds (free-usage-exhausted / prefer_buffer) never terminal.
+  - `--move-dead` required to shutil.move into cpa_auths_dead/ (manual only).
+  - `--refresh-all` required to touch non-disabled files (dangerous).
 
 Usage:
   python scripts/hard_purge_pool.py
-  python scripts/hard_purge_pool.py --scope buffer --max 400 --workers 12
-  python scripts/hard_purge_pool.py --scope all
+  python scripts/hard_purge_pool.py --scope buffer --max 400 --workers 8
+  python scripts/hard_purge_pool.py --scope all --move-dead   # explicit
 """
 from __future__ import annotations
 
@@ -49,6 +52,8 @@ TERMINAL_REASONS = frozenset(
         "bad_json",
         "terminal_disabled",
         "invalid_grant",
+        "permission-denied",
+        "permission_denied",
     }
 )
 
@@ -83,9 +88,17 @@ def _quota_reason(d: dict[str, Any]) -> str:
 def classify_disabled(d: dict[str, Any]) -> str:
     """hold_quota | terminal | probe (disabled+RT but no terminal/hold reason)."""
     reason = _quota_reason(d)
-    if reason in HOLD_REASONS or "exhausted" in reason.lower():
+    rl = reason.lower()
+    if reason in HOLD_REASONS or "exhausted" in rl:
         return "hold_quota"
-    if reason in TERMINAL_REASONS or "revok" in reason.lower():
+    # domain_dead:* / permission-denied / revoked — never recover by refresh
+    if (
+        reason in TERMINAL_REASONS
+        or "revok" in rl
+        or "domain_dead" in rl
+        or "permission" in rl
+        or "invalid_grant" in rl
+    ):
         return "terminal"
     if d.get("refresh_token"):
         # Unknown disable — must probe RT before keeping forever as hold
@@ -93,7 +106,13 @@ def classify_disabled(d: dict[str, Any]) -> str:
     return "terminal"
 
 
-def select_files(scope: str, cfg: dict[str, Any], max_files: int) -> list[Path]:
+def select_files(
+    scope: str,
+    cfg: dict[str, Any],
+    max_files: int,
+    *,
+    dirty_only: bool = True,
+) -> list[Path]:
     files = sorted(LIVE.glob("xai-*.json"), key=lambda p: p.stat().st_mtime)
     if scope == "all":
         chosen = files
@@ -107,6 +126,19 @@ def select_files(scope: str, cfg: dict[str, Any], max_files: int) -> list[Path]:
                 chosen = [p for p in files if not is_own_path(p, cfg)]
         except Exception:
             chosen = files
+    if dirty_only:
+        # Default: only disabled / missing RT. Never mass-refresh healthy pool
+        # (full refresh storms cause rate-limit + false revoked + pool collapse).
+        dirty: list[Path] = []
+        for p in chosen:
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                dirty.append(p)
+                continue
+            if d.get("disabled") or not d.get("refresh_token"):
+                dirty.append(p)
+        chosen = dirty
     if max_files and max_files > 0:
         # Prefer older mtime first within cap (stale buffer first)
         chosen = chosen[: max_files]
@@ -155,6 +187,12 @@ def refresh_write(path: Path, d: dict[str, Any], opener) -> tuple[str, str]:
     except urllib.error.HTTPError as e:
         b = e.read().decode("utf-8", "ignore")
         if "revoked" in b or "invalid_grant" in b:
+            # Rotation-race guard: another refresher may have just rotated this
+            # RT. Re-read the file; if the on-disk RT changed, account is alive.
+            from cpa_xai.raceguard import rt_rotated_by_other
+
+            if rt_rotated_by_other(path, rt):
+                return "rotated_skip", ""
             try:
                 d["disabled"] = True
                 d["quota_state"] = {
@@ -214,22 +252,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--max", type=int, default=0, help="max files (0=all in scope)")
     ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument(
+        "--refresh-all",
+        action="store_true",
+        help="also refresh non-disabled files (dangerous; can mass-revoke under rate limit)",
+    )
+    ap.add_argument(
+        "--move-dead",
+        action="store_true",
+        help="physically move terminal files to cpa_auths_dead/ (OFF by default)",
+    )
     args = ap.parse_args(argv)
 
     cfg = load_cfg()
     scope = (args.scope or str(cfg.get("pool_hard_purge_scope") or "buffer")).strip().lower()
     if scope not in ("buffer", "own", "all"):
         scope = "buffer"
-    max_files = int(args.max or cfg.get("pool_hard_purge_max") or 0)
+    # argparse 0 is valid "unlimited"; do not use `or` (0 is falsy)
+    if args.max is not None and args.max > 0:
+        max_files = int(args.max)
+    else:
+        max_files = int(cfg.get("pool_hard_purge_max") or 0)
     workers = int(args.workers or cfg.get("pool_hard_purge_workers") or 12)
     workers = max(1, min(workers, 24))
+    dirty_only = not bool(args.refresh_all)
+    # Config can force move off even if CLI passes --move-dead? Prefer CLI OR config opt-in.
+    move_dead = bool(args.move_dead) or bool(cfg.get("pool_hard_purge_move_dead"))
 
     DEAD.mkdir(parents=True, exist_ok=True)
     proxy = load_proxy(cfg)
     opener = opener_for(proxy)
-    files = select_files(scope, cfg, max_files)
+    files = select_files(scope, cfg, max_files, dirty_only=dirty_only)
     print(
-        f"[*] hard_purge scope={scope} files={len(files)} workers={workers} proxy={proxy}",
+        f"[*] hard_purge scope={scope} dirty_only={dirty_only} move_dead={move_dead} "
+        f"files={len(files)} workers={workers} proxy={proxy}",
         flush=True,
     )
     if not files:
@@ -247,7 +303,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     stats: Counter = Counter()
-    move_names: list[str] = []
+    terminal_names: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(one, p, opener) for p in files]
         done = 0
@@ -256,23 +312,50 @@ def main(argv: list[str] | None = None) -> int:
             stats[st] += 1
             done += 1
             if st in ("revoked", "no_rt", "bad_json", "terminal_disabled"):
-                move_names.append(name)
+                terminal_names.append(name)
             if done % 100 == 0:
                 print(f"[*] progress {done}/{len(files)} stats={dict(stats)}", flush=True)
 
-    moved = 0
-    for name in move_names:
+    # Soft-disable terminal in place (always). Physical move only if move_dead.
+    soft_disabled = 0
+    for name in terminal_names:
         src = LIVE / name
         if not src.is_file():
             continue
-        dest = DEAD / name
-        if dest.exists():
-            dest = DEAD / f"{src.stem}.{int(time.time())}{src.suffix}"
         try:
-            shutil.move(str(src), str(dest))
-            moved += 1
+            d = json.loads(src.read_text(encoding="utf-8"))
+            d["disabled"] = True
+            qs = d.get("quota_state") if isinstance(d.get("quota_state"), dict) else {}
+            if not qs.get("reason"):
+                qs = {
+                    **qs,
+                    "reason": "terminal_disabled",
+                    "soft_purged_at": time.time(),
+                }
+            d["quota_state"] = qs
+            from pool_policy import atomic_write_json
+
+            atomic_write_json(src, d)
+            soft_disabled += 1
         except Exception:
             pass
+
+    moved = 0
+    if move_dead:
+        for name in terminal_names:
+            src = LIVE / name
+            if not src.is_file():
+                continue
+            dest = DEAD / name
+            if dest.exists():
+                dest = DEAD / f"{src.stem}.{int(time.time())}{src.suffix}"
+            try:
+                shutil.move(str(src), str(dest))
+                moved += 1
+            except Exception:
+                pass
+    else:
+        stats["soft_disable_only"] = soft_disabled
 
     try:
         from pool_policy import is_own_path
@@ -289,13 +372,16 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "stats": dict(stats),
         "moved_terminal": moved,
+        "soft_disabled": soft_disabled,
+        "move_dead": move_dead,
+        "dirty_only": dirty_only,
         "scope": scope,
         "files_scanned": len(files),
         "live_left": len(list(LIVE.glob("xai-*.json"))),
         "dead_total": len(list(DEAD.glob("xai-*.json"))),
         "live_own_enabled_est": live_own,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "policy": "hold free-usage; probe unknown disabled; default scope=buffer",
+        "policy": "dirty_only; soft-disable terminal; move only with --move-dead",
     }
     out = ROOT / "logs" / "_hard_purge_report.json"
     out.parent.mkdir(parents=True, exist_ok=True)
