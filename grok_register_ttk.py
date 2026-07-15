@@ -614,12 +614,61 @@ def force_rotate_egress_for_sso(log_fn=None) -> None:
             log_fn(f"[*] SSO超时换节点失败: {safe}")
 
 
+def _effective_ua() -> str:
+    """The UA actually sent to the browser (for honest metrics regression).
+
+    Only the UA pool (anti_detect_ua_pool) or an explicit custom UA
+    (browser_use_custom_ua) actually override the header. When both are off,
+    every account shares the browser's own Chromium default — recorded as a
+    constant marker since the exact string doesn't matter for correlation."""
+    try:
+        if bool(config.get("anti_detect_ua_pool", False)):
+            fp = _thread_fp[0]
+            if fp is not None and getattr(fp, "user_agent", ""):
+                return fp.user_agent
+        if bool(config.get("browser_use_custom_ua", False)):
+            return get_user_agent()
+        return "browser_default"
+    except Exception:
+        return ""
+
+
+def _fingerprint_axes() -> dict:
+    """Snapshot the current thread's fingerprint axes for metrics regression.
+
+    Lets us later regress batch refresh_revoked deaths onto concrete axes
+    (egress node, effective UA, viewport, timezone) instead of guessing.
+    Best-effort; never raises. viewport/tz are applied independently of the
+    UA pool, so they reflect what the browser actually used."""
+    try:
+        out = {
+            "ua_pool": bool(config.get("anti_detect_ua_pool", False)),
+            "fp_ua": _effective_ua(),
+        }
+        fp = _thread_fp[0]
+        if fp is not None:
+            if bool(config.get("anti_detect_viewport", True)):
+                out["fp_vp"] = getattr(fp, "window_size", "")
+            if bool(config.get("anti_detect_tz_locale", True)):
+                out["fp_tz"] = getattr(fp, "timezone", "")
+        return out
+    except Exception:
+        return {}
+
+
 def note_register_outcome(
-    ok: bool, exc: BaseException | None = None, log_fn=None
+    ok: bool, exc: BaseException | None = None, log_fn=None, clash_node=None, email=""
 ) -> None:
     """Metrics + SSO-timeout streak → optional forced egress rotate."""
     reason = "ok" if ok else classify_register_fail(exc)
-    record_reg_metric("success" if ok else "fail", reason=reason)
+    extra = _fingerprint_axes()
+    if clash_node:
+        extra["egress"] = str(clash_node)
+    if email:
+        # Join key: lets a later tool correlate cpa_auths_dead/*.json back to
+        # the egress node + fingerprint axes this account registered under.
+        extra["email"] = str(email)
+    record_reg_metric("success" if ok else "fail", reason=reason, **extra)
     if ok:
         config["_sso_timeout_streak"] = 0
         return
@@ -5302,11 +5351,11 @@ class GrokRegisterGUI:
                 log_fn, worker_id, local_success, clash_node
             )
             report_egress_result(True, egress)
-            note_register_outcome(True, log_fn=log_fn)
+            note_register_outcome(True, log_fn=log_fn, clash_node=clash_node)
             return result
         except Exception as exc:
             report_egress_result(False, egress)
-            note_register_outcome(False, exc, log_fn=log_fn)
+            note_register_outcome(False, exc, log_fn=log_fn, clash_node=clash_node)
             raise
     def _register_one_account_body(self, log_fn, worker_id=0, local_success=0, clash_node=None):
         email = ""
@@ -5544,11 +5593,17 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
             email_holder=email_holder,
         )
         report_egress_result(True, egress)
-        note_register_outcome(True, log_fn=log_fn)
+        note_register_outcome(
+            True, log_fn=log_fn, clash_node=clash_node,
+            email=str(email_holder.get("email") or ""),
+        )
         return result
     except Exception as exc:
         report_egress_result(False, egress)
-        note_register_outcome(False, exc, log_fn=log_fn)
+        note_register_outcome(
+            False, exc, log_fn=log_fn, clash_node=clash_node,
+            email=str(email_holder.get("email") or ""),
+        )
         try:
             import domain_health as _dh
 

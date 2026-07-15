@@ -21,6 +21,14 @@
    `recover_after`（默认 24h，`GROK_POOL_PERM_DENIED_RECOVER_HOURS` 可调）到期自动
    复测放回。别搬 dead、别为它刷 RT（刷新解不了 chat 面 gate）。
 
+5. **封禁是号龄驱动，别再折腾指纹。** 2026-07-16 号龄回归（`scripts/ban_regression.py`，
+   用 `accounts_*.txt` 时间戳 join 死号状态）：按**真实注册号龄** cohort，死亡率
+   `<6h 0% → 1-2d 91% → 2-3d 97%` 单调增长。域名/命名/UA/出口/刷新活跃度**都不是主轴**
+   （age≥1d 切片下所有域名一律 ~100% 死；活号中位刷新间隔比死号更长）。最简解释：
+   free/cli-chat-proxy 号有约 **24-48h 寿命上限**。所以：**把 free 号当 24-48h 耗材，
+   靠持续补号维持水位**；别为"降注册指纹/换 UA/换出口"烧成本（改不动主轴）；域名声誉
+   只是二阶（自有域比 hotmail 长寿约 50×，仍逃不过号龄）。想验证/复核跑 `ban_regression.py`。
+
 **任何 refresh 消费端，判死/禁用/搬号前必须调
 `cpa_xai.raceguard.rt_rotated_by_other(path, tried_rt)`。** 已接入 5 处，新增端照做。
 
@@ -29,6 +37,8 @@
 - `cpa_auths/`：活号（网关读取）。
 - `cpa_auths_dead/`：死号（不删，留审计；部分可能是假死，可按上面方法复核救回）。
 - own 自注册域：`baoxia.top`、`lima.cc.cd`、`zhuguang.ccwu.cc`、`zhuguang.de5.net`、`hotmail.com`。
+- 封禁归因工具：`python scripts/ban_regression.py`（只读；把死/活状态按号龄/域名/出口/UA 回归，
+  证实"号龄驱动"结论；出口/指纹轴随新号 metric 积累而完整——注册 metric 现记 email+egress+生效指纹）。
 
 ## 改动纪律
 

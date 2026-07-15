@@ -75,7 +75,7 @@ default_model = "local-cpa/grok-4.5"
 |----|------|
 | CPA 文件 | **~4.7k**（enabled ~4.36k + disabled ~328） |
 | 死号库 | **7009**（+3982 本轮清入，见 §4） |
-| 自有域存活 | **10.6%**（2786 死 / 329 活；hotmail 仅 3.3%）→ 按管道指纹批量封 |
+| 自有域存活 | 瞬时值随年龄构成漂移，**勿据此判域名优劣**（见 §4.4 号龄回归）|
 | prefer | `buffer_first` |
 | 域名健康 | 自有 CF 域 ok 率多在 **0.96+**；hotmail 略低 |
 
@@ -84,9 +84,15 @@ default_model = "local-cpa/grok-4.5"
 1. **清池**：3982 个 `refresh_revoked` 确证死号（抽样 8/8 RT 服务端 revoked）从 `cpa_auths` 搬入 `cpa_auths_dead`（累计 7009）；池扫描提速  
 2. **permission-denied 软禁用**：`cpa_xai/usage.py` 打标设 `recover_after=+24h`（env `GROK_POOL_PERM_DENIED_RECOVER_HOURS`），`reenable_recovered_accounts` 移出 terminal；`hard_purge_pool.py` 将其从 TERMINAL 挪到 HOLD（不白烧 RT 轮换）；存量旧文件已回填。**自愈实测 5/5 chat_ok 已放回**（24h 窗口）  
 3. **生日修复证伪**（linux.do 2564817/2579539 对 cli 面不成立）：9 号 API 设生日全仍 403；TOS 接受+浏览器过墙+网页端发对话成功 → cli-chat-proxy 仍 403。结论写入 `AGENTS.md` 判死铁律第 4 条  
-4. **封禁特征结论**：xAI 按注册管道指纹批量封（hotmail 死 97% 证非域名；binbim 同 tmp 命名 70% 活证非命名）  
+4. **封禁特征结论（2026-07-16 号龄回归，覆盖旧"按管道指纹"说）**：用 `accounts_*.txt` 文件名时间戳建立"email→真实注册时间"，join `cpa_auths(_dead)` 存活状态（`scripts/ban_regression.py`）。按**真实注册号龄**切 cohort：`<6h 0%死 / 6-12h 26% / 12-24h 42% / 1-2d 91% / 2-3d 97%`。死亡率随号龄单调增长，**号龄是主驱动**，非域名、非命名、非 UA/出口指纹。此前"hotmail≫自有域"是年龄构成差的假象（低死域名当时全是 0.1 天龄新号，未到死亡窗口；age≥1d 切片下所有域名一律 ~100% 死）。auth_kind/base_url 在幸存/死号间完全一致（均 oauth / cli-chat-proxy），排除该两轴。刷新活跃度也无关：活号 reg→last_refresh 中位 0.16d（放置），死号 1.13d（刷得更勤反而死）。**最简解释：xAI 对 free/cli-chat-proxy 号课约 24-48h 寿命上限。** 幸存者存在（>3d 仍 16% 活，自有域 baoxia 存活率约为 hotmail 的 50×）说明域名声誉有二阶效应，但一阶是号龄——UA/出口再怎么改都改不动主轴。**运维含义：把 free 号当 24-48h 耗材，按"持续补号维持水位"运营，别指望长寿；省流优先，不必为降指纹烧成本。**  
 5. 既有加固一并入库：chat 准入探针、`import_cpa_with_probe.py`、`pool_sample.py` / `quota_watch.py` / `mint.py` 系列、167/167 测试绿  
-6. 新脚本：`scripts/repair_birthday_403.py`（复测+放回）、`scripts/merge_clash_grok_nodes.py`（**已回滚勿用**，见下）  
+6. 新脚本：`scripts/ban_regression.py`（号龄/域名/出口/UA 死亡率回归，只读）、`scripts/repair_birthday_403.py`（复测+放回）、`scripts/merge_clash_grok_nodes.py`（**已回滚勿用**，见下）  
+7. 注册 metric 增字段：`record_reg_metric` 现记 `email + egress + 生效 UA/vp/tz`（`grok_register_ttk._fingerprint_axes/_effective_ua`），供 `ban_regression.py` 出口/指纹轴 join；历史行无 email，随新号积累。  
+
+**社区交叉核对（linux.do，均指向 free 号短寿 / cli 面 permission-denied，非本地可解）**：
+topic/2571307（free 号全死、cli 面 403）、2569557 / 2569716（403 permission-denied 根因未定）、
+2579539（permission-denied 非测活口径）、2578155（500 号约 150 个 403）、2578879（100+ 临时邮箱号全 403）、
+2519580（"存活 3 月"注册机——实为 grok2api web 面，非 build 直 auth，勿混淆）。
 
 **⚠ clash/verge 勿碰**：本轮试合并节点进 mihomo 被喝止，已回滚（`.bak_20260716` 恢复 + reload）。不要再动 clash 配置。
 
