@@ -43,6 +43,11 @@ HOLD_REASONS = frozenset(
         "rate_limited",
         "temporary",
         "prefer_buffer",
+        # soft hold: retried on a 24h window by usage.reenable_recovered_accounts;
+        # skip here so we don't burn an RT rotation on accounts whose chat gate
+        # has not lifted yet (refresh cannot clear a chat-side 403).
+        "permission-denied",
+        "permission_denied",
     }
 )
 TERMINAL_REASONS = frozenset(
@@ -52,8 +57,8 @@ TERMINAL_REASONS = frozenset(
         "bad_json",
         "terminal_disabled",
         "invalid_grant",
-        "permission-denied",
-        "permission_denied",
+        # permission-denied is NOT terminal: the new-account chat gate
+        # self-heals over days (verified 2026-07-16, see cpa_xai/usage.py).
     }
 )
 
@@ -91,12 +96,14 @@ def classify_disabled(d: dict[str, Any]) -> str:
     rl = reason.lower()
     if reason in HOLD_REASONS or "exhausted" in rl:
         return "hold_quota"
-    # domain_dead:* / permission-denied / revoked — never recover by refresh
+    # domain_dead:* / revoked — never recover by refresh.
+    # permission-denied deliberately excluded: soft-disabled, retried on a
+    # 24h window (self-heals); sending it through "probe" lets a successful
+    # RT refresh + re-enable pick it back up.
     if (
         reason in TERMINAL_REASONS
         or "revok" in rl
         or "domain_dead" in rl
-        or "permission" in rl
         or "invalid_grant" in rl
     ):
         return "terminal"

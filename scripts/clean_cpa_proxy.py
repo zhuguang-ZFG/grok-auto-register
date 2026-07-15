@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# 白名单端口：全局 proxy 7897 + per-auth 出口绑定 7911-7914
+ALLOW_PORTS = {"7897", "7911", "7912", "7913", "7914"}
 KEEP_PORT = "7897"
 
 
@@ -32,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     keep = str(args.keep)
+    allow = ALLOW_PORTS | {keep}
     checked = cleaned = 0
     for f in auth_dir.glob("xai-*.json"):
         checked += 1
@@ -44,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         for key in ("proxy", "proxy_url", "proxy-url"):
             if key in d:
                 val = str(d[key])
-                if keep not in val:
+                if not any(p in val for p in allow):
                     if not args.dry_run:
                         del d[key]
                         tmp = f.with_suffix(f.suffix + ".tmp")
@@ -56,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         if changed:
             cleaned += 1
     mode = "DRY-RUN" if args.dry_run else "CLEANED"
-    print(f"[clean-proxy] {mode}: checked={checked} cleaned={cleaned} keep_port={keep}")
+    print(f"[clean-proxy] {mode}: checked={checked} cleaned={cleaned} allow_ports={sorted(ALLOW_PORTS)}")
     return 0
 
 

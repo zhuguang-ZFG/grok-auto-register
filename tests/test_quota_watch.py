@@ -12,10 +12,27 @@ from quota_watch import (
     flatten_log_line,
     line_matches,
     mark_exhausted_from_hits,
+    sample_ratio,
+    select_own_pool,
 )
 
 
 class QuotaWatchMatchTests(unittest.TestCase):
+    def test_select_own_pool_returns_domains_in_policy_branch(self):
+        paths = [Path("xai-a@own.test.json"), Path("xai-b@other.test.json")]
+        with mock.patch("pool_policy.own_domains", return_value=["own.test"]), mock.patch(
+            "pool_policy.is_own_path", side_effect=lambda p, _cfg: "@own.test" in p.name
+        ):
+            selected, domains = select_own_pool(paths, {})
+        self.assertEqual(selected, [paths[0]])
+        self.assertEqual(domains, ["own.test"])
+
+    def test_zero_live_sample_ratio_stays_zero(self):
+        self.assertEqual(sample_ratio({"sampled": 10, "ratio": 0.0}), 0.0)
+
+    def test_empty_sample_ratio_defaults_to_one(self):
+        self.assertEqual(sample_ratio({"sampled": 0, "ratio": 0.0}), 1.0)
+
     def setUp(self):
         self.include = compile_patterns(DEFAULT_QUOTA_PATTERNS)
         self.exclude = compile_patterns(DEFAULT_EXCLUDE_PATTERNS)

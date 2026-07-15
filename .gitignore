@@ -100,3 +100,9 @@ _tools/authconv/
 # temp scratch scripts
 _tmp_*.ps1
 _tmp_*.py
+
+# quarantined community CPA dumps (thousands of account JSONs with tokens)
+cpa_auths_quarantine/
+
+# omk tooling internal state
+.omk/

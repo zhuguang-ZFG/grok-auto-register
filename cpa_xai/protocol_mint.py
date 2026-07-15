@@ -27,6 +27,10 @@ from .oauth_device import (
 )
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
 
+import hashlib
+import json
+from pathlib import Path
+
 LogFn = Callable[[str], None]
 
 VERIFY_URL = f"{ISSUER}/oauth2/device/verify"
@@ -35,6 +39,29 @@ APPROVE_URL = f"{ISSUER}/oauth2/device/approve"
 
 class ProtocolMintError(RuntimeError):
     """Protocol path failed; caller may fall back to browser mint."""
+
+
+
+def egress_bind_proxy(email: str, num_ports: int = 4, base_port: int = 7911) -> str | None:
+    """如果 config.json 启用了 cpa_egress_bind_enabled，返回按 email 哈希计算的 proxy URL。
+
+    哈希规则与 scripts/cpa_egress_bind.py 一致（sha1(email) % num_ports），
+    确保两边的端口分配相同。
+    返回格式：http://127.0.0.1:791X 或 None（未启用时）。
+    """
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not str(cfg.get("cpa_egress_bind_enabled", "")).lower() in ("true", "1", "yes"):
+            return None
+    except Exception:
+        return None
+    email = (email or "").strip()
+    if not email:
+        return None
+    h = int(hashlib.sha1(email.encode("utf-8")).hexdigest(), 16)
+    port = base_port + (h % max(num_ports, 1))
+    return f"http://127.0.0.1:{port}"
 
 
 def _noop_log(_: str) -> None:

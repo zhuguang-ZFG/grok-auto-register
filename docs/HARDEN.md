@@ -145,6 +145,30 @@ curl -s -m 10 -x http://127.0.0.1:7897 https://ifconfig.me  :: 出口 IP
 curl -s -m 10 -x http://127.0.0.1:7897 "https://cli-chat-proxy.grok.com/v1/models" -H "Authorization: Bearer <token>"
 ```
 
+### 7.4 账号哈希出口绑定（P1，默认关）
+
+**原理**：对每个 CPA 账号的 email 做 sha1 哈希，稳定映射到 7911-7914 四个 per-auth HTTP listener 端口。
+每个 listener 的 upstream proxy 固定到一个 Clash CDN 节点（`--emit-listeners` 打印 YAML 片段），
+确保同一账号的 refresh/chat 长期走同一出口 IP，避免多号滥用信号。
+
+**开关**：`config.json` 设置 `"cpa_egress_bind_enabled": true`（默认 false）。
+开启后 `protocol_mint.py` 在 mint 写 CPA JSON 时自动追加 `proxy` 字段。
+
+**回填命令**（批量修正已有 CPA 文件）：
+```bash
+python scripts/cpa_egress_bind.py --apply
+python scripts/cpa_egress_bind.py --emit-listeners  # 打印 YAML → 粘贴到 Clash Verge 自定义监听器
+```
+
+**节点死时**：CDN 节点不可达时，切掉节点后重跑 `--apply` 会重新哈希分配，
+端口绑定可能变化（同一账号可能映射到不同端口）。确认节点存活后重新 `--emit-listeners` 并粘贴。
+
+**版本漂移监控**：
+```bash
+python scripts/cpa_client_version_watch.py --quiet  # 每日一次，exit 0 一致，1 需升级
+```
+若在系统计划任务中每日调用 `pool_maintain.py`，可在其后追加此行（失败不阻断主流程）。
+
 ## 8. 相关文件
 
 - `cpa_xai/mint.py` / `authcode_mint.py` / `protocol_mint.py`

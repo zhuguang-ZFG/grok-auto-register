@@ -16,6 +16,54 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 
 
+def _probe_chat_payload(
+    payload: dict[str, Any],
+    *,
+    proxy: str | None,
+    timeout: float,
+) -> tuple[str, str]:
+    """Probe real chat capability; /models alone cannot detect permission-denied."""
+    import urllib.error
+    import urllib.request
+
+    from scripts.import_cpa_with_probe import DEFAULT_BASE, DEFAULT_HEADERS, classify_chat_result
+
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        return "unauthorized", "missing access_token"
+    headers = dict(DEFAULT_HEADERS)
+    if isinstance(payload.get("headers"), dict):
+        headers.update({str(k): str(v) for k, v in payload["headers"].items()})
+    headers.update({"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+    base = str(payload.get("base_url") or DEFAULT_BASE).rstrip("/")
+    body = json.dumps(
+        {
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "Reply OK."}],
+            "max_tokens": 4,
+        }
+    ).encode()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy}) if proxy else urllib.request.ProxyHandler({})
+    )
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code or 0)
+        raw = exc.read().decode("utf-8", "ignore")
+    except Exception as exc:
+        return "network_error", str(exc)[:160]
+    return classify_chat_result(status, raw), raw
+
+
 def _load_cfg(cfg: dict[str, Any] | None) -> dict[str, Any]:
     if cfg:
         return cfg
@@ -55,10 +103,12 @@ def sample_probe(
     sample_n: int = 3,
     proxy: str | None = None,
     timeout: float = 15.0,
+    quarantine: bool = False,
 ) -> dict[str, Any]:
-    """Probe up to sample_n random non-disabled CPA files via /models.
+    """Probe real chat capability and optionally isolate failed credentials.
 
-    Returns {sampled, live, dead, ratio, details[]}.
+    ``quarantine=True`` marks permission-denied permanently disabled and puts
+    quota-exhausted accounts on the recoverable rolling-window hold.
     """
     cfg = _load_cfg(cfg)
     sample_n = max(0, int(sample_n or 0))
@@ -74,38 +124,34 @@ def sample_probe(
             "ts": time.time(),
         }
     pick = files if len(files) <= sample_n else random.sample(files, sample_n)
-    base = str(cfg.get("cpa_base_url") or "https://cli-chat-proxy.grok.com/v1")
     if proxy is None:
         proxy = str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip() or None
-
-    try:
-        from pool_health import probe_access
-    except Exception:
-        # fallback import path
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "pool_health", ROOT / "pool_health.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(mod)
-        probe_access = mod.probe_access
 
     live = dead = 0
     details = []
     for p in pick:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-            token = str(data.get("access_token") or "").strip()
-            ok, reason = probe_access(token, base, proxy, timeout=timeout)
+            status, reason = _probe_chat_payload(data, proxy=proxy, timeout=timeout)
         except Exception as exc:
-            ok, reason = False, str(exc)[:120]
+            status, reason = "network_error", str(exc)[:120]
+        ok = status == "chat_ok"
         if ok:
             live += 1
         else:
             dead += 1
-        details.append({"file": p.name, "ok": ok, "reason": reason[:160]})
+            if quarantine:
+                if status == "permission_denied":
+                    from cpa_xai.usage import mark_account_permission_denied
+
+                    mark_account_permission_denied(p, error=reason)
+                elif status == "quota_exhausted":
+                    from cpa_xai.usage import mark_account_exhausted
+
+                    mark_account_exhausted(p, disable_for_proxy=True)
+        details.append(
+            {"file": p.name, "ok": ok, "status": status, "reason": reason[:160]}
+        )
 
     sampled = live + dead
     ratio = (live / sampled) if sampled else 1.0

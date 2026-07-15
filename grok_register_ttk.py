@@ -166,6 +166,10 @@ DEFAULT_CONFIG = {
     "sso_timeout_rotate_enabled": True,
     "sso_timeout_rotate_after": 2,
     "register_daily_success_cap": 0,
+    # A2A watchdog stability (register join + per-account + page load)
+    "join_timeout_sec": 1800,
+    "account_hard_timeout_sec": 600,
+    "page_load_timeout_sec": 30,
 }
 config = DEFAULT_CONFIG.copy()
 
@@ -1408,7 +1412,7 @@ def create_browser_options():
     不要默认 new_env / 强制 UA / 过多 flag，容易触发 Cloudflare「故障排除」。
     """
     options = ChromiumOptions()
-    options.set_timeouts(base=1)
+    options.set_timeouts(base=1, page_load=int(config.get("page_load_timeout_sec", 30) or 30))
     # 并发时为每个 worker 分配独立资料目录，避免 cookie/会话互相污染
     profile_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".browser_profiles")
     try:
@@ -2958,8 +2962,9 @@ def _enqueue_cpa_mint(email, password, sso, log_fn, page=None):
     return None
 
 
-def _join_threads_interruptible(threads, should_stop=None, timeout=None, poll=0.5):
-    """可被 stop/Ctrl+C 打断的线程等待，避免 join() 永久阻塞。"""
+def _join_threads_interruptible(threads, should_stop=None, timeout=None, poll=0.5, log_callback=None, stop_callback=None):
+    """可被 stop/Ctrl+C 打断的线程等待，避免 join() 永久阻塞。
+    超时后记录存活线程、触发停止、3s 宽限、强制杀浏览器进程后返回（绝不永久等）。"""
     threads = [t for t in (threads or []) if t is not None]
     if not threads:
         return
@@ -2973,6 +2978,57 @@ def _join_threads_interruptible(threads, should_stop=None, timeout=None, poll=0.
                     t.join(timeout=poll)
             return
         if deadline is not None and time.time() >= deadline:
+            # 超时: 记录存活 worker, 触发停止, 3s 宽限, 强制清理后 return
+            alive_names = [t.name for t in threads if t.is_alive()]
+            _msg = f"[!!!] join 超时 ({timeout}s)，以下 worker 仍未退出: {alive_names}"
+            if log_callback:
+                log_callback(_msg)
+            else:
+                print(_msg)
+            if stop_callback:
+                stop_callback()
+            grace_deadline = time.time() + 3
+            while any(t.is_alive() for t in threads) and time.time() < grace_deadline:
+                for t in threads:
+                    t.join(timeout=poll)
+            # 仍有 worker 存活时强制杀浏览器进程
+            still_alive = [t for t in threads if t.is_alive()]
+            if still_alive:
+                names = [t.name for t in still_alive]
+                _msg2 = f"[!!!] 强制清理以下 worker 的浏览器进程: {names}"
+                if log_callback:
+                    log_callback(_msg2)
+                else:
+                    print(_msg2)
+                if sys.platform == 'win32':
+                    try:
+                        import subprocess
+                        ps_cmd = (
+                            "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | "
+                            "Where-Object { $_.CommandLine -like '*.browser_profiles*' } | "
+                            "Select-Object -ExpandProperty ProcessId"
+                        )
+                        result = subprocess.run(
+                            ['powershell', '-NoProfile', '-Command', ps_cmd],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        pids = [int(pid.strip()) for pid in result.stdout.strip().splitlines()
+                                if pid.strip().isdigit()]
+                        if pids:
+                            for pid in pids:
+                                subprocess.run(
+                                    ['taskkill', '/F', '/PID', str(pid)],
+                                    capture_output=True, timeout=5
+                                )
+                        else:
+                            _msg3 = '[!!!] 未匹配到 .browser_profiles 相关的 chrome.exe 进程，跳过强杀'
+                            if log_callback:
+                                log_callback(_msg3)
+                            else:
+                                print(_msg3)
+                    except Exception as _e:
+                        if log_callback:
+                            log_callback(f"[!!!] 强杀浏览器进程异常: {_e}")
             return
         for t in threads:
             t.join(timeout=poll)
@@ -3240,10 +3296,27 @@ def prepare_clean_browser_session(log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     page = _get_page()
     browser = _get_browser()
-    if page is None or browser is None:
+    if browser is None:
+        # 浏览器不存在才启动；browser 活着但 page 丢失时只补 page，
+        # 不重启浏览器（否则旧 Chrome 进程被覆盖引用、永不释放——每号漏一个进程）。
         start_browser(log_callback=log_callback)
         page = _get_page()
         browser = _get_browser()
+    elif page is None:
+        try:
+            tabs = browser.get_tabs()
+            _set_page(tabs[-1] if tabs else browser.new_tab())
+            page = _get_page()
+        except Exception as _e:
+            if log_callback:
+                log_callback(f"[Debug] 补 page 失败，重启浏览器: {_e}")
+            try:
+                stop_browser()
+            except Exception:
+                pass
+            start_browser(log_callback=log_callback)
+            page = _get_page()
+            browser = _get_browser()
     try:
         if page is not None:
             try:
@@ -5144,8 +5217,10 @@ class GrokRegisterGUI:
         _join_threads_interruptible(
             threads,
             should_stop=self.should_stop,
-            timeout=None,
+            timeout=int(config.get("join_timeout_sec", 1800)),
             poll=0.5,
+            log_callback=self.log,
+            stop_callback=self.stop_registration,
         )
         if self.should_stop():
             _join_threads_interruptible(threads, should_stop=None, timeout=5, poll=0.5)
@@ -5239,7 +5314,11 @@ class GrokRegisterGUI:
         code = ""
         mail_ok = False
         max_mail_retry = 3
+        _acct_deadline = time.time() + int(config.get("account_hard_timeout_sec", 600))
         for mail_try in range(1, max_mail_retry + 1):
+            if time.time() > _acct_deadline:
+                log_fn(f"[!!!] 单号硬看门狗超时，跳过当前号")
+                raise Exception(f"单号处理超过 {int(config.get('account_hard_timeout_sec', 600))}s")
             log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
             open_signup_page(log_callback=log_fn, cancel_callback=self.should_stop)
             # Human-like pause between page open and email create
@@ -5282,6 +5361,9 @@ class GrokRegisterGUI:
             log_callback=log_fn, cancel_callback=self.should_stop
         )
         log_fn(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+        if time.time() > _acct_deadline:
+            log_fn(f"[!!!] 单号硬看门狗超时，跳过当前号（邮箱={email}）")
+            raise Exception(f"单号处理超过 {int(config.get('account_hard_timeout_sec', 600))}s")
         log_fn("[*] 5. 等待 sso cookie")
         sso = wait_for_sso_cookie(
             log_callback=log_fn, cancel_callback=self.should_stop
@@ -5489,7 +5571,11 @@ def _register_one_account_cli_body(
     max_mail_retry = 3
     if email_holder is None:
         email_holder = {"email": ""}
+    _acct_deadline = time.time() + int(config.get("account_hard_timeout_sec", 600))
     for mail_try in range(1, max_mail_retry + 1):
+        if time.time() > _acct_deadline:
+            log_fn(f"[!!!] 单号硬看门狗超时，跳过当前号")
+            raise Exception(f"单号处理超过 {int(config.get('account_hard_timeout_sec', 600))}s")
         log_fn(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
         open_signup_page(log_callback=log_fn, cancel_callback=stop_fn)
         # Human-like pause between page open and email create
@@ -5533,6 +5619,9 @@ def _register_one_account_cli_body(
         log_callback=log_fn, cancel_callback=stop_fn
     )
     log_fn(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+    if time.time() > _acct_deadline:
+        log_fn(f"[!!!] 单号硬看门狗超时，跳过当前号（邮箱={email_holder.get('email','') or email}）")
+        raise Exception(f"单号处理超过 {int(config.get('account_hard_timeout_sec', 600))}s")
     log_fn("[*] 5. 等待 sso cookie")
     sso = wait_for_sso_cookie(
         log_callback=log_fn, cancel_callback=stop_fn
@@ -5691,8 +5780,10 @@ def run_registration_cli(count):
             _join_threads_interruptible(
                 threads,
                 should_stop=controller.should_stop,
-                timeout=None,
+                timeout=int(config.get("join_timeout_sec", 1800)),
                 poll=0.5,
+                log_callback=cli_log,
+                stop_callback=controller.stop,
             )
             if controller.should_stop():
                 cli_log("[!] 已请求停止，等待 worker 收尾...")

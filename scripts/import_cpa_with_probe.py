@@ -67,12 +67,95 @@ def proxy_of(cfg: dict[str, Any]) -> str | None:
     return str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip() or None
 
 
+def classify_chat_result(status: int, body: str) -> str:
+    """Classify a real chat probe for live-pool admission."""
+    blob = (body or "").lower()
+    if status == 200:
+        return "chat_ok"
+    if status == 403 and any(
+        marker in blob
+        for marker in (
+            "permission-denied",
+            "permission_denied",
+            "access to the chat endpoint is denied",
+            "update the permissions",
+        )
+    ):
+        return "permission_denied"
+    if status == 429 or "free-usage-exhausted" in blob or "usage-exhausted" in blob:
+        return "quota_exhausted"
+    if status == 401:
+        return "unauthorized"
+    return "http_error"
+
+
 def opener_for(proxy: str | None):
     if proxy:
         return urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
     return urllib.request.build_opener()
+
+
+def probe_chat(d: dict[str, Any], opener) -> tuple[str, str]:
+    """Probe the actual chat surface; models-list success is insufficient."""
+    token = str(d.get("access_token") or "").strip()
+    if not token:
+        return "unauthorized", "missing access_token"
+    base = str(d.get("base_url") or DEFAULT_BASE).rstrip("/")
+    headers = dict(DEFAULT_HEADERS)
+    if isinstance(d.get("headers"), dict):
+        headers.update({str(k): str(v) for k, v in d["headers"].items()})
+    headers.update({
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    })
+    payload = json.dumps(
+        {
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "Reply OK."}],
+            "max_tokens": 4,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            status = int(getattr(resp, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code or 0)
+        body = exc.read().decode("utf-8", "ignore")
+    except Exception as exc:
+        return "network_error", str(exc)[:300]
+    return classify_chat_result(status, body), body
+
+
+def admit_candidate(
+    candidate: dict[str, Any],
+    opener,
+    *,
+    chat_probe=probe_chat,
+    refresher=None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Admit only chat-capable accounts; refresh RT solely after AT 401."""
+    status, _body = chat_probe(candidate, opener)
+    if status == "chat_ok":
+        return status, candidate
+    if status != "unauthorized":
+        return status, None
+    refresh_fn = refresher or refresh_one
+    refresh_status, refreshed = refresh_fn(candidate, opener)
+    if refresh_status != "ok" or refreshed is None:
+        return f"refresh_{refresh_status}", None
+    status, _body = chat_probe(refreshed, opener)
+    if status == "chat_ok":
+        return status, refreshed
+    return status, None
 
 
 def parse_line(line: str) -> dict[str, Any] | None:
@@ -270,11 +353,11 @@ def main(argv: list[str] | None = None) -> int:
     stats = Counter()
     refreshed_map: dict[str, dict[str, Any]] = {}
     for d in sample:
-        st, nd = refresh_one(d, opener)
+        st, nd = admit_candidate(d, opener)
         stats[st] += 1
-        if st == "ok" and nd is not None:
+        if st == "chat_ok" and nd is not None:
             refreshed_map[email_of(nd) or str(nd.get("sub"))] = nd
-    ok = int(stats.get("ok") or 0)
+    ok = int(stats.get("chat_ok") or 0)
     rate = ok / sample_n if sample_n else 0.0
     print(
         f"[*] sample n={sample_n} stats={dict(stats)} ok_rate={rate:.1%} "
@@ -304,37 +387,39 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[*] dry-run would import via {mode}; candidates={len(cands)}")
         return 0
 
-    # Full refresh: only RT-ok accounts enter live (default).
+    # Full admission: only accounts that pass the real chat endpoint enter live.
+    # AT is tested first; RT is consumed only after a 401, then chat is rechecked.
     full_stats: Counter = Counter()
     to_write: list[dict[str, Any]] = []
     if args.refresh_all:
         import concurrent.futures
 
         workers = max(1, min(int(args.workers or 8), 16))
-        print(f"[*] refresh-all candidates={len(cands)} workers={workers}", flush=True)
+        print(f"[*] chat-admission candidates={len(cands)} workers={workers}", flush=True)
 
         def _job(d0: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
             key0 = email_of(d0) or str(d0.get("sub") or "")
             if key0 in refreshed_map:
-                return "ok", refreshed_map[key0]
-            return refresh_one(d0, opener)
+                return "chat_ok", refreshed_map[key0]
+            return admit_candidate(d0, opener)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = list(ex.map(_job, cands))
         for st, nd in futs:
             full_stats[st] += 1
-            if st == "ok" and nd is not None:
+            if st == "chat_ok" and nd is not None:
                 to_write.append(normalize(nd, cfg))
-        print(f"[*] refresh-all stats={dict(full_stats)} survivors={len(to_write)}", flush=True)
+        print(f"[*] admission stats={dict(full_stats)} survivors={len(to_write)}", flush=True)
     else:
         for d in cands:
-            em = email_of(d)
-            key = em or str(d.get("sub") or "")
+            key = email_of(d) or str(d.get("sub") or "")
             if key in refreshed_map:
-                to_write.append(normalize(refreshed_map[key], cfg))
+                st, nd = "chat_ok", refreshed_map[key]
             else:
-                to_write.append(normalize(d, cfg))
-        full_stats["legacy_unprobed"] = len(to_write) - len(refreshed_map)
+                st, nd = admit_candidate(d, opener)
+            full_stats[st] += 1
+            if st == "chat_ok" and nd is not None:
+                to_write.append(normalize(nd, cfg))
 
     auth_dir.mkdir(parents=True, exist_ok=True)
     imported = skipped_dup = 0

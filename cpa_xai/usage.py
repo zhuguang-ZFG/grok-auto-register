@@ -44,6 +44,19 @@ def _recover_window_sec() -> float:
 
 RESET_WINDOW_SEC = 6 * 3600  # default recovery window (see _recover_window_sec)
 
+
+# permission-denied (new-account chat gate) retry window. Measured self-heal
+# is on the order of 1-2 days; retry after 24h. Override via env
+# GROK_POOL_PERM_DENIED_RECOVER_HOURS (float).
+def _perm_denied_recover_sec() -> float:
+    try:
+        h = float(os.environ.get("GROK_POOL_PERM_DENIED_RECOVER_HOURS", "") or 0)
+        if h > 0:
+            return h * 3600.0
+    except Exception:
+        pass
+    return 24 * 3600.0
+
 LogFn = Callable[[str], None]
 
 
@@ -131,8 +144,12 @@ def mark_account_permission_denied(
 
     Mint can succeed (token + models list OK) while chat is denied. Leaving such
     files enabled makes CLIProxy rotate onto dead-chat credentials and slow every
-    request. Unlike quota exhaustion this is treated as terminal-ish for free
-    chat access until re-minted (no auto recover_after).
+    request. xAI gates new/cold accounts on the cli-chat-proxy surface for a
+    while; ~18% of denied accounts self-heal within ~1-2 days (measured
+    2026-07-15/16: 13/73 flipped to chat_ok with zero action, while setting
+    birthDate / accepting ToS / completing a web chat did NOT clear it). So
+    this is a soft-disable: re-try after a recovery window instead of treating
+    the account as terminal.
     """
     if not cpa_file.is_file():
         return
@@ -142,9 +159,14 @@ def mark_account_permission_denied(
             return
         qs = data.setdefault("quota_state", {})
         qs["reason"] = "permission-denied"
-        qs["exhausted_at"] = time.time()
-        # No recover_after: need re-mint / reauth, not time wait
-        qs.pop("recover_after", None)
+        now = time.time()
+        if not qs.get("exhausted_at"):
+            qs["exhausted_at"] = now
+        # Soft-disable: xAI's new-account chat gate lifts by itself over time.
+        # Keep the original window so repeated marks cannot push it out forever.
+        prev_recover = parse_recover_after(qs.get("recover_after"))
+        if not (prev_recover and prev_recover > now):
+            qs["recover_after"] = now + _perm_denied_recover_sec()
         if error:
             qs["last_error"] = str(error)[:300]
         data["disabled"] = True
@@ -268,13 +290,15 @@ def reenable_recovered_accounts(
 
     Returns counts for logging. Safe to call frequently.
     Never re-enables terminal dead reasons (revoked RT / missing RT / bad json).
+    permission-denied is NOT terminal: the new-account chat gate self-heals
+    over time, so it is re-enabled once its recover_after window expires; if
+    the gate is still up, the next chat use simply re-marks it.
     """
     stats = {"scanned": 0, "reenabled": 0, "still_exhausted": 0, "skipped_terminal": 0}
     _TERMINAL = frozenset({
         "refresh_revoked",
         "missing_refresh_token",
         "bad_json",
-        "permission-denied",  # chat endpoint denied — needs re-mint, not time wait
     })
     if not auth_dir.is_dir():
         return stats

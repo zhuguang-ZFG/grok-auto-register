@@ -445,6 +445,13 @@ def probe_token(cfg: dict[str, Any], access_token: str) -> dict[str, Any]:
     return result
 
 
+def sample_ratio(sample: dict[str, Any] | None) -> float:
+    """Return measured ratio; default to 1 only when no sample exists."""
+    if not sample or int(sample.get("sampled") or 0) <= 0:
+        return 1.0
+    return max(0.0, min(1.0, float(sample.get("ratio", 0.0))))
+
+
 def pool_token_is_expired(payload: dict[str, Any]) -> bool:
     """读 CPA 文件 access_token 的 JWT exp，过期返回 True。
 
@@ -1120,6 +1127,33 @@ def ensure_local_auth_flag(cfg_path: Path) -> None:
         atomic_write_json(cfg_path, data)
 
 
+def select_own_pool(paths: list[Path], cfg: dict[str, Any]) -> tuple[list[Path], list[str]]:
+    """Select own-domain credentials and always return the resolved domain list."""
+    try:
+        from pool_policy import is_own_path, own_domains as own_domains_fn
+
+        domains = list(own_domains_fn(cfg) or [])
+        return ([p for p in paths if is_own_path(p, cfg)] if domains else paths), domains
+    except Exception:
+        domains = [
+            d.strip()
+            for d in str(cfg.get("defaultDomains") or "").split(",")
+            if d.strip()
+        ]
+        if not domains:
+            return paths, domains
+        from pool_policy import domain_matches
+
+        def is_own(path: Path) -> bool:
+            name = path.name.lower()
+            if "@" not in name:
+                return False
+            domain = name.rsplit("@", 1)[-1].removesuffix(".json")
+            return any(domain_matches(domain, d.lower()) for d in domains)
+
+        return [p for p in paths if is_own(p)], domains
+
+
 def topup_pool(
     cfg: dict[str, Any],
     state: WatchState,
@@ -1138,29 +1172,7 @@ def topup_pool(
     target_pool = int(cfg.get("quota_watch_target_pool") or max(min_pool, 20))
     # 水位只看自有域名（defaultDomains），打野凭证不计入补池判断
     pool = list_cpa_pool(cfg)
-    try:
-        from pool_policy import is_own_path, own_domains as _own_doms_fn
-
-        _owns = _own_doms_fn(cfg)
-        if _owns:
-            own_pool = [p for p in pool if is_own_path(p, cfg)]
-        else:
-            own_pool = pool
-    except Exception:
-        own_domains = [d.strip() for d in str(cfg.get("defaultDomains") or "").split(",") if d.strip()]
-        if own_domains:
-            from pool_policy import domain_matches
-
-            def _path_own(path):
-                name = path.name.lower()
-                if "@" not in name:
-                    return False
-                dom = name.rsplit("@", 1)[-1].removesuffix(".json")
-                return any(domain_matches(dom, d.lower()) for d in own_domains)
-
-            own_pool = [p for p in pool if _path_own(p)]
-        else:
-            own_pool = pool
+    own_pool, own_domains = select_own_pool(pool, cfg)
     def _is_usable(path: Path) -> bool:
         payload = load_json(path)
         if payload.get("disabled"):
@@ -1818,9 +1830,11 @@ def once(
                     sample_n=sample_n,
                     proxy=str(cfg.get("cpa_proxy") or cfg.get("proxy") or "").strip()
                     or None,
+                    timeout=float(cfg.get("quota_watch_sample_probe_timeout_sec") or 12),
+                    quarantine=True,
                 )
                 state.last_sample_probe_at = now
-                state.last_sample_live_ratio = float(sample_info.get("ratio") or 1.0)
+                state.last_sample_live_ratio = sample_ratio(sample_info)
                 _log(
                     log,
                     f"[quota] sample probe live={sample_info.get('live')}/"

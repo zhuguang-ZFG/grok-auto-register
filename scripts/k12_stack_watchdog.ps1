@@ -32,7 +32,11 @@ $LockFile = Join-Path $LogDir "k12_stack_watchdog.lock"
 $GatewayDir = Join-Path $ProjectDir "chatgpt2api"
 $DbUrl = "sqlite:///" + ((Join-Path $ProjectDir "chatgpt2api/data/accounts.db") -replace "\\", "/")
 $Python = (Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-if (-not $Python) { $Python = "python" }
+if ($Python) {
+    # 无窗口：优先 pythonw.exe（GUI 子系统，不分配控制台）
+    $pyw = $Python -replace 'python\.exe$', 'pythonw.exe'
+    if (($pyw -ne $Python) -and (Test-Path $pyw)) { $Python = $pyw }
+} else { $Python = "pythonw" }
 
 function Write-Log([string]$msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -110,6 +114,18 @@ function Start-Gateway {
     $env:STORAGE_BACKEND = "sqlite"
     $env:DATABASE_URL = $DbUrl
     $env:CHATGPT2API_AUTH_KEY = $AuthKey
+
+    # 无窗口优先：venv pythonw -m uvicorn（GUI 子系统，绝无控制台窗口）
+    $venvPyw = Join-Path $GatewayDir ".venv\Scripts\pythonw.exe"
+    if (Test-Path $venvPyw) {
+        $proc = Start-Process -FilePath $venvPyw `
+            -ArgumentList @("-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8124", "--log-level", "warning", "--timeout-keep-alive", "30", "--limit-concurrency", "10") `
+            -WorkingDirectory $GatewayDir `
+            -WindowStyle Hidden `
+            -PassThru
+        Write-Log "gateway start via venv pythonw pid=$($proc.Id)"
+        return
+    }
 
     $uv = Get-Command uv -ErrorAction SilentlyContinue
     if ($uv) {

@@ -22,6 +22,7 @@ from .protocol_mint import (
     _is_transient_tls_error,
     extract_sso_from_cookies,
     mint_with_sso_protocol,
+    egress_bind_proxy,
 )
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
 from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth
@@ -299,6 +300,11 @@ def mint_and_export(
         base_url=base_url,
         headers=headers,
     )
+    # cpa_egress_bind：如启用则按 email 哈希写 per-auth proxy 字段
+    egress_proxy = egress_bind_proxy(email)
+    if egress_proxy:
+        payload["proxy"] = egress_proxy
+
     path = write_cpa_xai_auth(auth_dir, payload)
     log(f"wrote {path}")
 

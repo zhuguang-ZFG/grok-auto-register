@@ -14,6 +14,12 @@
    AT 能用 = 号现在能用。用 `cpa_xai.probe.probe_models(at, base_url=...)`。
 3. **AT 探测 URL 别拼错。** `base_url` 已含 `/v1`，正确地址
    `https://cli-chat-proxy.grok.com/v1/models`；别再拼出 `/v1/v1`。
+4. **`permission-denied`(403) ≠ 号死，也 ≠ 缺生日。** 2026-07-16 实测（73 个禁号）：
+   13 个零操作自愈；而 设 birthDate API、网页端过 TOS 墙、网页端成功发出一条对话，
+   都不能立刻解除 cli-chat-proxy 面的 403（10/10 仍 403）。社区「设置生日即恢复」
+   的帖子对 cli 面**不成立**（网页面能聊 ≠ cli 面放行）。正确处理：软禁用 +
+   `recover_after`（默认 24h，`GROK_POOL_PERM_DENIED_RECOVER_HOURS` 可调）到期自动
+   复测放回。别搬 dead、别为它刷 RT（刷新解不了 chat 面 gate）。
 
 **任何 refresh 消费端，判死/禁用/搬号前必须调
 `cpa_xai.raceguard.rt_rotated_by_other(path, tried_rt)`。** 已接入 5 处，新增端照做。

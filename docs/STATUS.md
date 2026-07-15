@@ -1,6 +1,6 @@
 # 运行状态快照
 
-> 记录时间：2026-07-15（墙钟；**Grok 维持档 + K12 全禁 + 路由切离**）  
+> 记录时间：2026-07-16（墙钟；**Grok 维持档 + K12 全禁 + 清池收口**）  
 > 仓库：`zhuguang-ZFG/grok-auto-register`  
 > 不含密钥 / 号池 JSON / 订阅 token / `mail_credentials` / Hotmail 号池正文。
 
@@ -8,7 +8,7 @@
 
 | 线 | 状态 |
 |----|------|
-| **Grok CPA 主粮** | 正常；注册机维持补号；近数小时 metrics 成功率 **~75%–80%** |
+| **Grok CPA 主粮** | 正常；注册机维持补号；网关 8317 实测 ~8s 出 token |
 | **K12 共享池** | **全 disabled**（`fc4f8db5`）；勿作默认；禁止 pre_slim 灌回 |
 | **默认路由** | Kimi → `local-cpa/grok-4.5`；Codex → `mycodex`（非 k12-local） |
 
@@ -73,17 +73,22 @@ default_model = "local-cpa/grok-4.5"
 
 | 项 | 约值 |
 |----|------|
-| CPA 文件 | ~6.3k–6.4k |
-| 自有域 | **≥ own_register_target（2000+）** |
+| CPA 文件 | **~4.7k**（enabled ~4.36k + disabled ~328） |
+| 死号库 | **7009**（+3982 本轮清入，见 §4） |
+| 自有域存活 | **10.6%**（2786 死 / 329 活；hotmail 仅 3.3%）→ 按管道指纹批量封 |
 | prefer | `buffer_first` |
 | 域名健康 | 自有 CF 域 ok 率多在 **0.96+**；hotmail 略低 |
 
 ## 4. 本阶段入库改动（相对上一推送）
 
-1. **`apply_bandwidth_saver`**：`block_media_fonts` 真正接线（CDP blocked_urls）；默认建议 **false**  
-2. 注册维持：count/日 cap/关 NSFW/关坏邮箱 mix/关 mint chat probe  
-3. **K12 refill**：死 workspace 过滤；全 disabled skip probe/refill；maintain 无头  
-4. 文档：`HARDEN` / `COMMUNITY_THICKEN` / `TURNSTILE` / 本文件  
+1. **清池**：3982 个 `refresh_revoked` 确证死号（抽样 8/8 RT 服务端 revoked）从 `cpa_auths` 搬入 `cpa_auths_dead`（累计 7009）；池扫描提速  
+2. **permission-denied 软禁用**：`cpa_xai/usage.py` 打标设 `recover_after=+24h`（env `GROK_POOL_PERM_DENIED_RECOVER_HOURS`），`reenable_recovered_accounts` 移出 terminal；`hard_purge_pool.py` 将其从 TERMINAL 挪到 HOLD（不白烧 RT 轮换）；存量旧文件已回填。**自愈实测 5/5 chat_ok 已放回**（24h 窗口）  
+3. **生日修复证伪**（linux.do 2564817/2579539 对 cli 面不成立）：9 号 API 设生日全仍 403；TOS 接受+浏览器过墙+网页端发对话成功 → cli-chat-proxy 仍 403。结论写入 `AGENTS.md` 判死铁律第 4 条  
+4. **封禁特征结论**：xAI 按注册管道指纹批量封（hotmail 死 97% 证非域名；binbim 同 tmp 命名 70% 活证非命名）  
+5. 既有加固一并入库：chat 准入探针、`import_cpa_with_probe.py`、`pool_sample.py` / `quota_watch.py` / `mint.py` 系列、167/167 测试绿  
+6. 新脚本：`scripts/repair_birthday_403.py`（复测+放回）、`scripts/merge_clash_grok_nodes.py`（**已回滚勿用**，见下）  
+
+**⚠ clash/verge 勿碰**：本轮试合并节点进 mihomo 被喝止，已回滚（`.bak_20260716` 恢复 + reload）。不要再动 clash 配置。
 
 **不入库（本机 only）**
 
@@ -114,4 +119,4 @@ python scripts\cc_switch_codex_provider.py switch mycodex-1782970213160
 
 ## 7. 不提交内容
 
-`config.json`、`cpa_auths/`、`chatgpt2api/`（含 `data/accounts.db` 与本机协议补丁）、`chatgpt_auths/`、`data/hotmail_pool*.txt`、`mail_credentials.txt`、`token.json`、`vip0_mail.local.json`、`logs/`、`screenshots/`、代理明文、导入包、`_import_*` / `_community_ref/`、本机 Kimi/cc-switch 配置与 DB。
+`config.json`、`cpa_auths/`、`cpa_auths_quarantine/`、`chatgpt2api/`（含 `data/accounts.db` 与本机协议补丁）、`chatgpt_auths/`、`data/hotmail_pool*.txt`、`mail_credentials.txt`、`token.json`、`vip0_mail.local.json`、`logs/`、`screenshots/`、代理明文、导入包、`_import_*` / `_community_ref/`、`.omk/`、本机 Kimi/cc-switch 配置与 DB。
