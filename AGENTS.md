@@ -40,6 +40,29 @@
 - 封禁归因工具：`python scripts/ban_regression.py`（只读；把死/活状态按号龄/域名/出口/UA 回归，
   证实"号龄驱动"结论；出口/指纹轴随新号 metric 积累而完整——注册 metric 现记 email+egress+生效指纹）。
 
+## 统一网关四池（CLIProxy，2026-07-16 落地）
+
+客户端**只认一个 endpoint/池**，CLIProxy 内同 alias 多上游 hop。端口硬分离：
+
+| 端口 | 池 | config | 客户端入口 |
+|------|-----|--------|-----------|
+| 8317 | Grok | `D:/cli-proxy-api/config.yaml` | Kimi `local-cpa/grok-4.5` |
+| 8327 | Codex | `config-codex.yaml` | cc-switch `codex-unified` |
+| 8337 | Claude | `config-claude.yaml` | cc-switch `claude-unified` |
+| 8347 | GLM | `config-glm.yaml` | Kimi `glm-unified/glm-*` |
+
+要点：
+
+- **本地弹药 ≠ 远端渠道**：Grok 本地在 `cpa_auths/`；Codex 本地在 chatgpt2api `:8124`（OAuth 号池，选号 tier 优先 plus/go/team+RT，k12 无 RT 快照末位）；远端 `sk-` 只走 `openai-compatibility` / `claude-api-key`，**不进** OAuth 库。
+- **坏站要摘**：chat 硬失败（401/403/404）→ `disabled: true`；额度/限流或仅 `remote-*` 的 ≥15s 慢源 → **临时 disabled + recover_after**（默认 6h）；主路径 200 响应 ≥8000ms 连续 2 次则只把每个主 alias 改名为 `remote-*`，源保持启用。纯网络 0/5xx 不摘。工具：`scripts/disable_bad_upstreams.py --auto`（日检 + 小时任务 `GrokHourlyRemoteProbe`）。细则见 `docs/DAILY_POOL_HEALTH.md`。
+- **会话亲和**：Grok / GLM `session-affinity-ttl: "1h"`；Codex / Claude 保持 `"4h"`。
+- **探测口径**：`probe_three_pools.py` 只验证本地聚合端口 alive；Claude `:8337` chat 非 200 标 `[CLOAK]`，是上游 kiro/any 反代的客户端门/Cloudflare 抖动，不视为本地池 down。上游质量由 `disable_bad_upstreams.py` 单独监控。
+- **默停对策**：四池都开 `streaming.keepalive-seconds: 15` + `bootstrap-retries: 2`。
+- **GLM 不冒充 Opus**：Claude 池里 GLM 只露 `glm-*` alias。
+- **fleet 常驻**：`scripts/cliproxy_fleet_watchdog.ps1`（按 config 名分实例，登录自启）；**禁止**旧单实例 `cliproxy_mem_watchdog.ps1`（脚本已 no-op；任务 `CLIProxyMemWatchdog` 若仍 Ready 需管理员 Disable）。心跳：`GrokOpsHeartbeat` → `ops_heartbeat.py --write logs/heartbeat.json`。
+- **改 gateway 代码必重启**：`python scripts/restart_chatgpt2api.py`；**改号池状态走 API**（`scripts/k12_prioritize_rt.py`），禁止直写 `accounts.db`（会被 flush 覆盖）。
+- 密钥只在 `D:/cli-proxy-api/config-*.yaml` 和 `config.json`（gitignore）；文档：`docs/REMOTE_POOL_SUPPLEMENT.md`、`CODEX_UNIFIED_POOL.md`、`CLAUDE_UNIFIED_POOL.md`、`DAILY_POOL_HEALTH.md`。
+
 ## 改动纪律
 
 - 改完 `.py` 跑 `python -m py_compile <files>` 验证。

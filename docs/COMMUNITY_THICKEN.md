@@ -82,6 +82,13 @@ python scripts/hotmail_cpa_health.py
 
 | 单实例 watchdog + 日志轮转 | `scripts/k12_stack_watchdog.ps1`；`k12_pool_*` lock + log rotate；`chatgpt2api_watchdog.ps1` 启网关带 `STORAGE_BACKEND=sqlite` |
 | Codex 本地 K12 | `scripts/codex_k12.ps1` / `.sh`（清 muyuan env 再起） |
+| Codex 本地+远端同 alias 混池 | `docs/CODEX_UNIFIED_POOL.md` + CLIProxy `:8327` + `codex-unified` |
+| Claude Code 多反代同池 hop | `docs/CLAUDE_UNIFIED_POOL.md` + CLIProxy `:8337` + `claude-unified` |
+| 三池日探活 + heartbeat 端口 | `scripts/probe_three_pools.py`；`ops_heartbeat.py` 查 8317/8327/8337 |
+| Codex 选号优先 RT+plus/go | `chatgpt2api` `get_text_access_token` tier（见 K12_GATEWAY_OPTIMIZATION） |
+| 坏上游自动摘除（防误杀） | `scripts/disable_bad_upstreams.py`：传输错误重试、0/429/5xx 软失败不摘、改后强制重载 |
+| 上游 UA 指纹限制 | 探测多 UA 后再定案（muyuan 只放行 `codex_cli_rs/*`） |
+| 号池状态改动走网关 API | `scripts/k12_prioritize_rt.py`（直写 sqlite 会被 flush 覆盖，已踩过） |
 | CPA 共享包熔断 | `import_cpa_with_probe`（本批 cpa-grok4.5-100 采样 0% 未入库） |
 | 失效剔除 | 网关 `auto_remove_invalid_accounts` + `k12_pool_ops purge-abnormal` |
 | 定时刷新 | `refresh_account_interval_minute`；有 RT 时 `k12_rt_import refresh-gateway` |

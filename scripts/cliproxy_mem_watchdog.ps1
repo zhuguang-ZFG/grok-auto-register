@@ -29,10 +29,21 @@ param(
     [switch]$Install
 )
 
-$ErrorActionPreference = "SilentlyContinue"
+# DEPRECATED 2026-07-17: single-instance killer (Get-ProxyProcess | Select-Object -First 1)
+# will randomly murder codex/claude/glm siblings. Fleet RSS/uptime is owned by
+# scripts/cliproxy_fleet_watchdog.ps1 (+ Startup CLIProxyFleetWatchdog.cmd).
+# Scheduled task CLIProxyMemWatchdog may still exist (needs admin to Disable);
+# this script is now a permanent no-op so a boot trigger cannot harm the fleet.
 $LogDir = "D:\cli-proxy-api\logs"
-$LogFile = Join-Path $LogDir "mem_watchdog.log"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$LogFile = Join-Path $LogDir "mem_watchdog.log"
+$ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+Add-Content -Path $LogFile -Value "[$ts] NO-OP: deprecated single-instance mem watchdog; use cliproxy_fleet_watchdog.ps1" -Encoding UTF8
+Write-Host "CLIProxyMemWatchdog is deprecated (fleet-unsafe). Use scripts/cliproxy_fleet_watchdog.ps1 instead."
+if ($Install) {
+    Write-Host "Refusing -Install: would re-register a fleet-unsafe task."
+}
+return
 
 function Write-Log([string]$msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"

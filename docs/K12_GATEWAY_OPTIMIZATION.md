@@ -36,6 +36,9 @@
 - 选号分两层：healthy（`text_fail < 3` 或失败不多于成功）→ degraded（失败较多但仍可选）。
 - 优先从 healthy 池 round-robin，degraded 池兜底。
 - `mark_text_fail()` 在空响应/超时/token 失效时记录。
+- **2026-07-16（社区/官方）**：healthy 内再按 tier 优先  
+  `0=plus/go/pro+RT → 1=any+RT → 2=other no-RT → 3=k12 snapshot no-RT`，  
+  避免无 RT 的 k12 快照占满 round-robin 导致 Codex 首跳 401。
 
 ### 4. 请求重试扩展 (`services/protocol/conversation.py`)
 

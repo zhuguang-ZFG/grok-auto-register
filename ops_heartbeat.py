@@ -155,6 +155,19 @@ def build_heartbeat(
                 return True
         return False
 
+    def _port_up(port: int, headers: dict[str, str]) -> bool:
+        """Best-effort local HTTP probe (no chat body — cheap liveness)."""
+        import urllib.error
+        import urllib.request
+
+        url = f"http://127.0.0.1:{port}/v1/models"
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return int(getattr(resp, "status", 0) or 0) == 200
+        except Exception:
+            return False
+
     procs = {
         "register": {
             "alive": _alive(proc_rows.get("register") or []),
@@ -168,6 +181,25 @@ def build_heartbeat(
             "alive": _alive(proc_rows.get("cliproxy") or []),
             "count": len(proc_rows.get("cliproxy") or []),
         },
+    }
+
+    # Unified pools (keys from config.json pool_keys, gitignored)
+    _keys = dict(cfg.get("pool_keys") or {}) if isinstance(cfg.get("pool_keys"), dict) else {}
+    k_grok = _keys.get("grok") or "sk-local-grok-pool-2026"
+    k_codex = _keys.get("codex") or "sk-local-codex-unified-2026"
+    k_claude = _keys.get("claude") or "sk-local-claude-unified-2026"
+    k_glm = _keys.get("glm") or "sk-local-glm-unified-2026"
+    ports = {
+        "grok_8317": _port_up(8317, {"Authorization": f"Bearer {k_grok}"}),
+        "codex_8327": _port_up(8327, {"Authorization": f"Bearer {k_codex}"}),
+        "claude_8337": _port_up(
+            8337,
+            {
+                "Authorization": f"Bearer {k_claude}",
+                "x-api-key": k_claude,
+            },
+        ),
+        "glm_8347": _port_up(8347, {"Authorization": f"Bearer {k_glm}"}),
     }
 
     cpa_raw = str(cfg.get("cpa_auth_dir") or "cpa_auths")
@@ -193,15 +225,46 @@ def build_heartbeat(
         alerts.append(f"pool_live_est={live} < min_live={min_live}")
         if level == "ok":
             level = "warn"
+    for port_name, up in ports.items():
+        if not up:
+            alerts.append(f"{port_name} /v1/models not 200")
+            if level == "ok":
+                level = "warn"
+
+    # Recent disable_bad_upstreams report (hard + temp-out charity sources)
+    disable_rep: dict[str, Any] = {}
+    rep_path = root / "logs" / "disable_bad_upstreams.json"
+    if rep_path.is_file():
+        try:
+            disable_rep = json.loads(rep_path.read_text(encoding="utf-8"))
+        except Exception:
+            disable_rep = {}
+    applied = list(disable_rep.get("applied") or [])
+    revived = list(disable_rep.get("revived") or [])
+    temp_ledger = disable_rep.get("temp_disable_ledger") or {}
+    if applied:
+        alerts.append(
+            "upstream_applied="
+            + ",".join(f"{a.get('pool')}/{a.get('name')}:{a.get('kind')}" for a in applied[:8])
+        )
+        if level == "ok":
+            level = "warn"
+    if isinstance(temp_ledger, dict) and temp_ledger:
+        alerts.append(f"temp_disabled_n={len(temp_ledger)}")
 
     return {
         "ok": level == "ok",
         "level": level,
         "procs": procs,
+        "ports": ports,
         "pool_live_est": live,
         "pool_total": total,
         "min_live": min_live,
         "alerts": alerts,
+        "upstream_applied": applied,
+        "upstream_revived": revived,
+        "temp_disabled": list(temp_ledger.keys()) if isinstance(temp_ledger, dict) else [],
+        "disable_report_ts": disable_rep.get("ts_iso"),
         "ts": time.time(),
         "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -236,10 +299,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.json or write_path:
         print(text)
     else:
+        ports = hb.get("ports") or {}
         print(
             f"[heartbeat] level={hb['level']} live={hb['pool_live_est']}/{hb['min_live']} "
             f"reg={hb['procs']['register']['alive']} qw={hb['procs']['quota_watch']['alive']} "
-            f"proxy={hb['procs']['cliproxy']['alive']}"
+            f"proxy={hb['procs']['cliproxy']['alive']} "
+            f"8317={ports.get('grok_8317')} 8327={ports.get('codex_8327')} "
+            f"8337={ports.get('claude_8337')} 8347={ports.get('glm_8347')}"
         )
         for a in hb.get("alerts") or []:
             print(f"  ! {a}")
