@@ -149,6 +149,10 @@ class ScoreBoard:
 
         return best_upstream
 
+    def upstreams(self) -> list[Upstream]:
+        """Return a snapshot of registered upstream definitions."""
+        return list(self._upstreams.values())
+
     def snapshot(self) -> dict[str, Any]:
         """Return a serializable view of the current board state."""
         out: dict[str, Any] = {}

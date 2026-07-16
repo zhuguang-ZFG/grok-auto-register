@@ -6,7 +6,7 @@ import contextlib
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 import yaml
@@ -239,7 +239,7 @@ class SmartRouter:
         This ensures the router can serve traffic before the first probe round
         completes, and gives exhausted scored-upstreams another chance.
         """
-        for upstream in self.board._upstreams.values():
+        for upstream in self.board.upstreams():
             if upstream.pool != pool:
                 continue
             if model_alias and model_alias not in upstream.aliases:
@@ -249,45 +249,61 @@ class SmartRouter:
             return upstream
         return None
 
-    async def _try_upstream(
-        self, request: Request, upstream: Upstream, body: bytes
-    ) -> httpx.Response:
-        url = _join_url(
-            upstream.base_url, request.url.path, request.url.query
-        )
+    def _upstream_headers(
+        self, request: Request, upstream: Upstream
+    ) -> dict[str, str]:
+        """Build headers for forwarding *request* to *upstream*.
+
+        Channel-level headers from the config are applied first so the
+        Bearer token derived from ``api-key-entries`` always wins.
+        """
         headers: dict[str, str] = {}
         for key, value in request.headers.items():
             if key.lower() == "host":
                 continue
             headers[key] = value
-        headers["Authorization"] = f"Bearer {upstream.api_key}"
         if upstream.headers:
             for key, value in upstream.headers.items():
                 headers[key] = value
+        headers["Authorization"] = f"Bearer {upstream.api_key}"
+        return headers
 
-        return await self.client.request(
-            request.method,
-            url,
-            headers=headers,
-            content=body,
-            timeout=30.0,
-        )
+    async def _build_response(
+        self, response: httpx.Response, stream_ctx: Any | None = None
+    ) -> Response:
+        """Convert an httpx response into a Starlette response.
 
-    def _build_response(self, response: httpx.Response) -> Response:
+        For SSE responses the underlying *stream_ctx* is kept open and
+        closed by the streaming iterator, yielding true pass-through.
+        For all other responses the body is buffered and the context is
+        closed before returning.
+        """
         headers = {
             k: v
             for k, v in response.headers.items()
             if k.lower() not in _HOP_BY_HOP_HEADERS
         }
         content_type = response.headers.get("content-type", "")
-        if "text/event-stream" in content_type:
+        if "text/event-stream" in content_type and stream_ctx is not None:
+            async def body_iterator() -> AsyncGenerator[bytes, None]:
+                try:
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                finally:
+                    with contextlib.suppress(Exception):
+                        await stream_ctx.__aexit__(None, None, None)
+
             return StreamingResponse(
-                response.aiter_bytes(),
+                body_iterator(),
                 status_code=response.status_code,
                 headers=headers,
             )
+
+        content = response.content
+        if stream_ctx is not None:
+            await stream_ctx.__aexit__(None, None, None)
         return Response(
-            content=response.content,
+            content=content,
             status_code=response.status_code,
             headers=headers,
         )
@@ -309,8 +325,20 @@ class SmartRouter:
                 break
             tried.add(upstream.name)
 
+            url = _join_url(
+                upstream.base_url, request.url.path, request.url.query
+            )
+            headers = self._upstream_headers(request, upstream)
+            stream_ctx = self.client.stream(
+                request.method,
+                url,
+                headers=headers,
+                content=body,
+                timeout=30.0,
+            )
+
             try:
-                response = await self._try_upstream(request, upstream, body)
+                response = await stream_ctx.__aenter__()
             except httpx.TimeoutException as exc:
                 last_error = exc
                 self._mark_failed(upstream, 0, "timeout")
@@ -326,18 +354,22 @@ class SmartRouter:
 
             if response.status_code == 429 or response.status_code >= 500:
                 last_response = response
+                last_error = None
                 self._mark_failed(upstream, response.status_code)
+                # Drain and close the response so we can retry or return it.
+                await response.aread()
+                await stream_ctx.__aexit__(None, None, None)
                 continue
 
             if response.status_code >= 400:
                 # 401/403/404 are hard-disable territory handled by
                 # disable_bad_upstreams.py; return them directly without retry.
-                return self._build_response(response)
+                return await self._build_response(response, stream_ctx)
 
-            return self._build_response(response)
+            return await self._build_response(response, stream_ctx)
 
         if last_response is not None:
-            return self._build_response(last_response)
+            return await self._build_response(last_response, None)
         if last_error is not None:
             return JSONResponse({"error": str(last_error)}, status_code=502)
         return JSONResponse({"error": "no upstream available"}, status_code=502)
