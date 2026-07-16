@@ -1,8 +1,11 @@
 """Health probe result tracking and scoring engine for the Smart Router."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
+
+import httpx
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,14 +128,18 @@ class ScoreBoard:
         return (success_rate * 1000.0) / max(ewma_value, 1.0)
 
     def best(self, pool: str, model_alias: str) -> Upstream | None:
-        """Pick the highest-score upstream for *pool* whose aliases include *model_alias*."""
+        """Pick the highest-score upstream for *pool* whose aliases include *model_alias*.
+
+        If *model_alias* is empty, the alias filter is skipped so callers such as the
+        router's ``/v1/models`` proxy can still obtain a viable upstream.
+        """
         best_upstream: Upstream | None = None
         best_score = 0.0
 
         for name, upstream in self._upstreams.items():
             if upstream.pool != pool:
                 continue
-            if model_alias not in upstream.aliases:
+            if model_alias and model_alias not in upstream.aliases:
                 continue
 
             s = self.score(name)
@@ -161,3 +168,41 @@ class ScoreBoard:
                 "last_seen": state["last_seen"],
             }
         return out
+
+
+async def async_probe(upstream: Upstream, client: httpx.AsyncClient) -> ProbeResult:
+    """Probe *upstream* via ``GET {base_url}/v1/models`` and return a ``ProbeResult``."""
+    base = upstream.base_url.rstrip("/")
+    url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+    headers: dict[str, str] = {}
+    if upstream.headers:
+        headers.update(upstream.headers)
+    headers["Authorization"] = f"Bearer {upstream.api_key}"
+
+    start = time.monotonic()
+    try:
+        response = await client.get(url, headers=headers, timeout=10.0)
+        latency_ms = (time.monotonic() - start) * 1000.0
+        healthy = 200 <= response.status_code < 300
+        return ProbeResult(
+            name=upstream.name,
+            pool=upstream.pool,
+            url=upstream.base_url,
+            healthy=healthy,
+            latency_ms=latency_ms,
+            status_code=response.status_code,
+            error="",
+            timestamp=time.time(),
+        )
+    except Exception as exc:  # pragma: no cover - network errors vary
+        latency_ms = (time.monotonic() - start) * 1000.0
+        return ProbeResult(
+            name=upstream.name,
+            pool=upstream.pool,
+            url=upstream.base_url,
+            healthy=False,
+            latency_ms=latency_ms,
+            status_code=0,
+            error=str(exc),
+            timestamp=time.time(),
+        )
