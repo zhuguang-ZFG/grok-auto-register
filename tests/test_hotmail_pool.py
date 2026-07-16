@@ -47,9 +47,63 @@ class ExtractCodeTests(unittest.TestCase):
     def test_xai_subject(self):
         self.assertEqual(hp._extract_code("", "ABC-123 xAI"), "ABC-123")
 
-    def test_digit_code(self):
+    def test_xai_confirmation_subject(self):
         self.assertEqual(
-            hp._extract_code("Your verification code: 482910", "Verify"),
+            hp._extract_code("", "DHB-Z5V xAI confirmation code"),
+            "DHB-Z5V",
+        )
+
+    def test_digit_code_requires_xai_brand(self):
+        # generic "Verify" alone must not yield a code (OpenAI-style false positive)
+        self.assertIsNone(
+            hp._extract_code("Your verification code: 482910", "Verify")
+        )
+        self.assertEqual(
+            hp._extract_code("Your verification code: 482910", "xAI verify"),
+            "482910",
+        )
+
+    def test_rejects_openai_sign_in_code(self):
+        # shared hotmail inbox often mixes OpenAI OTP; must not steal it
+        self.assertIsNone(
+            hp._extract_code(
+                "2BL-2BF is your code",
+                "New sign-in to your OpenAI account",
+                from_addr="noreply@openai.com",
+            )
+        )
+
+    def test_rejects_maxai_substring_brand(self):
+        # bare "xai" must not match inside "maxai"
+        self.assertFalse(
+            hp._looks_like_xai_mail(
+                "Welcome from maxai",
+                "your code is AB1-CD2 in body",
+                from_addr="hi@maxai.com",
+            )
+        )
+        self.assertIsNone(
+            hp._extract_code(
+                "your code is AB1-CD2 in body",
+                "Welcome from maxai",
+                from_addr="hi@maxai.com",
+            )
+        )
+
+    def test_accepts_xai_sender_domain(self):
+        self.assertTrue(
+            hp._looks_like_xai_mail(
+                "Confirm your email",
+                "Your verification code: 482910",
+                from_addr="noreply@x.ai",
+            )
+        )
+        self.assertEqual(
+            hp._extract_code(
+                "Your verification code: 482910",
+                "Confirm your email",
+                from_addr="noreply@x.ai",
+            ),
             "482910",
         )
 

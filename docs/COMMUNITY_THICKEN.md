@@ -113,7 +113,7 @@ python scripts/hotmail_cpa_health.py
 | `enable_nsfw` | **`false`** | grok.com `set_birth_date` 常被 CF 403，白耗流量；CPA 编码池不需要 |
 | `cpa_probe_after_write` / `cpa_probe_chat` | **`false`** | 铸造后 probe 易误杀 + 费额度 |
 | `email_mix_tempmail_lol` / `mailtm` / `yunmeng` | **关** | 站内大量「临时邮注册秒 403 / OTP 不到」；主用自有 CF 域 + 少量 hotmail |
-| `register_daily_success_cap` | `120` | 防尖刺 |
+| `register_daily_success_cap` | `60` | 防尖刺；2026-07-16 起按"低强度维持"下调（原 120） |
 
 - 注册机改代码后必须**重启 auto 进程**；仅改 `config.json` 部分路径会 `load_config`，仍建议重启一次。  
 - 若 CF/资料页成功率明显掉：先 `block_media_fonts: false` 对照，再考虑 `chromium_slim: false`。

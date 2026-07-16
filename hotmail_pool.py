@@ -350,19 +350,35 @@ _FALSE_CODE = {
 }
 
 
+# Word-boundary brand markers — bare "xai" must not match "maxai".
+_XAI_BRAND_RE = re.compile(
+    r"(?:\bx\.ai\b|\bxai\b|\bgrok\b|xai\s+confirmation|xai\s+verification)",
+    re.I,
+)
+_XAI_FROM_RE = re.compile(r"@(?:mail\.)?x\.ai\b", re.I)
+
+
 def _looks_like_xai_mail(subject: str, text: str, from_addr: str = "") -> bool:
-    blob = f"{subject}\n{from_addr}\n{text}".lower()
-    keys = (
-        "x.ai",
-        "xai",
-        "grok",
-        "verification code",
-        "verify your",
-        "confirm your email",
-        "your code is",
-        "security code",
+    """True only when the mail is clearly xAI/Grok — not OpenAI / generic OTP."""
+    blob = f"{subject}\n{from_addr}\n{text}"
+    blob_l = blob.lower()
+    # Shared hotmail inboxes often mix OpenAI/ChatGPT codes; reject hard.
+    reject = (
+        "openai",
+        "chatgpt",
+        "anthropic",
+        "claude",
+        "cursor.",
+        "github.com",
+        "microsoft account",
+        "outlook.com account",
     )
-    return any(k in blob for k in keys)
+    if any(k in blob_l for k in reject):
+        return False
+    # Brand / sender domain with boundaries — generic "verification code" alone is too wide.
+    if _XAI_FROM_RE.search(from_addr or ""):
+        return True
+    return bool(_XAI_BRAND_RE.search(blob))
 
 
 def _extract_code(text: str, subject: str = "", *, from_addr: str = "") -> str | None:
@@ -370,12 +386,12 @@ def _extract_code(text: str, subject: str = "", *, from_addr: str = "") -> str |
     subj = subject or ""
     body = text or ""
 
-    # Strong: "ABC-123 xAI" subject
-    m = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subj, re.I)
+    # Strong: "ABC-123 xAI" / "ABC-123 xAI confirmation code" subject
+    m = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI\b", subj, re.I)
     if m:
         return m.group(1).upper()
 
-    # Only scan XXX-XXX / digit codes on mails that look like xAI/verify
+    # Only scan XXX-XXX / digit codes on mails that look like xAI (brand required)
     if not _looks_like_xai_mail(subj, body, from_addr):
         return None
 

@@ -43,6 +43,17 @@ from typing import Callable
 
 from curl_cffi import requests
 
+# Windows default consoles are often GBK; emoji/CJK in logs must not abort the batch.
+def _harden_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+_harden_stdio()
+
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
 SCOPES = (
@@ -100,19 +111,36 @@ _progress_lock = threading.Lock()
 TASK_TIMEOUT = 120  # 单任务超时秒数（future.result）
 
 
+def _safe_write(text: str) -> None:
+    """Write to stdout; never raise UnicodeEncodeError on narrow consoles."""
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        data = text.encode(enc, errors="replace")
+        buf = getattr(sys.stdout, "buffer", None)
+        if buf is not None:
+            buf.write(data)
+            buf.flush()
+        else:
+            sys.stdout.write(data.decode(enc, errors="replace"))
+            sys.stdout.flush()
+
+
 def log_block(lines: list[str]) -> None:
     """整块输出一个任务的日志，避免并行交错。"""
     if not lines:
         return
     text = "\n".join(lines).rstrip() + "\n"
     with _print_lock:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        _safe_write(text)
 
 
 def log_line(msg: str) -> None:
+    """Print one line; never crash on Windows gbk consoles (emoji / CJK)."""
     with _print_lock:
-        print(msg, flush=True)
+        _safe_write(msg + ("\n" if not msg.endswith("\n") else ""))
 
 
 def progress_snapshot() -> str:
@@ -125,7 +153,8 @@ def progress_snapshot() -> str:
 
 
 def progress_print() -> None:
-    log_line(f"⏱  {progress_snapshot()}")
+    # ASCII marker — Windows gbk cannot encode ⏱ and used to abort the whole batch
+    log_line(f"[T] {progress_snapshot()}")
 
 
 def progress_start_one() -> None:
