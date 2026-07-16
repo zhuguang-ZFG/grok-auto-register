@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Keep Grok/Codex/Claude CLIProxy instances alive (port + config aware).
+  Keep Grok/Codex/Claude/GLM CLIProxy instances + Smart Router alive (port + config aware).
 
   Root cause of Codex :8327 "randomly dies":
     Started under agent shell / non-hidden console → process ends when session ends.
@@ -9,8 +9,9 @@
     which can take down sibling instances.
 
   This watchdog:
-    - Tracks three configs by CommandLine match
+    - Tracks four CLIProxy configs by CommandLine match
     - Health-checks HTTP ports independently
+    - Ensures the Smart Router on public port 8317 is running before CLIProxy
     - Restarts only the dead instance via hidden VBS
     - Optional RSS restart per-instance (does not kill siblings)
 
@@ -40,22 +41,22 @@ $Fleet = @(
     @{
         Name   = "grok"
         Config = "config.yaml"
-        Port   = 8317
-        Url    = "http://127.0.0.1:8317/v1/models"
+        Port   = 8318
+        Url    = "http://127.0.0.1:8318/v1/models"
         Header = @{ Authorization = "Bearer sk-local-grok-pool-2026" }
     },
     @{
         Name   = "codex"
         Config = "config-codex.yaml"
-        Port   = 8327
-        Url    = "http://127.0.0.1:8327/v1/models"
+        Port   = 8328
+        Url    = "http://127.0.0.1:8328/v1/models"
         Header = @{ Authorization = "Bearer sk-local-codex-unified-2026" }
     },
     @{
         Name   = "claude"
         Config = "config-claude.yaml"
-        Port   = 8337
-        Url    = "http://127.0.0.1:8337/v1/models"
+        Port   = 8338
+        Url    = "http://127.0.0.1:8338/v1/models"
         Header = @{
             Authorization = "Bearer sk-local-claude-unified-2026"
             "x-api-key"   = "sk-local-claude-unified-2026"
@@ -64,8 +65,8 @@ $Fleet = @(
     @{
         Name   = "glm"
         Config = "config-glm.yaml"
-        Port   = 8347
-        Url    = "http://127.0.0.1:8347/v1/models"
+        Port   = 8348
+        Url    = "http://127.0.0.1:8348/v1/models"
         Header = @{ Authorization = "Bearer sk-local-glm-unified-2026" }
     }
 )
@@ -101,6 +102,33 @@ function Test-Health($item) {
     } catch {
         return $false
     }
+}
+
+function Test-RouterHealth {
+    try {
+        $r = Invoke-WebRequest -Uri "http://127.0.0.1:8317/router/status" -TimeoutSec 5 -UseBasicParsing
+        return ($r.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Start-Router {
+    $RouterRoot = "D:\Users\grok-auto-register"
+    $py = Join-Path $RouterRoot "scripts\smart_router.py"
+    if (-not (Test-Path $py)) {
+        Write-Log "ERROR missing router script $py"
+        return
+    }
+    $vbs = Join-Path $RouterRoot "_start_router_hidden.vbs"
+    $vbsContent = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.CurrentDirectory = "$RouterRoot"
+WshShell.Run "python ""$py""", 0, False
+"@
+    Set-Content -Path $vbs -Value $vbsContent -Encoding ASCII
+    Start-Process -FilePath "wscript.exe" -ArgumentList @("`"$vbs`"") -WindowStyle Hidden
+    Start-Sleep -Seconds 5
 }
 
 function Start-Instance([string]$configName) {
@@ -165,6 +193,8 @@ function Ensure-Instance($item) {
 }
 
 function Show-Status {
+    $routerHealthy = Test-RouterHealth
+    Write-Host ("{0,-7} port={1} healthy={2}" -f "router", 8317, $routerHealthy)
     foreach ($item in $Fleet) {
         $proc = Get-InstanceProcess $item.Config
         $h = Test-Health $item
@@ -201,6 +231,7 @@ if ($Install) {
         $installed = $true
     }
     # also ensure once now
+    if (-not (Test-RouterHealth)) { Start-Router }
     foreach ($item in $Fleet) { [void](Ensure-Instance $item) }
     Show-Status
     return
@@ -213,16 +244,19 @@ if ($Status) {
 
 if ($Once) {
     Write-Log "fleet ensure once"
+    if (-not (Test-RouterHealth)) { Start-Router }
     foreach ($item in $Fleet) { [void](Ensure-Instance $item) }
     Show-Status
     return
 }
 
 Write-Log "fleet watchdog loop interval=${CheckIntervalSec}s maxRSS=${MaxRSSMB}MB"
+if (-not (Test-RouterHealth)) { Start-Router }
 foreach ($item in $Fleet) { [void](Ensure-Instance $item) }
 
 while ($true) {
     Start-Sleep -Seconds $CheckIntervalSec
+    if (-not (Test-RouterHealth)) { Start-Router }
     foreach ($item in $Fleet) {
         try {
             [void](Ensure-Instance $item)
