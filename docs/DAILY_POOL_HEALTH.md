@@ -76,14 +76,22 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
 - Claude `:8337` chat 非 200 时标记为 `[CLOAK]`：这是上游 kiro/any 反代对非 Claude Code 客户端的权限/上下文/Cloudflare 门，不是本地池 down。上游质量由 `disable_bad_upstreams.py` 单独监控。
 - `ops_heartbeat.py` 返回非零属正常告警语义（例如注册机未运行、`temp_disabled_n>0`）。
 
-## 当前状态（2026-07-17 06:50Z 加固：--auto + Claude 重配 + 代理落盘）
+## 当前状态（2026-07-17 16:50Z 加固：Codex + 火山 coding plan 兜底）
 
 | 池 | 端口 | 状态 |
 |--|--|--|
 | Grok | 8317 | OK models+chat 200（硬摘 chuanapi 后已重拉） |
-| Codex | 8327 | OK models+chat 200 |
+| Codex | 8327 | OK models+chat+responses 200（新增火山双 key 兜底） |
 | Claude | 8337 | OK models+chat 200 |
 | GLM | 8347 | OK models+chat 200 |
+
+- **Codex :8327 503 恢复（16:50Z）**
+  - 根因：local-k12 / muyuan / apinebula / zmoon2 全部进入 auth unavailable / cooldown，无可用上游。
+  - 修复：在 `D:/cli-proxy-api/config-codex.yaml` 新增 `volc1` / `volc2` 两个火山 coding plan 源：
+    - `deepseek-v4-pro-260425` → `gpt-5.6`
+    - `deepseek-v4-flash-260425` → `gpt-5.5`
+    - `doubao-seed-2-0-code-preview-260215` → `gpt-5.6-sol`
+  - 已重启 Codex CLIProxy；`:8327` `/v1/models` 10 models，`/v1/chat/completions` 与 `/v1/responses` 双 200。
 
 - **本轮 `--auto`（06:43Z）**
   - **硬摘**：`grok/chuanapi`（401 Invalid token）
