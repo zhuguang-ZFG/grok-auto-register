@@ -62,12 +62,14 @@ def parse_expired(value: str) -> datetime | None:
         return None
 
 
-def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: float = 20.0) -> tuple[bool, str]:
+def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: float = 20.0) -> tuple[bool, int, str]:
     """轻量探测：对 cli-chat-proxy 发一条极短 models/list 或 chat 预检。
 
     优先 GET {base}/models；失败再记原因。不在这里打真实对话，避免耗额度。
     Prefer curl_cffi Chrome TLS when available (mint path fingerprint); fall back
     to stdlib urllib so health checks still work without the optional dep.
+
+    Returns: (ok, status_code, reason). status_code is 0 for network/non-HTTP errors.
     """
     base = (base_url or "https://cli-chat-proxy.grok.com/v1").rstrip("/")
     url = base + "/models"
@@ -97,12 +99,12 @@ def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: f
             code = int(getattr(resp, "status_code", 0) or 0)
             body = (getattr(resp, "text", None) or "")[:300]
             if 200 <= code < 300:
-                return True, f"HTTP {code}"
+                return True, code, f"HTTP {code}"
             if code == 429:
-                return True, f"HTTP 429 rate-limited (alive): {body[:80]}"
+                return True, code, f"HTTP 429 rate-limited (alive): {body[:80]}"
             # Auth/client errors from curl_cffi are definitive — no urllib retry.
             if code in (401, 403, 400):
-                return False, f"HTTP {code}: {body[:160]}"
+                return False, code, f"HTTP {code}: {body[:160]}"
             # Soft/network-ish status: fall through to urllib once.
             cffi_err = f"HTTP {code}: {body[:80]}"
         except Exception as e:  # noqa: BLE001
@@ -120,17 +122,17 @@ def probe_access(access_token: str, base_url: str, proxy: str | None, timeout: f
             code = int(getattr(resp, "status", 200) or 200)
             body = resp.read(300).decode("utf-8", errors="replace")
             if 200 <= code < 300:
-                return True, f"HTTP {code}"
-            return False, f"HTTP {code}: {body[:120]}"
+                return True, code, f"HTTP {code}"
+            return False, code, f"HTTP {code}: {body[:120]}"
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         # 401/403 = 死号；429 = 活着但限流
         if e.code == 429:
-            return True, f"HTTP 429 rate-limited (alive): {body[:80]}"
-        return False, f"HTTP {e.code}: {body[:160]}"
+            return True, e.code, f"HTTP 429 rate-limited (alive): {body[:80]}"
+        return False, e.code, f"HTTP {e.code}: {body[:160]}"
     except Exception as e:
         note = f" (curl_cffi: {cffi_err})" if cffi_err else ""
-        return False, f"{type(e).__name__}: {e}{note}"
+        return False, 0, f"{type(e).__name__}: {e}{note}"
 
 
 def refresh_auth_file(path: Path, proxy: str | None) -> tuple[bool, str, dict | None]:
@@ -248,7 +250,7 @@ def soft_disable(path: Path, reason: str, *, hours: float = 24.0) -> None:
         data = {}
     data["disabled"] = True
     # Canonical recover_after is Unix epoch float (matches cpa_xai.usage / quota_watch).
-    # Do not write ISO strings — reenable used to float() them and ValueError.
+    # pool_health re-enable path also accepts ISO-8601 strings for compatibility.
     now = time.time()
     data["quota_state"] = {
         "reason": "probe_or_refresh_fail",
@@ -305,6 +307,33 @@ def quarantine(path: Path, dead_dir: Path, reason: str, *, hard: bool = False) -
         pass
 
 
+def _handle_probe_failure(
+    path: Path,
+    dead_dir: Path,
+    status: int,
+    reason: str,
+    email: str,
+    stats: dict[str, Any],
+    live: list[Path],
+) -> None:
+    """Classify a probe failure as hard (quarantine) or soft (keep live).
+
+    Hard: HTTP 401/403, or HTTP 400 with explicit invalid/expired message.
+    Soft: network errors, 5xx, and other transient failures — leave in pool.
+    """
+    low = reason.lower()
+    hard = status in (401, 403) or (
+        status == 400 and ("invalid" in low or "expired" in low)
+    )
+    if hard:
+        quarantine(path, dead_dir, reason)
+        stats["quarantined"] += 1
+        print(f"[!] probe HARD  {email}: {reason}")
+    else:
+        live.append(path)
+        print(f"[!] probe SOFT  {email}: {reason}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="号池健康检查 / 刷新 / CLI 同步")
     parser.add_argument("--refresh-all", action="store_true", help="不管是否临期都刷新")
@@ -323,10 +352,9 @@ def main() -> int:
     auth_dir = Path(str(cfg.get("cpa_auth_dir") or "./cpa_auths"))
     if not auth_dir.is_absolute():
         auth_dir = (ROOT / auth_dir).resolve()
-    # 正式项目死号目录
+    # 正式项目死号目录；始终落在 ROOT 下，避免落入 CLIProxy 监听的 auth_dir。
     dead_dir = ROOT / "cpa_auths_dead"
-    if not dead_dir.is_dir():
-        dead_dir = auth_dir / "dead"
+    dead_dir.mkdir(parents=True, exist_ok=True)
     # hotload 即 cpa_auths（CLIProxy auth-dir 同此）
     live_dir = Path(
         str(
@@ -365,6 +393,9 @@ def main() -> int:
         "probe_fail": 0,
         "quarantined": 0,
         "skipped": 0,
+        "skipped_disabled": 0,
+        "recovered": 0,
+        "skipped_rotated": 0,
     }
 
     for path in files:
@@ -394,14 +425,14 @@ def main() -> int:
                     due = True
             if not due:
                 stats["skipped"] += 1
-                stats["skipped_disabled"] = stats.get("skipped_disabled", 0) + 1
+                stats["skipped_disabled"] += 1
                 continue
             # recover_after due: clear soft flag and re-probe below (GrokPoolMaintain path)
             data["disabled"] = False
             qs = dict(qs)
             qs.pop("recover_after", None)
             data["quota_state"] = qs
-            stats["recovered"] = stats.get("recovered", 0) + 1
+            stats["recovered"] += 1
             try:
                 path.write_text(
                     json.dumps(data, ensure_ascii=False, indent=2) + "\n",
@@ -428,7 +459,7 @@ def main() -> int:
         probe_ok = False
         probe_reason = ""
         if do_probe and access and not args.refresh_all:
-            probe_ok, probe_reason = probe_access(access, base_url, proxy)
+            probe_ok, probe_status, probe_reason = probe_access(access, base_url, proxy)
             if probe_ok and not need_refresh:
                 stats["probe_ok"] += 1
                 stats["skipped"] += 1
@@ -451,20 +482,16 @@ def main() -> int:
                 access = str(data.get("access_token") or access)
                 time.sleep(random.uniform(0.05, 0.25))
                 if do_probe:
-                    probe_ok, probe_reason = probe_access(access, base_url, proxy)
+                    probe_ok, probe_status, probe_reason = probe_access(access, base_url, proxy)
                     if probe_ok:
                         stats["probe_ok"] += 1
                         print(f"[+] probe OK    {email}: {probe_reason}")
                         live.append(path)
                     else:
                         stats["probe_fail"] += 1
-                        print(f"[!] probe FAIL  {email}: {probe_reason}")
-                        low = probe_reason.lower()
-                        if "401" in low or "403" in low or "invalid" in low or "expired" in low:
-                            quarantine(path, dead_dir, probe_reason)
-                            stats["quarantined"] += 1
-                        else:
-                            live.append(path)
+                        _handle_probe_failure(
+                            path, dead_dir, probe_status, probe_reason, email, stats, live
+                        )
                 else:
                     live.append(path)
             else:
@@ -477,7 +504,7 @@ def main() -> int:
                 if "invalid_grant" in msg.lower() and rt_rotated_by_other(
                     path, str(data.get("refresh_token") or "")
                 ):
-                    stats["skipped_rotated"] = stats.get("skipped_rotated", 0) + 1
+                    stats["skipped_rotated"] += 1
                     live.append(path)
                     continue
                 quarantine(path, dead_dir, msg)
@@ -486,18 +513,15 @@ def main() -> int:
         else:
             stats["skipped"] += 1
             if do_probe and not probe_ok and access:
-                probe_ok, probe_reason = probe_access(access, base_url, proxy)
+                probe_ok, probe_status, probe_reason = probe_access(access, base_url, proxy)
                 if probe_ok:
                     stats["probe_ok"] += 1
                     live.append(path)
                 else:
                     stats["probe_fail"] += 1
-                    low = probe_reason.lower()
-                    if "401" in low or "403" in low or "invalid" in low or "expired" in low:
-                        quarantine(path, dead_dir, probe_reason)
-                        stats["quarantined"] += 1
-                    else:
-                        live.append(path)
+                    _handle_probe_failure(
+                        path, dead_dir, probe_status, probe_reason, email, stats, live
+                    )
             else:
                 live.append(path)
 
@@ -520,7 +544,8 @@ def main() -> int:
     print(
         f"[*] done total={stats['total']} live={len(live)} refreshed={stats['refreshed']} "
         f"refresh_fail={stats['refresh_fail']} quarantined={stats['quarantined']} "
-        f"need_refill={report['need_refill']}"
+        f"skipped_disabled={stats['skipped_disabled']} recovered={stats['recovered']} "
+        f"skipped_rotated={stats['skipped_rotated']} need_refill={report['need_refill']}"
     )
     if len(live) < min_live:
         return 2
