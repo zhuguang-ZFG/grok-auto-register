@@ -76,7 +76,7 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
 - Claude `:8337` chat 非 200 时标记为 `[CLOAK]`：这是上游 kiro/any 反代对非 Claude Code 客户端的权限/上下文/Cloudflare 门，不是本地池 down。上游质量由 `disable_bad_upstreams.py` 单独监控。
 - `ops_heartbeat.py` 返回非零属正常告警语义（例如注册机未运行、`temp_disabled_n>0`）。
 
-## 当前状态（2026-07-17 16:50Z 加固：Codex + 火山 coding plan 兜底）
+## 当前状态（2026-07-17 16:56Z 加固：Codex + 火山 coding plan 兜底 + 九幺正名）
 
 | 池 | 端口 | 状态 |
 |--|--|--|
@@ -92,6 +92,16 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
     - `deepseek-v4-flash-260425` → `gpt-5.5`
     - `doubao-seed-2-0-code-preview-260215` → `gpt-5.6-sol`
   - 已重启 Codex CLIProxy；`:8327` `/v1/models` 10 models，`/v1/chat/completions` 与 `/v1/responses` 双 200。
+
+- **九幺 `api.7r.fit` 正名与补配（16:56Z）**
+  - 用户确认 `https://api.7r.fit` 就是九幺的 base_url；之前配置里的 `7rfit` 已重命名为 `jiuyao`。
+  - Claude `:8337` 新增九幺第二个 key（`sk-8Yi28hbANE95UWVxvdwDxS2cwVifVKUiRhuNGZVaTCoZNBmU`），仅支持 `claude-opus-4-7`。
+  - GLM `:8347` 中 `remote-7rfit-glm-5.2` 已改为 `remote-jiuyao-glm-5.2`。
+  - **九幺 Grok**：两个 key 在 `/v1/models` 中均未发现 `grok-4.5` / `xai-grok-4.5`，因此**没有加入 Grok :8317 池**。若后续拿到九幺的 Grok 模型名/key，可再补。
+  - 已重启 Claude/GLM CLIProxy；`:8337` models=4、message 200；`:8347` models=17。
+
+- **火山第三个 key（volc3）**
+  - 用户新分享 `zZ5O3MQXaA30KSREDgUxy7aZwfE1H2nQTDwIpwBxvMGnClqk` 探活返回 401，已以 `disabled: true` 写入 `config-codex.yaml`，待确认是否过期或格式问题。
 
 - **本轮 `--auto`（06:43Z）**
   - **硬摘**：`grok/chuanapi`（401 Invalid token）
