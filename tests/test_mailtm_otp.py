@@ -26,6 +26,47 @@ class TokenHelpers(unittest.TestCase):
         self.assertFalse(mt.is_mailtm_token("{}"))
 
 
+class BasesTests(unittest.TestCase):
+    def test_primary_only(self):
+        cfg = {"mailtm_api_base": "https://api.mail.tm"}
+        self.assertEqual(mt._bases(cfg), ["https://api.mail.tm"])
+
+    def test_fallbacks_dedup(self):
+        cfg = {
+            "mailtm_api_base": "https://api.mail.tm",
+            "mailtm_fallback_bases": [
+                "https://api.mail.tm",
+                "https://api.mail.gw",
+                "https://api.duckmail.sbs",
+            ],
+        }
+        self.assertEqual(
+            mt._bases(cfg),
+            ["https://api.mail.tm", "https://api.mail.gw", "https://api.duckmail.sbs"],
+        )
+
+
+class PickDomainTests(unittest.TestCase):
+    def test_skips_banned_domains(self):
+        cfg = {
+            "mailtm_api_base": "https://api.mail.tm",
+            "mailtm_banned_domains": ["web-library.net"],
+        }
+        with mock.patch.object(
+            mt, "list_domains", return_value=["web-library.net", "safe.tm"]
+        ):
+            domain = mt._pick_domain(cfg)
+        self.assertEqual(domain, "safe.tm")
+
+    def test_skips_default_banned(self):
+        cfg = {"mailtm_api_base": "https://api.mail.tm"}
+        with mock.patch.object(
+            mt, "list_domains", return_value=["duckmail.sbs", "safe.tm"]
+        ):
+            domain = mt._pick_domain(cfg)
+        self.assertEqual(domain, "safe.tm")
+
+
 class CreateInboxTests(unittest.TestCase):
     def test_create_ok(self):
         cfg = {"mailtm_api_base": "https://api.mail.tm"}
@@ -37,11 +78,38 @@ class CreateInboxTests(unittest.TestCase):
             post=mock.Mock(side_effect=[acc, tok]),
         )
         with mock.patch.object(mt, "_session", return_value=sess):
-            with mock.patch.object(mt, "_pick_domain", return_value="web-library.net"):
+            with mock.patch.object(mt, "_pick_domain", return_value="safe.tm"):
                 email, blob = mt.create_inbox(cfg)
-        self.assertTrue(email.endswith("@web-library.net"))
+        self.assertTrue(email.endswith("@safe.tm"))
         self.assertTrue(mt.is_mailtm_token(blob))
         self.assertEqual(json.loads(blob)["jwt"], "JWT123")
+
+    def test_create_fallback_on_primary_failure(self):
+        cfg = {
+            "mailtm_api_base": "https://api.mail.tm",
+            "mailtm_fallback_bases": ["https://api.mail.gw"],
+        }
+
+        def pick_side_effect(ccfg):
+            base = ccfg.get("mailtm_api_base")
+            if base == "https://api.mail.tm":
+                raise RuntimeError("primary down")
+            return "gw-library.net"
+
+        acc = mock.Mock(status_code=201, text='{"id":"1"}')
+        acc.json.return_value = {"id": "1"}
+        tok = mock.Mock(status_code=200, text='{"token":"JWT456"}')
+        tok.json.return_value = {"token": "JWT456"}
+        sess = mock.Mock(post=mock.Mock(side_effect=[acc, tok]))
+
+        with mock.patch.object(mt, "_session", return_value=sess):
+            with mock.patch.object(mt, "_pick_domain", side_effect=pick_side_effect):
+                email, blob = mt.create_inbox(cfg)
+
+        self.assertTrue(email.endswith("@gw-library.net"))
+        data = json.loads(blob)
+        self.assertEqual(data["base"], "https://api.mail.gw")
+        self.assertEqual(data["jwt"], "JWT456")
 
 
 class WaitCodeTests(unittest.TestCase):

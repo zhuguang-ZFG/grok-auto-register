@@ -2,30 +2,27 @@
 # -*- coding: utf-8 -*-
 """CPA 号池保活 + 死号清理脚本。
 
-社区经验（linux.do 2579944 / 2569034 / 2579061）：
-Grok free 号注册后如果不使用，xAI 反滥用系统会在 30 分钟到数小时内封号。
-"用了就不会死，不用就死" —— 注册后立即使用过的号会进入"活跃"状态存活更久。
+社区经验（linux.do 2579944 / 2569034 / 2579061 + HARDEN 2026-07-18）：
+Grok free 号注册后如果不使用，xAI 反滥用系统可能在数小时内 gate。
+但 free 额度仅 ~2M tokens / 滚动 24h（topic/2562837），**全池 chat 保活会
+把号池额度扫光**——实测一轮 469 号 chat 是水位塌缩主因之一。
 
-此脚本做四件事：
-1. **续期**：access_token 过期或即将过期（< 30 min）时用 refresh_token 换新
-2. **保活**：发一个轻量 grok-4.5 chat 请求，让账号保持活跃
-3. **清理**：连续保活失败的号移到 cpa_auths_dead/（不删，留审计）
-4. **告警**：活号数低于阈值时输出 WARN 到日志
-
-策略：
-- 按 expired 时间升序排列（最先过期的优先处理）
-- access_token 过期 → 先 refresh，refresh 失败 → 标死
-- refresh 成功或 token 仍有效 → 发 keepalive chat
-- 保活失败连续 >= max_fail_streak → 移到 dead 目录
-- 多线程并发（默认 5 线程），大幅缩短一轮耗时
+默认策略（2026-07-18）：
+1. **续期**：access_token 临期用 refresh_token 换新（不烧 chat 额度）
+2. **保活**：默认 **models-only**（GET /v1/models）；``--chat`` 才发 responses
+3. **429/quota**：soft-disable + recover_after，**不**搬 dead
+4. **403 permission-denied**：soft-disable，不搬 dead
+5. **终端失败**（invalid_grant 且 raceguard 确认、连续 auth 失败）才搬 dead
+6. **告警**：活号低于阈值 WARN
 
 用法:
-    python scripts/cpa_keepalive.py                     # 跑一轮，默认 150 号
+    python scripts/cpa_keepalive.py                     # 一轮，默认 models 保活
+    python scripts/cpa_keepalive.py --chat --max 50     # 显式 chat（慎用）
     python scripts/cpa_keepalive.py --max 200 --workers 8
-    python scripts/cpa_keepalive.py --interval 3h       # 循环模式，每 3 小时一轮
-    python scripts/cpa_keepalive.py --dry-run           # 只探测不写文件
+    python scripts/cpa_keepalive.py --interval 3h
+    python scripts/cpa_keepalive.py --dry-run
     python scripts/cpa_keepalive.py --proxy http://127.0.0.1:7897
-    python scripts/cpa_keepalive.py --warn-below 200    # 活号 < 200 时告警
+    python scripts/cpa_keepalive.py --warn-below 200
 """
 from __future__ import annotations
 
@@ -175,29 +172,61 @@ def refresh_one(account: dict, proxy: str | None = None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def keepalive_one(account: dict, proxy: str | None = None) -> bool:
-    """发一个轻量 grok-4.5 请求保活。成功返回 True。"""
+def keepalive_one(account: dict, proxy: str | None = None, *, use_chat: bool = False) -> dict:
+    """Probe account. Default: GET /models (no free-quota burn).
+
+    Returns dict: ok, kind (ok|quota|permission|auth|error), status, error.
+    """
     opener = _build_opener(proxy)
-    url = f"{BASE_URL}/responses"
-    payload = json.dumps({
-        "model": "grok-4.5",
-        "stream": False,
-        "input": "Reply with exactly KEEPALIVE",
-        "reasoning": {"effort": "low"},
-    }).encode("utf-8")
     headers = {
         "Authorization": f"Bearer {account['token']}",
-        "Content-Type": "application/json",
         "Accept": "application/json",
         **DEFAULT_HEADERS,
     }
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    if use_chat:
+        url = f"{BASE_URL}/responses"
+        payload = json.dumps({
+            "model": "grok-4.5",
+            "stream": False,
+            "input": "Reply with exactly KEEPALIVE",
+            "reasoning": {"effort": "low"},
+        }).encode("utf-8")
+        headers = {
+            **headers,
+            "Content-Type": "application/json",
+        }
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    else:
+        url = f"{BASE_URL}/models"
+        req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with opener.open(req, timeout=KEEPALIVE_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-            return resp.status == 200 and bool(body)
-    except Exception:
-        return False
+            body = resp.read()
+            if resp.status == 200 and body:
+                return {"ok": True, "kind": "ok", "status": 200, "error": ""}
+            return {
+                "ok": False,
+                "kind": "error",
+                "status": getattr(resp, "status", 0),
+                "error": "empty body",
+            }
+    except urllib.error.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        el = err_body.lower()
+        kind = "error"
+        if e.code == 429 or "usage-exhausted" in el or "free-usage-exhausted" in el:
+            kind = "quota"
+        elif e.code == 403 and ("permission" in el or "denied" in el or "chat endpoint" in el):
+            kind = "permission"
+        elif e.code == 401:
+            kind = "auth"
+        return {"ok": False, "kind": kind, "status": e.code, "error": err_body}
+    except Exception as e:
+        return {"ok": False, "kind": "error", "status": 0, "error": str(e)}
 
 
 def move_to_dead(account: dict) -> None:
@@ -212,6 +241,30 @@ def move_to_dead(account: dict) -> None:
         pass
 
 
+def soft_disable_account(account: dict, reason: str) -> None:
+    """Soft-disable in place (CLIProxy skips; recover_after for reenable)."""
+    try:
+        from cpa_xai.usage import mark_account_exhausted, mark_account_permission_denied
+    except Exception:
+        mark_account_exhausted = None  # type: ignore
+        mark_account_permission_denied = None  # type: ignore
+    path = account["file"]
+    if reason in ("quota", "free-usage-exhausted", "quota_exhausted") and mark_account_exhausted:
+        mark_account_exhausted(path, log=None, disable_for_proxy=True)
+        return
+    if reason in ("permission", "permission-denied") and mark_account_permission_denied:
+        mark_account_permission_denied(path, error="keepalive permission-denied", log=None)
+        return
+    # fallback: write disabled flag
+    data = account.get("data") or {}
+    data["disabled"] = True
+    qs = data.setdefault("quota_state", {})
+    qs["reason"] = reason
+    qs["recover_after"] = time.time() + 6 * 3600
+    account["data"] = data
+    save_account(account)
+
+
 def save_account(account: dict) -> None:
     """线程安全地写回 account json。"""
     try:
@@ -224,7 +277,13 @@ def save_account(account: dict) -> None:
         pass
 
 
-def process_one(account: dict, proxy: str | None, dry_run: bool) -> str:
+def process_one(
+    account: dict,
+    proxy: str | None,
+    dry_run: bool,
+    *,
+    use_chat: bool = False,
+) -> str:
     """处理一个号：续期 → 保活。返回状态字符串。线程安全。"""
     now = _now()
     needs_refresh = (account["expired"] - now).total_seconds() < REFRESH_MARGIN_MINUTES * 60
@@ -267,25 +326,37 @@ def process_one(account: dict, proxy: str | None, dry_run: bool) -> str:
             save_account(account)
             return f"REFRESH_FAIL({r.get('status', '')})"
 
-    # Step 2: 保活
+    # Step 2: 保活（默认 models-only）
     if dry_run:
         return "SKIP_DRY"
 
-    ok = keepalive_one(account, proxy)
-    if ok:
+    result = keepalive_one(account, proxy, use_chat=use_chat)
+    if result.get("ok"):
         account["fail_streak"] = 0
         account["data"]["_keepalive_fail_streak"] = 0
         account["data"]["_last_keepalive"] = now.isoformat()
         save_account(account)
         return "OK"
-    else:
-        account["fail_streak"] += 1
-        account["data"]["_keepalive_fail_streak"] = account["fail_streak"]
-        save_account(account)
-        if account["fail_streak"] >= MAX_FAIL_STREAK:
-            move_to_dead(account)
-            return "DEAD_CHAT"
-        return f"CHAT_FAIL(streak={account['fail_streak']})"
+
+    kind = str(result.get("kind") or "error")
+    if kind == "quota":
+        if not dry_run:
+            soft_disable_account(account, "quota")
+        return "QUOTA_HOLD"
+    if kind == "permission":
+        if not dry_run:
+            soft_disable_account(account, "permission")
+        return "PERM_HOLD"
+
+    account["fail_streak"] += 1
+    account["data"]["_keepalive_fail_streak"] = account["fail_streak"]
+    save_account(account)
+    # Only hard-dead on repeated auth failures; network/server keep in pool
+    if kind == "auth" and account["fail_streak"] >= MAX_FAIL_STREAK:
+        move_to_dead(account)
+        return "DEAD_AUTH"
+    label = "CHAT_FAIL" if use_chat else "MODELS_FAIL"
+    return f"{label}(streak={account['fail_streak']})"
 
 
 def run_round(
@@ -294,6 +365,8 @@ def run_round(
     dry_run: bool,
     workers: int = 5,
     warn_below: int = WARN_BELOW_DEFAULT,
+    *,
+    use_chat: bool = False,
 ) -> dict:
     """跑一轮保活（多线程并发）。"""
     pool_total = count_pool()
@@ -315,7 +388,7 @@ def run_round(
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_acc = {
-            pool.submit(process_one, acc, proxy, dry_run): acc
+            pool.submit(process_one, acc, proxy, dry_run, use_chat=use_chat): acc
             for acc in accounts
         }
         for future in as_completed(future_to_acc):
@@ -331,6 +404,9 @@ def run_round(
                 stats["dead"] += 1
             elif "REFRESH_FAIL" in status:
                 stats["refresh_fail"] += 1
+            elif status in ("QUOTA_HOLD", "PERM_HOLD"):
+                stats.setdefault("soft_hold", 0)
+                stats["soft_hold"] = int(stats.get("soft_hold") or 0) + 1
             elif "FAIL" in status:
                 stats["fail"] += 1
 
@@ -348,8 +424,11 @@ def run_round(
 
     elapsed = time.time() - t0
     pool_after = count_pool()
-    log(f"\n[keepalive] round done in {elapsed:.0f}s: "
-        f"ok={stats['ok']} fail={stats['fail']} refresh_fail={stats['refresh_fail']} "
+    soft = int(stats.get("soft_hold") or 0)
+    mode = "chat" if use_chat else "models"
+    log(f"\n[keepalive] round done in {elapsed:.0f}s mode={mode}: "
+        f"ok={stats['ok']} fail={stats['fail']} soft_hold={soft} "
+        f"refresh_fail={stats['refresh_fail']} "
         f"dead={stats['dead']} total={stats['total']} "
         f"pool={pool_total}→{pool_after}")
 
@@ -368,6 +447,11 @@ def main() -> None:
     parser.add_argument("--interval", type=str, default=None,
                         help="循环模式间隔 (e.g. 3h, 30m)；不设则跑一轮退出")
     parser.add_argument("--dry-run", action="store_true", help="只探测不写文件、不发请求")
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="用 /responses chat 保活（烧 free 额度；默认仅 /models）",
+    )
     parser.add_argument("--warn-below", type=int, default=WARN_BELOW_DEFAULT,
                         help=f"活号低于此数告警 (default: {WARN_BELOW_DEFAULT})")
     args = parser.parse_args()
@@ -381,18 +465,30 @@ def main() -> None:
             sys.exit(1)
         seconds = val * {"h": 3600, "m": 60, "s": 1}.get(unit, 3600)
         log(f"[keepalive] loop mode: interval={seconds}s max={args.max} "
-            f"workers={args.workers} proxy={args.proxy or '(none)'}")
+            f"workers={args.workers} chat={args.chat} proxy={args.proxy or '(none)'}")
         while True:
             try:
-                run_round(args.max, args.proxy, args.dry_run,
-                          workers=args.workers, warn_below=args.warn_below)
+                run_round(
+                    args.max,
+                    args.proxy,
+                    args.dry_run,
+                    workers=args.workers,
+                    warn_below=args.warn_below,
+                    use_chat=bool(args.chat),
+                )
             except Exception as e:
                 log(f"[keepalive] round error: {e}")
             log(f"[keepalive] sleeping {seconds}s...")
             time.sleep(seconds)
     else:
-        run_round(args.max, args.proxy, args.dry_run,
-                  workers=args.workers, warn_below=args.warn_below)
+        run_round(
+            args.max,
+            args.proxy,
+            args.dry_run,
+            workers=args.workers,
+            warn_below=args.warn_below,
+            use_chat=bool(args.chat),
+        )
 
 
 if __name__ == "__main__":

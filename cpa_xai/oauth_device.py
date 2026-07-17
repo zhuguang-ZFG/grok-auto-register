@@ -307,6 +307,7 @@ def refresh_access_token(
     proxy: str | None = None,
     retries: int = 2,
     retry_sleep: float = 1.5,
+    use_rate_gate: bool = True,
 ) -> TokenResult:
     """用 grant_type=refresh_token 向 TOKEN_URL 换新 token。
 
@@ -314,13 +315,28 @@ def refresh_access_token(
     refresh_token 无效/过期（HTTP 400/401 且 invalid_grant）时抛
     OAuthDeviceError("refresh token invalid/expired")，由调用方决定是否换号。
     瞬时网络错误按 retries 重试。
+    use_rate_gate=True 时走进程级 GlobalRateLimitGate（429 单探针探活）。
     """
     refresh_token = (refresh_token or "").strip()
     if not refresh_token:
         raise OAuthDeviceError("refresh_access_token: empty refresh_token")
 
+    gate = None
+    if use_rate_gate:
+        try:
+            from .rate_limit_gate import default_gate, is_rate_limit_payload
+        except Exception:  # pragma: no cover
+            from cpa_xai.rate_limit_gate import default_gate, is_rate_limit_payload  # type: ignore
+        gate = default_gate()
+    else:
+        is_rate_limit_payload = None  # type: ignore
+
     last: BaseException | None = None
     for i in range(max(int(retries), 0) + 1):
+        probe_token = None
+        if gate is not None:
+            # Block while cooling; only one confirmation probe may proceed.
+            probe_token = gate.wait_for_permission()
         try:
             status, body = _post_form(
                 TOKEN_URL,
@@ -341,6 +357,8 @@ def refresh_access_token(
             continue
 
         if status == 200 and isinstance(body, dict) and body.get("access_token"):
+            if gate is not None and probe_token is not None:
+                gate.authorized(probe_token)
             access = str(body["access_token"]).strip()
             new_refresh = str(body.get("refresh_token") or refresh_token).strip()
             return TokenResult(
@@ -361,6 +379,14 @@ def refresh_access_token(
         if err == "invalid_grant" or (status in (400, 401) and err):
             raise OAuthDeviceError(
                 f"refresh token invalid/expired: {err}: {desc or body}"
+            )
+        if gate is not None and is_rate_limit_payload is not None and is_rate_limit_payload(status, body):
+            gate.rate_limited(probe_token)
+            if i < retries:
+                time.sleep(retry_sleep * (i + 1))
+                continue
+            raise OAuthDeviceError(
+                f"refresh token rate limited HTTP {status}: {err}: {desc or body!r}"
             )
         # transient 5xx / soft errors — retry if budget remains
         if i < retries and (status >= 500 or not isinstance(body, dict)):

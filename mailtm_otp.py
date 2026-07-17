@@ -35,6 +35,22 @@ from typing import Any, Callable
 DEFAULT_BASE = "https://api.mail.tm"
 PROVIDER = "mailtm"
 
+# Community-known domains that x.ai CreateEmailValidationCode rejects upfront.
+# Users can extend via config ``mailtm_banned_domains``.
+_DEFAULT_BANNED_DOMAINS = {
+    "duckmail.sbs",
+    "web-library.net",
+    "mail.tm",
+    "mail.gw",
+    "baldur.edu.kg",
+}
+
+
+def _banned_domains(cfg: dict[str, Any]) -> set[str]:
+    cfg_list = cfg.get("mailtm_banned_domains") or []
+    user_banned = {str(d).strip().lower() for d in cfg_list if d}
+    return _DEFAULT_BANNED_DOMAINS | user_banned
+
 LogFn = Callable[[str], None]
 CancelFn = Callable[[], bool]
 ResendFn = Callable[[], None]
@@ -88,6 +104,19 @@ def _session(proxy: str | None = None):
 
 def _base(cfg: dict[str, Any]) -> str:
     return str(cfg.get("mailtm_api_base") or cfg.get("mailtm_base") or DEFAULT_BASE).rstrip("/")
+
+
+def _bases(cfg: dict[str, Any]) -> list[str]:
+    """Return ordered list of API bases to try (primary + fallbacks)."""
+    primary = _base(cfg)
+    seen = {primary}
+    out = [primary]
+    for b in cfg.get("mailtm_fallback_bases") or []:
+        bs = str(b).rstrip("/")
+        if bs and bs not in seen:
+            out.append(bs)
+            seen.add(bs)
+    return out
 
 
 def _proxy(cfg: dict[str, Any]) -> str | None:
@@ -151,11 +180,12 @@ def list_domains(cfg: dict[str, Any] | None = None) -> list[str]:
 
 def _pick_domain(cfg: dict[str, Any]) -> str:
     preferred = str(cfg.get("mailtm_domain") or "").strip().lower().lstrip("@")
+    banned = _banned_domains(cfg)
     try:
-        available = list_domains(cfg)
+        available = [d for d in list_domains(cfg) if d not in banned]
     except Exception:
         available = []
-    if preferred and (not available or preferred in available):
+    if preferred and preferred not in banned and (not available or preferred in available):
         return preferred
     if available:
         return available[0]
@@ -165,61 +195,72 @@ def _pick_domain(cfg: dict[str, Any]) -> str:
 
 
 def create_inbox(cfg: dict[str, Any] | None = None) -> tuple[str, str]:
-    """Create account → (address, session_json)."""
+    """Create account → (address, session_json).
+
+    Tries the configured primary base first, then any ``mailtm_fallback_bases``
+    (e.g. api.mail.gw / api.duckmail.sbs) so a single dead endpoint does not
+    kill the whole mail.tm family.
+    """
     cfg = cfg or {}
-    base = _base(cfg)
-    domain = _pick_domain(cfg)
-    prefix = "u" + "".join(
-        secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
-    )
-    address = f"{prefix}@{domain}"
-    password = secrets.token_urlsafe(14)
-    s = _session(_proxy(cfg))
-
     last_err = ""
-    for _ in range(3):
-        r = s.post(
-            f"{base}/accounts",
-            json={"address": address, "password": password},
-            impersonate="chrome",
-            timeout=30,
-        )
-        if r.status_code in (200, 201):
-            break
-        # address taken → new prefix
-        last_err = f"accounts HTTP {r.status_code}: {(r.text or '')[:160]}"
-        prefix = "u" + "".join(
-            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
-        )
-        address = f"{prefix}@{domain}"
-    else:
-        raise RuntimeError(f"mailtm create failed: {last_err}")
+    for base in _bases(cfg):
+        ccfg = {**cfg, "mailtm_api_base": base}
+        try:
+            domain = _pick_domain(ccfg)
+            prefix = "u" + "".join(
+                secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
+            )
+            address = f"{prefix}@{domain}"
+            password = secrets.token_urlsafe(14)
+            s = _session(_proxy(ccfg))
 
-    tr = s.post(
-        f"{base}/token",
-        json={"address": address, "password": password},
-        impersonate="chrome",
-        timeout=30,
-    )
-    if tr.status_code >= 400:
-        raise RuntimeError(f"mailtm token HTTP {tr.status_code}: {(tr.text or '')[:160]}")
-    tdata = tr.json() if tr.text else {}
-    jwt = str((tdata or {}).get("token") or "").strip()
-    if not jwt:
-        raise RuntimeError(f"mailtm missing jwt: {tdata}")
+            for _ in range(3):
+                r = s.post(
+                    f"{base}/accounts",
+                    json={"address": address, "password": password},
+                    impersonate="chrome",
+                    timeout=30,
+                )
+                if r.status_code in (200, 201):
+                    break
+                # address taken → new prefix
+                last_err = f"accounts HTTP {r.status_code}: {(r.text or '')[:160]}"
+                prefix = "u" + "".join(
+                    secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
+                )
+                address = f"{prefix}@{domain}"
+            else:
+                raise RuntimeError(f"mailtm create failed: {last_err}")
 
-    blob = json.dumps(
-        {
-            "provider": PROVIDER,
-            "address": address,
-            "password": password,
-            "jwt": jwt,
-            "base": base,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return address, blob
+            tr = s.post(
+                f"{base}/token",
+                json={"address": address, "password": password},
+                impersonate="chrome",
+                timeout=30,
+            )
+            if tr.status_code >= 400:
+                raise RuntimeError(f"mailtm token HTTP {tr.status_code}: {(tr.text or '')[:160]}")
+            tdata = tr.json() if tr.text else {}
+            jwt = str((tdata or {}).get("token") or "").strip()
+            if not jwt:
+                raise RuntimeError(f"mailtm missing jwt: {tdata}")
+
+            blob = json.dumps(
+                {
+                    "provider": PROVIDER,
+                    "address": address,
+                    "password": password,
+                    "jwt": jwt,
+                    "base": base,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return address, blob
+        except Exception as exc:
+            last_err = f"{base}: {exc}"
+            continue
+    raise RuntimeError(f"mailtm create failed on all bases: {last_err}")
 
 
 def _refresh_jwt(sess: dict[str, Any], cfg: dict[str, Any]) -> str:

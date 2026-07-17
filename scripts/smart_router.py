@@ -20,7 +20,13 @@ from starlette.routing import Route
 # directly (`python scripts/smart_router.py`) instead of as a module.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.router_health import ProbeResult, ScoreBoard, Upstream, async_probe
+from scripts.router_health import (
+    ProbeResult,
+    ScoreBoard,
+    Upstream,
+    async_probe,
+    is_local_fallback,
+)
 
 DEFAULT_CONFIG_DIR = "D:/cli-proxy-api"
 
@@ -59,7 +65,12 @@ def _upstream_name(pool: str, channel_name: str, key_index: int, alias: str) -> 
 
 
 def _load_openai_compat(pool: str, channels: list[dict] | None) -> list[Upstream]:
-    """Parse ``openai-compatibility`` channel entries into Upstream objects."""
+    """Parse ``openai-compatibility`` channel entries into Upstream objects.
+
+    Only channels that expose client alias ``grok-4.5`` join the router.
+    ``remote-*`` debug aliases stay CLIProxy-only so demoted/slow stations
+    do not re-enter the smart-router RR.
+    """
     upstreams: list[Upstream] = []
     for channel in channels or []:
         if channel.get("disabled"):
@@ -67,31 +78,32 @@ def _load_openai_compat(pool: str, channels: list[dict] | None) -> list[Upstream
         channel_headers = channel.get("headers") or {}
         base_url = channel.get("base-url", "")
         channel_name = channel.get("name", "unknown")
+        main_models = [
+            m for m in (channel.get("models") or []) if m.get("alias") == "grok-4.5"
+        ]
+        if not main_models:
+            continue
+        model = main_models[0]
         for key_index, entry in enumerate(channel.get("api-key-entries", [])):
             api_key = entry.get("api-key", "")
-            # Prefer per-key proxy-url, fall back to channel-level, then empty.
             proxy_url = (
                 str(entry.get("proxy-url") or channel.get("proxy-url") or "").strip()
                 or None
             )
-            for model in channel.get("models", []):
-                alias = model.get("alias", "")
-                if alias.startswith("remote-"):
-                    continue
-                name = _upstream_name(pool, channel_name, key_index, alias)
-                upstreams.append(
-                    Upstream(
-                        name=name,
-                        pool=pool,
-                        base_url=base_url,
-                        api_key=api_key,
-                        headers=dict(channel_headers),
-                        probe_model=model.get("name", ""),
-                        aliases=[alias],
-                        max_inflight=3,  # charity remotes: keep low to avoid 429 storms
-                        proxy_url=proxy_url,
-                    )
+            name = _upstream_name(pool, channel_name, key_index, "grok-4.5")
+            upstreams.append(
+                Upstream(
+                    name=name,
+                    pool=pool,
+                    base_url=base_url,
+                    api_key=api_key,
+                    headers=dict(channel_headers),
+                    probe_model=model.get("name", "") or "grok-4.5",
+                    aliases=["grok-4.5"],
+                    max_inflight=8,
+                    proxy_url=proxy_url,
                 )
+            )
     return upstreams
 
 
@@ -165,12 +177,19 @@ def load_pools(config_dir: Path | str) -> dict[str, dict]:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         port = data.get("port", 0)
-        upstreams: list[Upstream] = []
+        remotes = (
+            _load_openai_compat("grok", data["openai-compatibility"])
+            if "openai-compatibility" in data
+            else []
+        )
         local = _load_local_cliproxy("grok", data)
-        if local is not None:
-            upstreams.append(local)
-        if "openai-compatibility" in data:
-            upstreams.extend(_load_openai_compat("grok", data["openai-compatibility"]))
+        # When any main-alias remote exists, keep local CPA off the router RR.
+        # Free local accounts are 15–45s traps; remotes are the usable path.
+        # Local remains on :8318 for debug / explicit remote-* demotion recovery.
+        if remotes:
+            upstreams = remotes
+        else:
+            upstreams = [local] if local is not None else []
         pools["grok"] = {"port": port, "upstreams": upstreams}
     return pools
 
@@ -262,7 +281,14 @@ class SmartRouter:
             if self.board.should_probe(upstream.name)
         ]
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Sequential probes: parallel chat TTFT through Clash stampses
+            # the mixed-port and false-fails cold remotes at startup.
+            for coro in tasks:
+                try:
+                    await coro
+                except Exception:
+                    pass
+                await asyncio.sleep(0.3)
 
     async def _probe_one(self, upstream: Upstream) -> None:
         if self.client is None:
@@ -304,10 +330,11 @@ class SmartRouter:
     ) -> Upstream | None:
         """Return any matching upstream that has not been tried yet.
 
-        This ensures the router can serve traffic before the first probe round
-        completes, and gives exhausted scored-upstreams another chance.
-        Respects circuit breaker + inflight caps when *acquire* is True.
+        Remotes first. Local CPA is last-resort only when no remote still has
+        a positive score (all circuits open / unregistered).
         """
+        matches: list[Upstream] = []
+        remote_alive = False
         for upstream in self.board.upstreams():
             if upstream.pool != pool:
                 continue
@@ -315,6 +342,18 @@ class SmartRouter:
                 continue
             if upstream.name in tried:
                 continue
+            if not is_local_fallback(upstream) and self.board.score(upstream.name) > 0:
+                remote_alive = True
+            matches.append(upstream)
+        if remote_alive:
+            matches = [u for u in matches if not is_local_fallback(u)]
+        matches.sort(
+            key=lambda u: (
+                1 if is_local_fallback(u) else 0,
+                -self.board.score(u.name),
+            )
+        )
+        for upstream in matches:
             if acquire:
                 if not self.board.try_acquire(upstream.name):
                     continue
@@ -403,13 +442,24 @@ class SmartRouter:
         last_error: Exception | None = None
 
         # 1 initial attempt + up to 3 retries = max 4 upstream attempts.
+        # Fail over before a hung charity hop burns the whole client budget.
+        HOP_TIMEOUT = 8.0
         for _ in range(4):
-            upstream = self.board.best(pool, model_alias, acquire=True)
-            if upstream is None or upstream.name in tried:
-                if upstream is not None and upstream.name in tried:
-                    self.board.release(upstream.name)
+            upstream = self.board.best(
+                pool, model_alias, acquire=True, exclude=tried
+            )
+            if upstream is None:
                 upstream = self._fallback_upstream(
                     pool, model_alias, tried, acquire=True
+                )
+            if upstream is None:
+                # Only when every remote is dead/unavailable: allow local CPA.
+                upstream = self.board.best(
+                    pool,
+                    model_alias,
+                    acquire=True,
+                    exclude=tried,
+                    allow_local=True,
                 )
             if upstream is None:
                 break
@@ -422,12 +472,13 @@ class SmartRouter:
             headers = self._upstream_headers(request, upstream)
             # Remotes with proxy-url go through Clash; local CLIProxy is direct.
             http = self._client_for(upstream)
+            hop_timeout = 20.0 if is_local_fallback(upstream) else HOP_TIMEOUT
             stream_ctx = http.stream(
                 request.method,
                 url,
                 headers=headers,
                 content=body,
-                timeout=30.0,
+                timeout=hop_timeout,
             )
 
             try:
@@ -455,8 +506,8 @@ class SmartRouter:
                     await stream_ctx.__aexit__(None, None, None)
                     continue
 
-                if response.status_code in (401, 403):
-                    # Hard fail: open long circuit, try next upstream.
+                if response.status_code in (401, 403, 404):
+                    # Hard/misconfig fail: open circuit, try next upstream.
                     last_response = response
                     self._mark_failed(upstream, response.status_code)
                     await response.aread()
@@ -485,6 +536,13 @@ class SmartRouter:
                 self.board.release(acquired_name)
 
         if last_response is not None:
+            # Prefer 502 over leaking a hop's 401/403/404 to the client after
+            # we already exhausted failover — those codes mean "try next".
+            if last_response.status_code in (401, 403, 404):
+                return JSONResponse(
+                    {"error": "all upstreams failed", "last_status": last_response.status_code},
+                    status_code=502,
+                )
             return await self._build_response(last_response, None)
         if last_error is not None:
             return JSONResponse({"error": str(last_error)}, status_code=502)

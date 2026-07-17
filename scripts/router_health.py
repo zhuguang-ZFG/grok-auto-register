@@ -17,6 +17,11 @@ COOLDOWN_SOFT_BASE_SEC = 30.0  # 429/5xx/timeout: starts at 30s
 COOLDOWN_SOFT_MAX_SEC = 600.0  # cap soft cool at 10 min
 FAIL_STREAK_OPEN = 3  # consecutive fails before opening the circuit
 
+# Prefer openai-compat remotes over local CLIProxy when any remote looks live.
+# Unprobed score is 0.01; a single ~3s success is ~0.33. Local free CPA is
+# fallback-only so RR over dead/quota accounts does not drag p50.
+REMOTE_PREFER_MIN_SCORE = 0.05
+
 
 @dataclass(frozen=True, slots=True)
 class ProbeResult:
@@ -48,6 +53,12 @@ class Upstream:
     # Optional HTTP(S) proxy for this upstream (e.g. Clash http://127.0.0.1:7897).
     # Empty/None = direct. Local CLIProxy should stay direct.
     proxy_url: str | None = None
+
+
+def is_local_fallback(upstream: Upstream) -> bool:
+    """True for local CLIProxy catch-alls that should not beat healthy remotes."""
+    name = (upstream.name or "").lower()
+    return name == "local-cliproxy" or name.startswith("local-")
 
 
 class EwmaLatency:
@@ -137,12 +148,18 @@ class ScoreBoard:
     def _open_circuit(self, state: dict[str, Any], status_code: int, now: float) -> None:
         """Open or extend the circuit based on failure class.
 
-        - 401/403 → hard cool for COOLDOWN_HARD_SEC (skip probes).
+        - 401 → hard cool for COOLDOWN_HARD_SEC (bad key / revoked).
+        - 403 → soft cool (charity remotes flap 403 under load; not "dead").
         - 429/5xx/timeout → open after FAIL_STREAK_OPEN fails, then exponential
           backoff from COOLDOWN_SOFT_BASE_SEC up to COOLDOWN_SOFT_MAX_SEC.
         """
-        if status_code in (401, 403):
+        if status_code == 401:
             cool = COOLDOWN_HARD_SEC
+        elif status_code == 403:
+            # Soft: community stations often 403 temporarily; 6h hard cool
+            # permanently empties the router of every usable remote.
+            prev = state.get("cooldown_sec") or 0.0
+            cool = min(max(prev * 2.0, COOLDOWN_SOFT_BASE_SEC), COOLDOWN_SOFT_MAX_SEC)
         elif status_code == 429 or state["fail_streak"] > FAIL_STREAK_OPEN:
             prev = state.get("cooldown_sec") or 0.0
             if prev > 0 and (state.get("open_until") or 0) > now - 1:
@@ -240,6 +257,11 @@ class ScoreBoard:
             return 0.01
 
         success_rate = state["success_count"] / total
+        if success_rate <= 0:
+            # Fail-only: keep a tiny score while the circuit is closed so a single
+            # bad probe does not permanently exile the only healthy remote.
+            return 0.001
+
         ewma_value = state["ewma"].value
         if ewma_value is None or ewma_value <= 0:
             ewma_value = 1.0
@@ -249,16 +271,31 @@ class ScoreBoard:
         load_penalty = 1.0 + (state["inflight"] / max(upstream.max_inflight, 1))
         return base / load_penalty
 
-    def best(self, pool: str, model_alias: str, *, acquire: bool = False) -> Upstream | None:
+    def best(
+        self,
+        pool: str,
+        model_alias: str,
+        *,
+        acquire: bool = False,
+        exclude: set[str] | None = None,
+        allow_local: bool = False,
+    ) -> Upstream | None:
         """Pick the highest-score upstream for *pool* whose aliases include *model_alias*.
 
         If *acquire* is True, also reserve an inflight slot (try_acquire).
         If *model_alias* is empty, the alias filter is skipped so callers such as the
         router's ``/v1/models`` proxy can still obtain a viable upstream.
+
+        By default, when any remote scores >= REMOTE_PREFER_MIN_SCORE, local
+        CLIProxy is excluded (free CPA RR is too slow to be a peer hop).
+        Pass *allow_local=True* only when remotes are all down.
         """
+        skipped = exclude or set()
         candidates: list[tuple[float, Upstream]] = []
         for name, upstream in self._upstreams.items():
             if upstream.pool != pool:
+                continue
+            if name in skipped:
                 continue
             if model_alias and model_alias not in upstream.aliases and "*" not in upstream.aliases:
                 continue
@@ -268,6 +305,14 @@ class ScoreBoard:
             candidates.append((s, upstream))
 
         candidates.sort(key=lambda t: t[0], reverse=True)
+        remotes = [(s, u) for s, u in candidates if not is_local_fallback(u)]
+        if not allow_local and any(s >= REMOTE_PREFER_MIN_SCORE for s, _ in remotes):
+            # Healthy remotes available: skip local CPA so dead free accounts
+            # on CLIProxy do not win RR / session stickiness.
+            candidates = remotes
+        elif not allow_local and remotes:
+            # Remotes registered but cold/unprobed: still prefer them over local.
+            candidates = remotes
         for _score, upstream in candidates:
             if acquire:
                 if self.try_acquire(upstream.name):

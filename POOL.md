@@ -64,6 +64,12 @@ python pool_maintain.py
 python grok_register_ttk.py -n 6 -c 1 -y
 run_status.bat                   # Windows 快捷
 
+# 批量探测清理死号（推荐定期运行）
+python batch_probe_accounts.py                  # 探测全池，标记死号
+python batch_probe_accounts.py --workers 8      # 并发探测（快速）
+python batch_probe_accounts.py --sample 50      # 随机抽样 50 个
+python batch_probe_accounts.py --dry-run        # 只探测不写文件
+
 # 外部 CPA zip / 目录导入号池
 python import_cpa_batch.py D:/Downloads/batch_0001-0500.zip D:/Downloads/batch_0501-1000.zip
 
@@ -190,12 +196,25 @@ python pool_status.py                    # 含域名健康摘要
 
 - **协议铸造** → `cpa_xai.mint_and_export` / `cpa_export`（默认开）
 - **TempMail.lol** → `email_provider: "tempmail_lol"`（可选；默认仍用 cloudflare 四域名）
+- **mail.tm 家族** → `email_provider: "mailtm"`（api.mail.tm / api.mail.gw / api.duckmail.sbs 自动 fallback）
+
+推荐在 `cloudflare`/`mixed` 模式下把免费邮箱作为 mix 层，避免单一域名被 ban：
 
 ```json
-"email_provider": "tempmail_lol",
-"tempmail_lol_api_base": "https://api.tempmail.lol/v2",
-"tempmail_lol_api_key": ""
+{
+  "email_provider": "cloudflare",
+  "email_mix_hotmail": true,
+  "email_mix_hotmail_ratio": 0.2,
+  "email_mix_tempmail_lol": true,
+  "email_mix_tempmail_lol_ratio": 0.25,
+  "email_mix_mailtm": true,
+  "email_mix_mailtm_ratio": 0.15,
+  "mailtm_api_base": "https://api.mail.tm",
+  "mailtm_fallback_bases": ["https://api.mail.gw", "https://api.duckmail.sbs"]
+}
 ```
+
+mix 总和不足 1.0 时，剩余概率继续走 Cloudflare 自有域名。
 
 协议铸造冒烟（有 SSO 的 accounts 行）：约 4s 写出 CPA + `/models` 含 grok-4.5。
 

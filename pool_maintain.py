@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -42,18 +43,95 @@ def run(cmd: list[str], log_fp) -> int:
     return int(p.returncode)
 
 
+class RefillGate:
+    """Rate-limit auto-refill spawns to avoid runaway registration.
+
+    Uses a small state file under logs/ to persist last spawn time and daily
+    count across maintain cycles. The gate limits *spawn attempts*, not
+    successful registrations; the registration script has its own daily cap.
+    """
+
+    STATE_FILE = LOG_DIR / "_pool_refill_state.json"
+
+    def __init__(self, cfg: dict):
+        self.enabled = bool(cfg.get("pool_auto_refill", True))
+        # Explicit 0 means "no limit" rather than falling back to default.
+        self.daily_max = (
+            int(cfg["pool_refill_daily_max"])
+            if "pool_refill_daily_max" in cfg
+            else 5
+        )
+        self.cooldown = (
+            float(cfg["pool_refill_cooldown_sec"])
+            if "pool_refill_cooldown_sec" in cfg
+            else 1800.0
+        )
+
+    def _load(self) -> dict:
+        if not self.STATE_FILE.is_file():
+            return {}
+        try:
+            return json.loads(self.STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _today(self) -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def check(self, *, force: bool = False, no_auto: bool = False) -> tuple[bool, str]:
+        if no_auto:
+            return False, "--no-auto-refill"
+        # Manual force overrides config-disable (but not explicit --no-auto-refill).
+        if force:
+            return True, "force-refill"
+        if not self.enabled:
+            return False, "pool_auto_refill=false"
+        state = self._load()
+        today = self._today()
+        last_date = state.get("last_refill_date")
+        count = int(state.get("refills_today", 0) or 0) if last_date == today else 0
+        if self.daily_max > 0 and count >= self.daily_max:
+            return False, f"daily_max {count}/{self.daily_max}"
+        last_ts = float(state.get("last_refill_ts", 0) or 0)
+        elapsed = time.time() - last_ts
+        if self.cooldown > 0 and last_ts and elapsed < self.cooldown:
+            return False, f"cooldown {int(elapsed)}s < {int(self.cooldown)}s"
+        return True, "ok"
+
+    def record(self) -> None:
+        state = self._load()
+        today = self._today()
+        if state.get("last_refill_date") != today:
+            state["refills_today"] = 0
+        state["last_refill_date"] = today
+        state["last_refill_ts"] = time.time()
+        state["refills_today"] = int(state.get("refills_today", 0) or 0) + 1
+        try:
+            tmp = self.STATE_FILE.with_suffix(self.STATE_FILE.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp, self.STATE_FILE)
+        except Exception as exc:
+            print(f"[!] refill state write failed: {exc}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="号池维持：refresh + health + 条件补号 + CLI 同步")
-    parser.add_argument("--force-refill", type=int, default=0, help="强制补 N 个，忽略健康阈值")
+    parser.add_argument("--force-refill", type=int, default=0, help="强制补号：忽略 gate 连续跑 N 轮注册")
     parser.add_argument("--skip-refill", action="store_true", help="只做健康检查不同步补号")
     parser.add_argument("--skip-health", action="store_true", help="跳过健康检查直接补号")
     parser.add_argument("--skip-refresh", action="store_true", help="跳过 access_token 批量刷新")
+    parser.add_argument(
+        "--no-auto-refill",
+        action="store_true",
+        help="即使号池不足也禁止自动 spawn 注册机（refresh/health 仍继续）",
+    )
     args = parser.parse_args()
 
     cfg = load_cfg()
     min_live = int(cfg.get("pool_min_live", 5) or 5)
-    refill_count = int(cfg.get("pool_refill_count", cfg.get("register_count", 8)) or 8)
-    concurrency = int(cfg.get("pool_refill_concurrency", cfg.get("concurrency", 1)) or 1)
     refresh_within = float(cfg.get("pool_maintain_refresh_within_hours", 2) or 2)
     refresh_max = int(cfg.get("pool_maintain_refresh_max", 300) or 300)
     refresh_workers = int(cfg.get("pool_maintain_refresh_workers", 3) or 3)
@@ -169,36 +247,44 @@ def main() -> int:
 
         if args.force_refill > 0:
             need_refill = True
-            refill_count = args.force_refill
 
         if args.skip_refill:
             need_refill = False
 
+        gate = RefillGate(cfg)
+        allowed, reason = gate.check(
+            force=args.force_refill > 0, no_auto=args.no_auto_refill
+        )
+        if need_refill and not allowed:
+            print(
+                f"[*] refill requested but gated ({reason}); skip spawn grok_register_ttk.py"
+            )
+            log.write(f"refill gated ({reason}); skip spawn register\n")
+            need_refill = False
+
         if need_refill:
-            print(f"[*] refill start count={refill_count} concurrency={concurrency}")
-            # 注意：grok_register_ttk start 只读 config.register_count（通常为 1）。
-            # 以前 refill_count 只打印不用，导致 --force-refill 8 也只跑 1 次。
-            # 这里按 refill_count 连续调用 start；单次失败再重试 1 次。
-            ok_n = 0
-            fail_n = 0
-            for i in range(1, max(1, refill_count) + 1):
+            rounds = max(1, int(args.force_refill)) if args.force_refill > 0 else 1
+            print(
+                f"[*] refill allowed ({reason}); spawn {rounds} round(s) "
+                f"grok_register_ttk.py start"
+            )
+            log.write(
+                f"refill allowed; spawn {rounds} round(s) grok_register_ttk.py start\n"
+            )
+            for i in range(1, rounds + 1):
                 code = 1
                 for attempt in range(1, 3):
                     code = run(
-                        [
-                            py,
-                            str(ROOT / "grok_register_ttk.py"),
-                            "start",
-                        ],
+                        [py, str(ROOT / "grok_register_ttk.py"), "start"],
                         log,
                     )
-                    print(f"[*] refill {i}/{refill_count} attempt={attempt} exit={code}")
+                    print(f"[*] refill round={i}/{rounds} attempt={attempt} exit={code}")
                     if code == 0:
-                        ok_n += 1
                         break
-                else:
-                    fail_n += 1
-            print(f"[*] refill summary ok={ok_n} fail={fail_n}")
+                # Record every spawn attempt so failed rounds also consume budget
+                # and prevent tight retry loops.
+                gate.record()
+            print(f"[*] refill rounds done")
             # 补完再健康同步一次
             if not args.skip_health:
                 code2 = run([py, str(ROOT / "pool_health.py")], log)

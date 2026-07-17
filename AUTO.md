@@ -79,7 +79,7 @@ C:\Users\zhugu\scoop\apps\python313\current\python.exe quota_watch.py
 | `quota_watch_probe_kind` | `models` | probe 端点（`models`=凭证有效性；`responses`=chat，Free 号会 403） |
 | `quota_watch_probe_interval_sec` | 300 | probe 间隔 |
 | `quota_watch_prefer_pool` | true | 先用 `cpa_auths/` |
-| `quota_watch_register_on_miss` | true | 池没有则跑 `grok_register_ttk.py start` |
+| `quota_watch_register_on_miss` | false | 池空时是否自动 spawn 注册机（当前已关闭自动注册） |
 | `quota_watch_min_pool` | 3 | CPA 池水位下限，低于则后台补号（**不碰当前 auth.json**） |
 | `quota_watch_pool_topup_cooldown_sec` | 600 | 补号冷却（独立于换证冷却） |
 | `quota_watch_pool_topup_max_per_day` | 30 | 每日补号上限 |
@@ -116,6 +116,56 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_quota_watch_task.ps1
 | 卸载 | `.\scripts\install_quota_watch_task.ps1 -Remove` |
 
 任务名默认 `GrokQuotaWatch`，以当前用户交互登录触发，失败自动重试 3 次。
+
+## 号池维护与补号控制
+
+`pool_maintain.py` 是计划任务 `GrokPoolMaintain` 的入口（默认每 2 小时），负责：
+
+1. 代理/Clash 健康检查
+2. `refresh_pool.py` 批量续期 + 死号软禁用
+3. `pool_health.py` 全池探活
+4. **条件补号**（历史上会 spawn `grok_register_ttk.py start`）
+5. `auto_link_cli.py` / `pool_policy.py` 同步与缓冲策略
+
+当前配置：自动补号**开启**，但加了 gate 防止拉多：
+
+```json
+{
+  "pool_auto_refill": true,
+  "pool_refill_daily_max": 5,
+  "pool_refill_cooldown_sec": 1800,
+  "quota_watch_register_on_miss": false
+}
+```
+
+| 配置/开关 | 作用 |
+|-----------|------|
+| `pool_auto_refill` | 总开关：`true` 时号池低于 `pool_min_live` 才会触发补号 |
+| `pool_refill_daily_max` | 每天最多 spawn 注册机几轮（默认 5） |
+| `pool_refill_cooldown_sec` | 两轮补号最短间隔（默认 1800s） |
+| `--no-auto-refill` | 命令行强制关闭补号（保留用于手动调试） |
+| `--force-refill N` | 手动强制连续跑 N 轮注册（忽略 gate） |
+| `--skip-refill` | 只做健康检查，不补号 |
+
+自动补号逻辑：
+- `GrokPoolMaintain` 每 2 小时跑一次；每次池不足时**只 spawn 一轮** `grok_register_ttk.py start`。
+- 一轮失败后不会立刻再拉，而是等 `pool_refill_cooldown_sec`；超过日上限后当天停止。
+- 注册机内部还有 `register_daily_success_cap` 限制实际成功数，双重保险。
+
+手动低频补号示例：
+
+```powershell
+python pool_maintain.py --force-refill 3
+```
+
+软隔离的号（403/429 等）由 `scripts/retest_quarantine.py` 每 6 小时复测一次（计划任务 `GrokQuarantineRetest`），能 chat 则搬回 `cpa_auths/`，仍 403 则延长 hold，401/anti-bot 进入 `_discarded`。
+
+旧版留在 `cpa_auths/` 里 `disabled=True` 的号，用下面命令统一迁移到隔离目录：
+
+```powershell
+python scripts/migrate_disabled_to_quarantine.py --dry-run   # 先看数量
+python scripts/migrate_disabled_to_quarantine.py             # 正式迁移
+```
 
 ## 本机模型列表：为什么看不到「官方」模型
 

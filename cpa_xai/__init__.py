@@ -5,7 +5,12 @@ Produce CLIProxyAPI-compatible ``xai-<email>.json`` credentials.
 
 from .accounts import AccountLine, existing_cpa_emails, parse_accounts_file
 from .mint import mint_and_export
-from .probe import probe_mini_response, probe_models
+from .probe import (
+    decode_token_risk,
+    probe_account_health,
+    probe_mini_response,
+    probe_models,
+)
 from .oauth_device import refresh_access_token
 from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
 
@@ -49,6 +54,8 @@ __all__ = [
     "mint_with_sso_protocol",
     "mint_with_sso_authcode",
     "parse_accounts_file",
+    "decode_token_risk",
+    "probe_account_health",
     "probe_mini_response",
     "probe_models",
     "refresh_access_token",

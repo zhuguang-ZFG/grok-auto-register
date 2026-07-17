@@ -16,10 +16,14 @@ DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
 DEFAULT_CLIENT_HEADERS: dict[str, str] = {
+    # Align with community acpa_watchdog / new-api grok-cli SetupRequestHeader.
+    # Dual-case Token-Auth: some reverse proxies normalize only one form.
     "x-grok-client-version": "0.2.93",
     "x-xai-token-auth": "xai-grok-cli",
+    "X-XAI-Token-Auth": "xai-grok-cli",
     "x-authenticateresponse": "authenticate-response",
     "x-grok-client-identifier": "grok-shell",
+    "x-compaction-at": "400000",
     "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
 }
 

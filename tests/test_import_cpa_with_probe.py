@@ -1,7 +1,7 @@
 import io
 import unittest
 
-from scripts.import_cpa_with_probe import admit_candidate, classify_chat_result, probe_chat
+from scripts.import_cpa_with_probe import admit_candidate, classify_chat_result, probe_chat, load_candidates, normalize
 
 
 class ChatAdmissionClassificationTests(unittest.TestCase):
@@ -81,6 +81,7 @@ class CandidateAdmissionTests(unittest.TestCase):
             object(),
             chat_probe=chat,
             refresher=refresh,
+            warmup_sec=0,
         )
         self.assertEqual(status, "chat_ok")
         self.assertEqual(candidate["access_token"], "old")
@@ -104,6 +105,7 @@ class CandidateAdmissionTests(unittest.TestCase):
             object(),
             chat_probe=chat,
             refresher=refresh,
+            warmup_sec=0,
         )
         self.assertEqual(status, "chat_ok")
         self.assertEqual(candidate["access_token"], "new")
@@ -121,11 +123,129 @@ class CandidateAdmissionTests(unittest.TestCase):
             object(),
             chat_probe=lambda _d, _o: ("permission_denied", "403"),
             refresher=refresh,
+            warmup_sec=0,
+            sleep_fn=lambda _s: None,
         )
-        self.assertEqual(status, "permission_denied")
-        self.assertIsNone(candidate)
+        self.assertEqual(status, "permission_denied_quarantine")
+        self.assertIsNotNone(candidate)
         self.assertEqual(refreshed, [])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from scripts.import_cpa_with_probe import load_candidates, normalize, email_from_tokens
+import base64
+import json
+import os
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+def _fake_jwt(payload: dict) -> str:
+    head = base64.urlsafe_b64encode(b'{"alg":"none"}').decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"{head}.{body}.sig"
+
+
+class NormalizeWashTests(unittest.TestCase):
+    def test_force_cli_chat_proxy_and_headers(self):
+        out = normalize(
+            {
+                "access_token": "a",
+                "refresh_token": "r",
+                "base_url": "https://api.x.ai/v1",
+                "headers": None,
+            },
+            {},
+        )
+        self.assertEqual(out["base_url"], "https://cli-chat-proxy.grok.com/v1")
+        self.assertEqual(out["headers"]["x-xai-token-auth"], "xai-grok-cli")
+        self.assertIn("User-Agent", out["headers"])
+
+    def test_email_from_jwt(self):
+        at = _fake_jwt({"email": "user@example.com"})
+        out = normalize(
+            {
+                "access_token": at,
+                "refresh_token": "r",
+                "base_url": "https://api.x.ai/v1",
+            },
+            {},
+        )
+        self.assertEqual(out.get("email"), "user@example.com")
+
+
+class TarLoadTests(unittest.TestCase):
+    def test_load_tar_gz_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            payload = {
+                "access_token": "at",
+                "refresh_token": "rt",
+                "base_url": "https://api.x.ai/v1",
+            }
+            j = td_path / "xai-a.json"
+            j.write_text(json.dumps(payload), encoding="utf-8")
+            tar_path = td_path / "pack.tar.gz"
+            with tarfile.open(tar_path, "w:gz") as tf:
+                tf.add(j, arcname="authenticated/xai-a.json")
+            items = load_candidates([tar_path])
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["refresh_token"], "rt")
+
+
+class WarmupAnd403RetryTests(unittest.TestCase):
+    def test_warmup_called(self):
+        slept = []
+
+        def chat(_d, _o):
+            return "chat_ok", "OK"
+
+        status, cand = admit_candidate(
+            {"access_token": "a", "refresh_token": "r"},
+            object(),
+            chat_probe=chat,
+            warmup_sec=1.5,
+            sleep_fn=lambda s: slept.append(s),
+        )
+        self.assertEqual(status, "chat_ok")
+        self.assertEqual(slept, [1.5])
+
+    def test_permission_denied_retries_then_out(self):
+        calls = []
+        slept = []
+
+        def chat(_d, _o):
+            calls.append("chat")
+            return "permission_denied", "403"
+
+        old_r = os.environ.get("ACPA_PERM_DENIED_RETRIES")
+        old_s = os.environ.get("ACPA_PERM_DENIED_SLEEP_SEC")
+        os.environ["ACPA_PERM_DENIED_RETRIES"] = "2"
+        os.environ["ACPA_PERM_DENIED_SLEEP_SEC"] = "4"
+        try:
+            status, cand = admit_candidate(
+                {"access_token": "a", "refresh_token": "r"},
+                object(),
+                chat_probe=chat,
+                refresher=lambda *_: (_ for _ in ()).throw(AssertionError("no refresh")),
+                warmup_sec=0,
+                sleep_fn=lambda s: slept.append(s),
+            )
+        finally:
+            if old_r is None:
+                os.environ.pop("ACPA_PERM_DENIED_RETRIES", None)
+            else:
+                os.environ["ACPA_PERM_DENIED_RETRIES"] = old_r
+            if old_s is None:
+                os.environ.pop("ACPA_PERM_DENIED_SLEEP_SEC", None)
+            else:
+                os.environ["ACPA_PERM_DENIED_SLEEP_SEC"] = old_s
+        self.assertEqual(status, "permission_denied_quarantine")
+        self.assertIsNotNone(cand)
+        self.assertEqual(len(calls), 3)  # initial + 2 retries
+        self.assertEqual(slept, [4, 4])
+

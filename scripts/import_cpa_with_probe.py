@@ -11,6 +11,7 @@ Flow:
 
 Supports:
   - zip of xai-*.json
+  - .tar / .tar.gz / .tgz of xai-*.json
   - directory of json
   - .txt lines: pure JSON or `{json}____sso`
 
@@ -22,10 +23,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
 import random
 import re
 import sys
+import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,16 +44,26 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from cpa_xai.quarantine import (
+    DEFAULT_RECOVER_AFTER_SEC,
+    discard_auth,
+    quarantine_auth,
+)
+from cpa_xai.proxyutil import next_proxy_from_pool, proxy_log_label
+
 try:
     from cpa_xai.schema import CLIENT_ID as CLIENT
 except Exception:  # pragma: no cover
     CLIENT = "b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_BASE = "https://cli-chat-proxy.grok.com/v1"
+# Keep in sync with cpa_xai.schema.DEFAULT_CLIENT_HEADERS (acpa_watchdog absorb).
 DEFAULT_HEADERS = {
     "x-grok-client-version": "0.2.93",
     "x-xai-token-auth": "xai-grok-cli",
+    "X-XAI-Token-Auth": "xai-grok-cli",
     "x-authenticateresponse": "authenticate-response",
     "x-grok-client-identifier": "grok-shell",
+    "x-compaction-at": "400000",
     "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
 }
 
@@ -89,10 +104,21 @@ def classify_chat_result(status: int, body: str) -> str:
     return "http_error"
 
 
-def opener_for(proxy: str | None):
-    if proxy:
+def _probe_timeout() -> float:
+    raw = os.environ.get("ACPA_PROBE_TIMEOUT_SEC", "30")
+    try:
+        return max(5.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
+def opener_for(proxy: str | None, cfg: dict[str, Any] | None = None):
+    p = (proxy or "").strip()
+    if not p and cfg is not None:
+        p = next_proxy_from_pool(cfg)
+    if p:
         return urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            urllib.request.ProxyHandler({"http": p, "https": p})
         )
     return urllib.request.build_opener()
 
@@ -124,7 +150,7 @@ def probe_chat(d: dict[str, Any], opener) -> tuple[str, str]:
         method="POST",
     )
     try:
-        with opener.open(req, timeout=30) as resp:
+        with opener.open(req, timeout=_probe_timeout()) as resp:
             body = resp.read().decode("utf-8", "ignore")
             status = int(getattr(resp, "status", 200) or 200)
     except urllib.error.HTTPError as exc:
@@ -135,17 +161,65 @@ def probe_chat(d: dict[str, Any], opener) -> tuple[str, str]:
     return classify_chat_result(status, body), body
 
 
+def _warmup_sec() -> float:
+    """New-account chat probe warmup (watchdog style). Env: ACPA_PROBE_WARMUP_SEC."""
+    raw = os.environ.get("ACPA_PROBE_WARMUP_SEC", "3")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 3.0
+
+
+def _perm_denied_retries() -> tuple[int, float]:
+    """Short 403 permission_denied retries: count, sleep_sec."""
+    try:
+        n = max(0, int(os.environ.get("ACPA_PERM_DENIED_RETRIES", "2")))
+    except ValueError:
+        n = 2
+    try:
+        sleep_s = max(0.0, float(os.environ.get("ACPA_PERM_DENIED_SLEEP_SEC", "4")))
+    except ValueError:
+        sleep_s = 4.0
+    return n, sleep_s
+
+
 def admit_candidate(
     candidate: dict[str, Any],
     opener,
     *,
     chat_probe=probe_chat,
     refresher=None,
+    warmup_sec: float | None = None,
+    sleep_fn=time.sleep,
 ) -> tuple[str, dict[str, Any] | None]:
-    """Admit only chat-capable accounts; refresh RT solely after AT 401."""
+    """Admit only chat-capable accounts; refresh RT solely after AT 401.
+
+    Watchdog standards (community import path):
+      - optional warmup before first chat probe (default 3s)
+      - permission_denied: short retry 2x4s, still 403 -> stay out of live
+        (do NOT refresh RT to "fix" chat gate)
+    """
+    warm = _warmup_sec() if warmup_sec is None else max(0.0, float(warmup_sec))
+    if warm > 0:
+        sleep_fn(warm)
+
     status, _body = chat_probe(candidate, opener)
     if status == "chat_ok":
         return status, candidate
+
+    if status == "permission_denied":
+        retries, sleep_s = _perm_denied_retries()
+        for _ in range(retries):
+            if sleep_s > 0:
+                sleep_fn(sleep_s)
+            status, _body = chat_probe(candidate, opener)
+            if status == "chat_ok":
+                return status, candidate
+            if status != "permission_denied":
+                break
+        # Still 403 -> soft quarantine; AGENTS.md: do not RT-kill, recover_after 24h.
+        return "permission_denied_quarantine", candidate
+
     if status != "unauthorized":
         return status, None
     refresh_fn = refresher or refresh_one
@@ -176,16 +250,67 @@ def parse_line(line: str) -> dict[str, Any] | None:
     return None
 
 
+def _jwt_claim(token: str, key: str) -> str | None:
+    """Best-effort JWT payload claim (no signature verify)."""
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return None
+        pad = "=" * (-len(parts[1]) % 4)
+        raw = base64.urlsafe_b64decode(parts[1] + pad)
+        data = json.loads(raw.decode("utf-8", "ignore"))
+        val = data.get(key)
+        if val is None:
+            return None
+        s = str(val).strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def email_from_tokens(d: dict[str, Any]) -> str | None:
+    for tok_key in ("id_token", "access_token"):
+        tok = str(d.get(tok_key) or "")
+        for claim in ("email", "preferred_username", "upn"):
+            em = _jwt_claim(tok, claim)
+            if em and "@" in em:
+                return em.lower()
+    return None
+
+
 def normalize(d: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """Force cli-chat-proxy base + grok-cli headers; fill email from JWT if missing."""
     out = dict(d)
     out["type"] = out.get("type") or "xai"
     out["auth_kind"] = out.get("auth_kind") or "oauth"
     out["disabled"] = False
-    bu = str(out.get("base_url") or "")
-    if (not bu) or ("api.x.ai" in bu):
+    # Always wash community packs that ship api.x.ai or empty base.
+    bu = str(out.get("base_url") or "").strip().rstrip("/")
+    if (not bu) or ("api.x.ai" in bu) or ("console.x.ai" in bu):
         out["base_url"] = DEFAULT_BASE
-    if not isinstance(out.get("headers"), dict):
-        out["headers"] = dict(DEFAULT_HEADERS)
+    else:
+        out["base_url"] = bu
+    # Merge DEFAULT_HEADERS over missing keys so CPA chat path works.
+    headers = dict(DEFAULT_HEADERS)
+    if isinstance(out.get("headers"), dict):
+        for k, v in out["headers"].items():
+            if v is not None and str(v).strip():
+                headers[str(k)] = str(v)
+    out["headers"] = headers
+    if not str(out.get("email") or "").strip():
+        em = email_from_tokens(out)
+        if em:
+            out["email"] = em
+    # Record advisory bot/risk claims from JWT (community credential_pool scoring).
+    try:
+        from cpa_xai.probe import decode_token_risk
+        risk = decode_token_risk(str(out.get("access_token") or ""))
+        out["bot_flag_source"] = risk.get("bot_flag_source")
+        out["bot_flagged"] = bool(risk.get("bot_flagged"))
+        if risk.get("risk_claims"):
+            out["risk_claims"] = risk["risk_claims"]
+    except Exception:
+        pass
     try:
         from pool_policy import tag_pool_source
 
@@ -202,6 +327,24 @@ def normalize(d: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
 
 def email_of(d: dict[str, Any]) -> str:
     return str(d.get("email") or "").strip().lower()
+
+
+def _is_tar_path(path: Path) -> bool:
+    name = path.name.lower()
+    return (
+        name.endswith(".tar")
+        or name.endswith(".tar.gz")
+        or name.endswith(".tgz")
+        or name.endswith(".tar.bz2")
+    )
+
+
+def _load_json_bytes(raw: bytes) -> dict[str, Any] | None:
+    try:
+        d = json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
 
 
 def load_candidates(paths: list[Path]) -> list[dict[str, Any]]:
@@ -222,6 +365,17 @@ def load_candidates(paths: list[Path]) -> list[dict[str, Any]]:
                         items.append(json.loads(z.read(info.filename)))
                     except Exception:
                         pass
+        elif _is_tar_path(path):
+            with tarfile.open(path, "r:*") as tf:
+                for m in tf.getmembers():
+                    if not m.isfile() or not m.name.lower().endswith(".json"):
+                        continue
+                    f = tf.extractfile(m)
+                    if f is None:
+                        continue
+                    d = _load_json_bytes(f.read())
+                    if d is not None:
+                        items.append(d)
         elif path.suffix.lower() in (".txt", ".jsonl", ".log"):
             for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 d = parse_line(ln)
@@ -306,11 +460,23 @@ def main(argv: list[str] | None = None) -> int:
         default=8,
         help="parallel refresh workers when --refresh-all (default 8)",
     )
+    ap.add_argument(
+        "--recover-after",
+        type=float,
+        default=float(DEFAULT_RECOVER_AFTER_SEC),
+        help="seconds to hold 403/soft-fail quarantine (default 24h)",
+    )
+    ap.add_argument(
+        "--quota-recover-after",
+        type=float,
+        default=6 * 3600.0,
+        help="seconds to hold 429/quota_exhausted quarantine (default 6h)",
+    )
     args = ap.parse_args(argv)
 
     cfg = load_cfg()
     proxy = proxy_of(cfg)
-    opener = opener_for(proxy)
+    opener = opener_for(proxy, cfg)
     paths = [Path(p) for p in args.paths]
     for p in paths:
         if not p.exists():
@@ -397,19 +563,43 @@ def main(argv: list[str] | None = None) -> int:
         workers = max(1, min(int(args.workers or 8), 16))
         print(f"[*] chat-admission candidates={len(cands)} workers={workers}", flush=True)
 
-        def _job(d0: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+        _prog_counter = {"n": 0, "lock": threading.Lock()}
+
+        def _job(d0: dict[str, Any]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
             key0 = email_of(d0) or str(d0.get("sub") or "")
             if key0 in refreshed_map:
-                return "chat_ok", refreshed_map[key0]
-            return admit_candidate(d0, opener)
+                return "chat_ok", refreshed_map[key0], d0
+            st, nd = admit_candidate(d0, opener)
+            with _prog_counter["lock"]:
+                _prog_counter["n"] += 1
+                n = _prog_counter["n"]
+                if n % 10 == 0 or n == len(cands):
+                    print(
+                        f"[*] admission progress {n}/{len(cands)} "
+                        f"({100*n//len(cands)}%)",
+                        flush=True,
+                    )
+            return st, nd, d0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = list(ex.map(_job, cands))
-        for st, nd in futs:
+        quarantined: list[tuple[str, dict[str, Any], float]] = []
+        discarded: list[tuple[str, dict[str, Any]]] = []
+        for st, nd, orig in futs:
             full_stats[st] += 1
             if st == "chat_ok" and nd is not None:
                 to_write.append(normalize(nd, cfg))
-        print(f"[*] admission stats={dict(full_stats)} survivors={len(to_write)}", flush=True)
+            elif st == "permission_denied_quarantine":
+                quarantined.append((st, normalize(orig, cfg), float(args.recover_after)))
+            elif st == "quota_exhausted":
+                quarantined.append((st, normalize(orig, cfg), float(args.quota_recover_after)))
+            elif st == "unauthorized":
+                discarded.append((st, normalize(orig, cfg)))
+        print(
+            f"[*] admission stats={dict(full_stats)} survivors={len(to_write)} "
+            f"quarantined={len(quarantined)} discarded={len(discarded)}",
+            flush=True,
+        )
     else:
         for d in cands:
             key = email_of(d) or str(d.get("sub") or "")
@@ -420,6 +610,19 @@ def main(argv: list[str] | None = None) -> int:
             full_stats[st] += 1
             if st == "chat_ok" and nd is not None:
                 to_write.append(normalize(nd, cfg))
+
+    # Write soft-quarantined auths for later retest.
+    for reason, qauth, recover_sec in quarantined:
+        try:
+            quarantine_auth(qauth, root=ROOT, reason=reason, recover_after_sec=recover_sec)
+        except Exception as exc:
+            print(f"[!] quarantine write failed: {exc}", file=sys.stderr)
+    # Hard-failures (429/401) go to discarded for audit.
+    for reason, dauth in discarded:
+        try:
+            discard_auth(dauth, root=ROOT, reason=reason)
+        except Exception as exc:
+            print(f"[!] discard write failed: {exc}", file=sys.stderr)
 
     auth_dir.mkdir(parents=True, exist_ok=True)
     imported = skipped_dup = 0
@@ -439,6 +642,8 @@ def main(argv: list[str] | None = None) -> int:
         "aborted": False,
         "imported": imported,
         "skipped_dup": skipped_dup,
+        "quarantined": len(quarantined),
+        "discarded": len(discarded),
         "candidates": len(cands),
         "survivors": len(to_write),
         "ok_rate": rate,

@@ -1437,20 +1437,89 @@ def write_local_grok_from_cpa(cpa_result, log_callback=None):
         return {"ok": False, "error": str(exc)}
 
 
+def _persist_registered_account(output_path, email, password, sso, log_callback=None):
+    """Persist a freshly registered account to the primary output file.
+
+    If the primary file cannot be written, queue the record to
+    ``<output_path>.pending.jsonl`` so ``retry-pending`` can recover it.
+    Raises RuntimeError only when both primary and pending rescue fail.
+    """
+    try:
+        from account_outputs import append_account_line, queue_unsaved_account
+    except Exception as import_exc:
+        if log_callback:
+            log_callback(f"[!!!] account_outputs 导入失败: {import_exc}")
+        raise
+
+    try:
+        appended = append_account_line(output_path, email, password, sso)
+        if log_callback:
+            log_callback(
+                f"[+] 账号已落盘: {output_path}"
+                + ("" if appended else " (已存在，跳过)")
+            )
+        return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!!!] 账号主文件写入失败: {exc}")
+        try:
+            pending_path = queue_unsaved_account(
+                output_path,
+                {"email": email, "password": password, "sso": sso},
+                exc,
+            )
+            if log_callback:
+                log_callback(f"[+] 已转存 pending 救援: {pending_path}")
+        except Exception as pending_exc:
+            if log_callback:
+                log_callback(f"[!!!] pending 救援也失败: {pending_exc}")
+            raise RuntimeError(
+                f"账号 {email} 落盘失败且 pending 救援失败: {exc}; pending error: {pending_exc}"
+            ) from exc
+        return False
+
+
 def run_post_register_pipeline(sso, email, log_callback=None, cpa_result=None):
     """Full auto path after one successful registration.
 
     1) tokens.txt
     2) grok2api local/remote pools
     3) local grok auth.json (when CPA result available)
+
+    Each step is isolated: a failure in one does not stop the others and is
+    recorded as a warning instead of failing the whole registration.
     """
-    results = {}
-    results["token_file"] = add_token_to_token_only_file(sso, log_callback=log_callback)
-    add_token_to_grok2api_pools(sso, email=email, log_callback=log_callback)
-    if cpa_result is not None:
-        results["local_grok"] = write_local_grok_from_cpa(
-            cpa_result, log_callback=log_callback
+    results = {
+        "token_file": None,
+        "grok2api_pools": None,
+        "local_grok": None,
+        "warnings": [],
+    }
+    try:
+        results["token_file"] = add_token_to_token_only_file(
+            sso, log_callback=log_callback
         )
+    except Exception as exc:
+        results["warnings"].append(f"token file: {exc}")
+        if log_callback:
+            log_callback(f"[!] token 文件写入异常: {exc}")
+    try:
+        add_token_to_grok2api_pools(sso, email=email, log_callback=log_callback)
+        results["grok2api_pools"] = True
+    except Exception as exc:
+        results["grok2api_pools"] = False
+        results["warnings"].append(f"grok2api pools: {exc}")
+        if log_callback:
+            log_callback(f"[!] grok2api 池写入异常: {exc}")
+    if cpa_result is not None:
+        try:
+            results["local_grok"] = write_local_grok_from_cpa(
+                cpa_result, log_callback=log_callback
+            )
+        except Exception as exc:
+            results["warnings"].append(f"local grok: {exc}")
+            if log_callback:
+                log_callback(f"[!] local grok auth 写入异常: {exc}")
     return results
 
 
@@ -5417,6 +5486,17 @@ class GrokRegisterGUI:
         sso = wait_for_sso_cookie(
             log_callback=log_fn, cancel_callback=self.should_stop
         )
+        # Registration is successful once we have the SSO cookie. Persist first.
+        # Only record in-memory after durable write so results == saved accounts.
+        _persist_registered_account(
+            self.accounts_output_file,
+            email,
+            profile.get("password", ""),
+            sso,
+            log_callback=log_fn,
+        )
+        with _stats_lock:
+            self.results.append({"email": email, "sso": sso, "profile": profile})
         _cpa_page = _get_page()
         cpa_result = _enqueue_cpa_mint(
             email, profile.get("password", ""), sso, log_fn, page=_cpa_page
@@ -5428,15 +5508,6 @@ class GrokRegisterGUI:
                 log_fn(f"[+] NSFW 开启成功: {nsfw_msg}")
             else:
                 log_fn(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-        with _stats_lock:
-            self.results.append({"email": email, "sso": sso, "profile": profile})
-        try:
-            line = f"{email}----{profile.get('password','')}----{sso}\n"
-            with _io_lock:
-                with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                    f.write(line)
-        except Exception as file_exc:
-            log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
         run_post_register_pipeline(
             sso, email, log_callback=log_fn, cpa_result=cpa_result
         )
@@ -5681,6 +5752,14 @@ def _register_one_account_cli_body(
     sso = wait_for_sso_cookie(
         log_callback=log_fn, cancel_callback=stop_fn
     )
+    # Registration is successful once we have the SSO cookie. Persist first.
+    _persist_registered_account(
+        accounts_output_file,
+        email,
+        profile.get("password", ""),
+        sso,
+        log_callback=log_fn,
+    )
     _cpa_page = _get_page()
     cpa_result = _enqueue_cpa_mint(
         email, profile.get("password", ""), sso, log_fn, page=_cpa_page
@@ -5692,13 +5771,6 @@ def _register_one_account_cli_body(
             log_fn(f"[+] NSFW 开启成功: {nsfw_msg}")
         else:
             log_fn(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
-    try:
-        line = f"{email}----{profile.get('password','')}----{sso}\n"
-        with _io_lock:
-            with open(accounts_output_file, "a", encoding="utf-8") as f:
-                f.write(line)
-    except Exception as file_exc:
-        log_fn(f"[Debug] 保存账号文件失败: {file_exc}")
     run_post_register_pipeline(
         sso, email, log_callback=log_fn, cpa_result=cpa_result
     )
@@ -6049,6 +6121,28 @@ def main_cli():
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "retry-pending":
+        pending_path = sys.argv[2] if len(sys.argv) > 2 else None
+        output_path = sys.argv[3] if len(sys.argv) > 3 else None
+        if not pending_path:
+            print(
+                "Usage: python grok_register_ttk.py retry-pending <pending.jsonl> [output_path]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        from account_outputs import retry_pending_file
+
+        result = retry_pending_file(
+            pending_path,
+            output_path=output_path or None,
+            log_callback=print,
+        )
+        print(
+            f"恢复完成: restored={result['restored']}, "
+            f"remaining={result['remaining']}, "
+            f"output={result['output']}"
+        )
+        return
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in (
         "start",
         "cli",

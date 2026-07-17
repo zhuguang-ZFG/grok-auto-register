@@ -197,3 +197,51 @@ def test_success_closes_circuit() -> None:
     board.update(ProbeResult("a", "grok", "http://x/v1", True, 40, 200, "", now + 1))
     assert board.score("a") > 0
     assert board.snapshot()["a"]["cooldown_remaining_sec"] == 0.0
+
+
+def test_best_skips_local_when_remote_healthy() -> None:
+    """Healthy remotes beat local-cliproxy even if local EWMA looks faster."""
+    board = ScoreBoard(
+        [
+            Upstream(
+                "local-cliproxy",
+                "grok",
+                "http://127.0.0.1:8318/v1",
+                "local",
+                aliases=["grok-4.5", "*"],
+            ),
+            Upstream("pub8317", "grok", "http://remote/v1", "k", aliases=["grok-4.5"]),
+        ]
+    )
+    # Local "faster" on paper but still must lose when remote is live.
+    board.update(
+        ProbeResult("local-cliproxy", "grok", "http://127.0.0.1:8318/v1", True, 80, 200, "", 1.0)
+    )
+    board.update(
+        ProbeResult("pub8317", "grok", "http://remote/v1", True, 3000, 200, "", 1.0)
+    )
+    best = board.best("grok", "grok-4.5")
+    assert best is not None
+    assert best.name == "pub8317"
+
+
+def test_best_skips_local_when_remotes_cold() -> None:
+    """Unprobed remotes still beat local (local is last-resort only)."""
+    board = ScoreBoard(
+        [
+            Upstream(
+                "local-cliproxy",
+                "grok",
+                "http://127.0.0.1:8318/v1",
+                "local",
+                aliases=["grok-4.5", "*"],
+            ),
+            Upstream("cold-remote", "grok", "http://remote/v1", "k", aliases=["grok-4.5"]),
+        ]
+    )
+    board.update(
+        ProbeResult("local-cliproxy", "grok", "http://127.0.0.1:8318/v1", True, 100, 200, "", 1.0)
+    )
+    best = board.best("grok", "grok-4.5")
+    assert best is not None
+    assert best.name == "cold-remote"

@@ -324,6 +324,32 @@ CLI 模式只是不启动 Tk GUI。注册页、Turnstile、验证码提交和 SS
 
 GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `register_count`。
 
+### 账号消耗太快 / 可用率低？
+
+**问题原因**：Free 账号有 24-48 小时寿命上限，大量死号（429 exhausted）未被及时标记为 disabled，导致 grok CLI 仍在轮询它们。
+
+**解决方案**：
+
+1. **批量清理死号**：
+   ```bash
+   python batch_probe_accounts.py
+   ```
+   
+2. **启用轻量探活**（在 `config.json` 中）：
+   ```json
+   {
+     "quota_watch_sample_probe_n": 5,
+     "quota_watch_sample_probe_interval_sec": 300
+   }
+   ```
+
+3. **定期补号**：
+   ```bash
+   python pool_maintain.py
+   ```
+
+详见 [docs/BATCH_PROBE.md](docs/BATCH_PROBE.md)。
+
 ## 目录结构
 
 ```text

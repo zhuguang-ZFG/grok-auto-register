@@ -192,17 +192,18 @@ def test_load_pools_discovers_grok() -> None:
     upstreams = pools["grok"]["upstreams"]
     aliases = {alias for u in upstreams for alias in u.aliases}
     assert "grok-4.5" in aliases
-    assert "*" in aliases  # local CLIProxy catch-all upstream
     assert not any(
         alias.startswith("remote-") for u in upstreams for alias in u.aliases
     )
-    # Local is direct; at least one remote should carry Clash proxy_url when
-    # config has per-key proxy-url (path consistency for probe + request).
-    local = next(u for u in upstreams if "local-cliproxy" in u.name)
-    assert not local.proxy_url
+    # With main-alias remotes present, local CPA is kept off the router RR.
     remotes = [u for u in upstreams if "local-cliproxy" not in u.name]
+    locals_ = [u for u in upstreams if "local-cliproxy" in u.name]
     if remotes:
+        assert not locals_
         assert any(u.proxy_url for u in remotes)
+    else:
+        assert locals_
+        assert not locals_[0].proxy_url
 
 
 def test_client_for_uses_proxy_url() -> None:
