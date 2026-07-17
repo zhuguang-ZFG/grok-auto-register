@@ -188,10 +188,11 @@ def test_router_status_endpoint() -> None:
 def test_load_pools_discovers_grok() -> None:
     pools = load_pools("D:/cli-proxy-api")
     assert "grok" in pools
-    assert pools["grok"]["port"] == 8317
+    assert pools["grok"]["port"] == 8318
     upstreams = pools["grok"]["upstreams"]
     aliases = {alias for u in upstreams for alias in u.aliases}
     assert "grok-4.5" in aliases
+    assert "*" in aliases  # local CLIProxy catch-all upstream
     assert not any(
         alias.startswith("remote-") for u in upstreams for alias in u.aliases
     )

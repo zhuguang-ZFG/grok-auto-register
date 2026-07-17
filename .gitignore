@@ -106,3 +106,4 @@ cpa_auths_quarantine/
 
 # omk tooling internal state
 .omk/
+_start_router_hidden.vbs

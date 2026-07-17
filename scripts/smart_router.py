@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -14,6 +15,10 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+
+# Allow `from scripts.router_health import ...` when the script is executed
+# directly (`python scripts/smart_router.py`) instead of as a module.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.router_health import ProbeResult, ScoreBoard, Upstream, async_probe
 
@@ -113,34 +118,52 @@ def _load_claude(pool: str, entries: list[dict] | None) -> list[Upstream]:
     return upstreams
 
 
+
+
+def _load_local_cliproxy(pool: str, data: dict) -> Upstream | None:
+    """Create an upstream pointing at the local CLIProxy instance for *pool*.
+
+    CLIProxy is the owner of the local credential pool (cpa_auths, k12,
+    claude-api-key entries, etc.).  The Smart Router probes it like any other
+    upstream and fails over to remote channels when it is slow or errors.
+    """
+    port = data.get("port")
+    api_keys = data.get("api-keys") or []
+    if not port or not api_keys:
+        return None
+    return Upstream(
+        name=f"{pool}/local-cliproxy/0/*",
+        pool=pool,
+        base_url=f"http://127.0.0.1:{port}/v1",
+        api_key=str(api_keys[0]),
+        headers=None,
+        probe_model="",
+        aliases=["*"],
+    )
+
+
 def load_pools(config_dir: Path | str) -> dict[str, dict]:
     """Parse ``D:/cli-proxy-api/config*.yaml`` into pool definitions.
 
     Returns ``{pool_name: {"port": int, "upstreams": [Upstream, ...]}}``.
-    Grok, Codex, Claude and GLM configs are all loaded, even though Task 2 only
-    fully implements proxying for the Grok pool.
+    Task 2 only routes the Grok pool, so only ``config.yaml`` is loaded.
+    Loading Codex/Claude/GLM configs would create upstreams that we neither
+    probe nor proxy yet, wasting memory and bandwidth.
     """
     config_dir = Path(config_dir)
-    mapping = {
-        "config.yaml": "grok",
-        "config-codex.yaml": "codex",
-        "config-claude.yaml": "claude",
-        "config-glm.yaml": "glm",
-    }
     pools: dict[str, dict] = {}
-    for filename, pool in mapping.items():
-        path = config_dir / filename
-        if not path.exists():
-            continue
+    path = config_dir / "config.yaml"
+    if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         port = data.get("port", 0)
         upstreams: list[Upstream] = []
+        local = _load_local_cliproxy("grok", data)
+        if local is not None:
+            upstreams.append(local)
         if "openai-compatibility" in data:
-            upstreams.extend(_load_openai_compat(pool, data["openai-compatibility"]))
-        if "claude-api-key" in data:
-            upstreams.extend(_load_claude(pool, data["claude-api-key"]))
-        pools[pool] = {"port": port, "upstreams": upstreams}
+            upstreams.extend(_load_openai_compat("grok", data["openai-compatibility"]))
+        pools["grok"] = {"port": port, "upstreams": upstreams}
     return pools
 
 
@@ -173,8 +196,12 @@ class SmartRouter:
         if self.client is not None:
             await self.client.aclose()
 
-    async def health_loop(self, interval: float = 10.0) -> None:
-        """Probe every upstream every *interval* seconds."""
+    async def health_loop(self, interval: float = 30.0) -> None:
+        """Probe active upstreams every *interval* seconds.
+
+        Task 2 only routes the Grok pool, so we restrict probing to Grok
+        upstreams to avoid wasting bandwidth on Codex/Claude/GLM remotes.
+        """
         if self.client is None:
             self.client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         while not self._stop_event.is_set():
@@ -192,10 +219,12 @@ class SmartRouter:
     async def _probe_all(self) -> None:
         if self.client is None:
             return
+        # Only probe Grok pool in this first pass.  Codex/Claude/GLM are still
+        # served directly by CLIProxy on their public ports.
+        grok = self.pools.get("grok", {})
         tasks = [
             self._probe_one(upstream)
-            for pool in self.pools.values()
-            for upstream in pool.get("upstreams", [])
+            for upstream in grok.get("upstreams", [])
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -259,12 +288,17 @@ class SmartRouter:
         """
         headers: dict[str, str] = {}
         for key, value in request.headers.items():
-            if key.lower() == "host":
+            if key.lower() in ("host", "authorization"):
                 continue
             headers[key] = value
         if upstream.headers:
             for key, value in upstream.headers.items():
                 headers[key] = value
+        # Remove any leftover Authorization variants so the upstream key is the
+        # only one sent.
+        for key in list(headers.keys()):
+            if key.lower() == "authorization":
+                del headers[key]
         headers["Authorization"] = f"Bearer {upstream.api_key}"
         return headers
 
@@ -283,6 +317,10 @@ class SmartRouter:
             for k, v in response.headers.items()
             if k.lower() not in _HOP_BY_HOP_HEADERS
         }
+        # Remove content-encoding / content-length when we decode the body
+        # ourselves; otherwise clients try to decompress plain bytes.
+        headers.pop("content-encoding", None)
+        headers.pop("content-length", None)
         content_type = response.headers.get("content-type", "")
         if "text/event-stream" in content_type and stream_ctx is not None:
             async def body_iterator() -> AsyncGenerator[bytes, None]:
@@ -299,6 +337,7 @@ class SmartRouter:
                 headers=headers,
             )
 
+        await response.aread()
         content = response.content
         if stream_ctx is not None:
             await stream_ctx.__aexit__(None, None, None)

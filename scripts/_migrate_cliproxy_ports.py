@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Idempotent CLIProxy port migration for Smart Router hand-off.
 
-Maps CLIProxy configs from public client ports to internal ports:
+Maps the Grok CLIProxy config from public client port to internal port:
   - config.yaml        8317 -> 8318
-  - config-codex.yaml  8327 -> 8328
-  - config-claude.yaml 8337 -> 8338
-  - config-glm.yaml    8347 -> 8348
+
+Codex/Claude/GLM pools stay on their public ports in this first pass.
 
 Use --reverse to restore original client ports from .before-router backups.
 Only modifies lines matching ``^port:\\s*\\d+$``.  API keys and other content
@@ -23,16 +22,10 @@ CLI_PROXY_DIR = Path("D:/cli-proxy-api")
 
 PUBLIC_PORTS = {
     "config.yaml": 8317,
-    "config-codex.yaml": 8327,
-    "config-claude.yaml": 8337,
-    "config-glm.yaml": 8347,
 }
 
 INTERNAL_PORTS = {
     "config.yaml": 8318,
-    "config-codex.yaml": 8328,
-    "config-claude.yaml": 8338,
-    "config-glm.yaml": 8348,
 }
 
 PORT_LINE_RE = re.compile(r"^port:\s*\d+$", re.MULTILINE)

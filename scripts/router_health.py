@@ -139,7 +139,7 @@ class ScoreBoard:
         for name, upstream in self._upstreams.items():
             if upstream.pool != pool:
                 continue
-            if model_alias and model_alias not in upstream.aliases:
+            if model_alias and model_alias not in upstream.aliases and "*" not in upstream.aliases:
                 continue
 
             s = self.score(name)

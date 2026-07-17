@@ -48,15 +48,15 @@ $Fleet = @(
     @{
         Name   = "codex"
         Config = "config-codex.yaml"
-        Port   = 8328
-        Url    = "http://127.0.0.1:8328/v1/models"
+        Port   = 8327
+        Url    = "http://127.0.0.1:8327/v1/models"
         Header = @{ Authorization = "Bearer sk-local-codex-unified-2026" }
     },
     @{
         Name   = "claude"
         Config = "config-claude.yaml"
-        Port   = 8338
-        Url    = "http://127.0.0.1:8338/v1/models"
+        Port   = 8337
+        Url    = "http://127.0.0.1:8337/v1/models"
         Header = @{
             Authorization = "Bearer sk-local-claude-unified-2026"
             "x-api-key"   = "sk-local-claude-unified-2026"
@@ -65,8 +65,8 @@ $Fleet = @(
     @{
         Name   = "glm"
         Config = "config-glm.yaml"
-        Port   = 8348
-        Url    = "http://127.0.0.1:8348/v1/models"
+        Port   = 8347
+        Url    = "http://127.0.0.1:8347/v1/models"
         Header = @{ Authorization = "Bearer sk-local-glm-unified-2026" }
     }
 )
