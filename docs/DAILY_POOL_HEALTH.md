@@ -76,14 +76,22 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
 - Claude `:8337` chat 非 200 时标记为 `[CLOAK]`：这是上游 kiro/any 反代对非 Claude Code 客户端的权限/上下文/Cloudflare 门，不是本地池 down。上游质量由 `disable_bad_upstreams.py` 单独监控。
 - `ops_heartbeat.py` 返回非零属正常告警语义（例如注册机未运行、`temp_disabled_n>0`）。
 
-## 当前状态（2026-07-17 17:24Z 加固：+ yxxb 渠道 + 76 本地号导入）
+## 当前状态（2026-07-17 17:28Z 加固：+ sui-xiang Claude 渠道 + 注册机成功率）
 
 | 池 | 端口 | 状态 |
 |--|--|--|
 | Grok | 8317 | OK models+chat 200（25 models，含 yxxb fallback） |
 | Codex | 8327 | OK models+chat+responses 200（13 models，含 yxxb + 火山兜底） |
-| Claude | 8337 | OK models+chat 200 |
+| Claude | 8337 | OK models+chat 200（新增 sui-xiang 兜底） |
 | GLM | 8347 | OK models+chat 200 |
+
+- **新增 `sui-xiang.com` Claude 渠道（17:28Z）**
+  - 3 个 key 中：key1/key2 429 quota exhausted；key3 alive。
+  - `/v1/models` 4 models：`claude-*`、`k3`、`kimi-for-coding`、`kimi-for-coding-highspeed`；聊天把 `claude-opus-4-7/4-8` 映射到 `kimi-for-coding`。
+  - 已加入 `config-claude.yaml`（仅 key3），`/v1/messages` 200；已重启 Claude CLIProxy。
+
+- **211api.com**
+  - `https://www.211api.com/v1` 返回 403，未配置。
 
 - **新增 `yxxb.eu.cc` 渠道（17:24Z）**
   - 已加入 `config.yaml`（Grok）和 `config-codex.yaml`（Codex）。
@@ -94,7 +102,11 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
   - 76 个 xai OAuth 凭证，抽样 5/5 活且含 `grok-4.5`；`cp -n` 全部导入成功。
   - 当前 `cpa_auths/` 共 **9177** 个文件。
 
-- **Codex :8327 503 恢复（16:50Z）**
+- **注册机成功率**
+  - 当前注册机已按用户要求关闭/低频，最近 24h 无新注册记录。
+  - 历史 `logs/reg_metrics.jsonl`（1771 条，至 2026-07-14）：成功率 **69.1%**（1224/1771）。
+  - 失败主因：`other`（442）、`sso_timeout`（79）、`sso_timeout_streak`（15）。
+  - 号龄结论（见 `docs/RT_ROTATION_RACE.md` / `scripts/ban_regression.py`）：free/cli-chat-proxy 号约 **24–48h 寿命上限**，应持续补号维持水位。当前终端死亡率 34.4%（live=10079 / dead=5295）。
 
 - **Codex :8327 503 恢复（16:50Z）**
   - 根因：local-k12 / muyuan / apinebula / zmoon2 全部进入 auth unavailable / cooldown，无可用上游。
