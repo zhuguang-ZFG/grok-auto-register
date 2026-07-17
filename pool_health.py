@@ -387,6 +387,11 @@ def main() -> int:
             due = True
             if isinstance(ra, (int, float)):
                 due = float(ra) <= time.time()
+            elif isinstance(ra, str):
+                try:
+                    due = datetime.fromisoformat(ra.replace("Z", "+00:00")).timestamp() <= time.time()
+                except ValueError:
+                    due = True
             if not due:
                 stats["skipped"] += 1
                 stats["skipped_disabled"] = stats.get("skipped_disabled", 0) + 1
@@ -404,6 +409,9 @@ def main() -> int:
                 )
             except Exception as e:
                 print(f"[!] 写回清除 disabled 失败 {path.name}: {e}")
+                # Do not fall through with mutated-in-memory data; skip to avoid
+                # re-probing against stale on-disk state.
+                continue
 
         exp = parse_expired(str(data.get("expired") or ""))
         need_refresh = args.refresh_all
