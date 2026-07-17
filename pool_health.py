@@ -377,6 +377,34 @@ def main() -> int:
             continue
 
         email = str(data.get("email") or path.name)
+
+        # Soft-disabled accounts already have recover_after; skip until due so a full
+        # --probe does not thrash RT on thousands of known-bad rows (invalid_grant spam).
+        if data.get("disabled") is True and not args.refresh_all:
+            qs = data.get("quota_state")
+            qs = qs if isinstance(qs, dict) else {}
+            ra = qs.get("recover_after")
+            due = True
+            if isinstance(ra, (int, float)):
+                due = float(ra) <= time.time()
+            if not due:
+                stats["skipped"] += 1
+                stats["skipped_disabled"] = stats.get("skipped_disabled", 0) + 1
+                continue
+            # recover_after due: clear soft flag and re-probe below (GrokPoolMaintain path)
+            data["disabled"] = False
+            qs = dict(qs)
+            qs.pop("recover_after", None)
+            data["quota_state"] = qs
+            stats["recovered"] = stats.get("recovered", 0) + 1
+            try:
+                path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"[!] 写回清除 disabled 失败 {path.name}: {e}")
+
         exp = parse_expired(str(data.get("expired") or ""))
         need_refresh = args.refresh_all
         if exp is None:

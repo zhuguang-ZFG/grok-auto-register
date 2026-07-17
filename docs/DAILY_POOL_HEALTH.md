@@ -76,18 +76,32 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
 - Claude `:8337` chat 非 200 时标记为 `[CLOAK]`：这是上游 kiro/any 反代对非 Claude Code 客户端的权限/上下文/Cloudflare 门，不是本地池 down。上游质量由 `disable_bad_upstreams.py` 单独监控。
 - `ops_heartbeat.py` 返回非零属正常告警语义（例如注册机未运行、`temp_disabled_n>0`）。
 
-## 当前状态（2026-07-17）
+## 当前状态（2026-07-17 06:50Z 加固：--auto + Claude 重配 + 代理落盘）
 
 | 池 | 端口 | 状态 |
 |--|--|--|
-| Grok | 8317 | OK，20 models |
-| Codex | 8327 | OK，8 models |
-| Claude | 8337 | CLOAK（本地 alive，上游门） |
-| GLM | 8347 | OK，11 models |
+| Grok | 8317 | OK models+chat 200（硬摘 chuanapi 后已重拉） |
+| Codex | 8327 | OK models+chat 200 |
+| Claude | 8337 | OK models+chat 200 |
+| GLM | 8347 | OK models+chat 200 |
 
-- `pool_live_est=54 / 6392`，满足 `min_live=50`。
-- 临时出局：`grok/vibes`、`glm/zhipu-plan`。
-- 注册机已按用户要求关闭，`heartbeat` 会报告 `register process not running`。
+- **本轮 `--auto`（06:43Z）**
+  - **硬摘**：`grok/chuanapi`（401 Invalid token）
+  - **pending**：`grok/yxxb` soft=1/2（429 额度耗尽）、`glm/hcnsec` soft=1/2（429）、`codex/hhhl` main_slow=1/2（~9.8s）
+  - **仍 temp**：`glm/zhipu-plan`、`volc-ark-a6807`、`volc-ark-62c6d`（+6h）
+  - **新源确认 OK**：`mskxaigrok`、`nocdn939593` 进主路径 chat 200
+- **Claude CLI 已切到本地统一池**：`cc-switch` → `claude-unified`（`http://127.0.0.1:8337`）；`C:/Users/zhugu/.claude/settings.json` 同步更新；`:8337` models+message 双 200。
+- **代理接入 Clash**：
+  - `data/proxies_clash_fragment.yaml` 已生成 1000 个 http 节点 + `代理池1000` selector；
+  - 已拷到 Clash Verge profiles 并合并进 `grok_merged.yaml`（总 1613 节点，selector 大小 1637）。
+  - 因不知道 Clash REST secret，自动 reload 返回 401；需在 Clash Verge 里手动切到 `grok_merged.yaml`。
+  - 注册机 `config.json` 已设为低频：`concurrent_count=1`、`auto_loop_count=2`、`auto_loop_pause_sec=1800`、`clash_selector=代理池1000`、`http_proxy_list_path=data/proxies-all-auth-1000.txt`（fallback）。
+  - **注意**：从当前 CN 主机直接/经 Clash 链测这 1000 个 HTTP 代理均不通（0/100），可能是代理已死或当前 Clash 节点无法到达；建议切到 `grok_merged.yaml` 后从能通境外的节点再测。
+- **全量 `pool_health.py --probe`**：已优化 `pool_health.py` 跳过未到期的 `disabled` 账号，避免对成千上万 `invalid_grant` 反复刷新；后台进程已按用户切任务时停止。当前 `cpa_auths/pool_health_report.json` 仍是 2026-07-16 旧数据（live=906），如需最新报告可择时再跑。
+- **cpa_auths.7z 导入**：+195 新号；本地 `cpa_auths` **~8941**；**enabled≈2049** / disabled≈6892；`cpa_auths_dead` 约 7517。
+- **Clash 1000 代理测活**：尝试合并到 `grok_merged.yaml` 并切换 selector 实测，**20/20 死**（连接被拒绝/重置），且导致断网。已立即恢复为之前的活动配置 `RtwJL9IAeu1a.yaml`；`scripts/merge_clash_grok_nodes.py` 已移除 `proxies_clash_fragment.yaml` donor。注册机 `config.json` 的 `clash_selector` 已清空、`http_proxy_enabled=false`，不再尝试使用这批死代理。
+- **全量 `pool_health.py --probe`**：已按用户要求停止，未跑完。
+- heartbeat critical = register 未跑 / upstream_applied，**≠ 四池 down**。
 
 ## 手工
 

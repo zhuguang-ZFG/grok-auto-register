@@ -21,7 +21,7 @@ import urllib.request
 import yaml
 
 PROF_DIR = r"C:/Users/zhugu/AppData/Roaming/io.github.clash-verge-rev.clash-verge-rev/profiles"
-ACTIVE_UID = "RRkxrzOfRMqu"          # current active profile (24 nodes)
+ACTIVE_UID = "RtwJL9IAeu1a"          # current active profile (24 nodes)
 DONORS = [
     "RzZts8dxSJQp.yaml", "RcHV0A3cq2Jk.yaml", "R1Dw0OHGLRF6.yaml",
     "ReTfEgwrDoEQ.yaml", "R7R0pTHV10yC.yaml", "RjA6gNCGFcoQ.yaml",
