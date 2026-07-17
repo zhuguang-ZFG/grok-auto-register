@@ -76,14 +76,25 @@ streak **只在 `--auto` 写盘**；`--auto` 进程 **exit 0**（pending 在 JSO
 - Claude `:8337` chat 非 200 时标记为 `[CLOAK]`：这是上游 kiro/any 反代对非 Claude Code 客户端的权限/上下文/Cloudflare 门，不是本地池 down。上游质量由 `disable_bad_upstreams.py` 单独监控。
 - `ops_heartbeat.py` 返回非零属正常告警语义（例如注册机未运行、`temp_disabled_n>0`）。
 
-## 当前状态（2026-07-17 16:56Z 加固：Codex + 火山 coding plan 兜底 + 九幺正名）
+## 当前状态（2026-07-17 17:24Z 加固：+ yxxb 渠道 + 76 本地号导入）
 
 | 池 | 端口 | 状态 |
 |--|--|--|
-| Grok | 8317 | OK models+chat 200（硬摘 chuanapi 后已重拉） |
-| Codex | 8327 | OK models+chat+responses 200（新增火山双 key 兜底） |
+| Grok | 8317 | OK models+chat 200（25 models，含 yxxb fallback） |
+| Codex | 8327 | OK models+chat+responses 200（13 models，含 yxxb + 火山兜底） |
 | Claude | 8337 | OK models+chat 200 |
 | GLM | 8347 | OK models+chat 200 |
+
+- **新增 `yxxb.eu.cc` 渠道（17:24Z）**
+  - 已加入 `config.yaml`（Grok）和 `config-codex.yaml`（Codex）。
+  - `/v1/models` 5 models：`grok-4.5`、`gpt-5.6-sol`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`；聊天实际均转发到 `grok-4.5`。
+  - `:8318` 和 `:8327` 均出现 `remote-yxxb-*` alias；chat 200。
+
+- **本地号池 `cpa_auths.zip` 导入（17:24Z）**
+  - 76 个 xai OAuth 凭证，抽样 5/5 活且含 `grok-4.5`；`cp -n` 全部导入成功。
+  - 当前 `cpa_auths/` 共 **9177** 个文件。
+
+- **Codex :8327 503 恢复（16:50Z）**
 
 - **Codex :8327 503 恢复（16:50Z）**
   - 根因：local-k12 / muyuan / apinebula / zmoon2 全部进入 auth unavailable / cooldown，无可用上游。
