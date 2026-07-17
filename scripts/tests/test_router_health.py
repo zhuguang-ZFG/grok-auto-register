@@ -1,9 +1,19 @@
-"""Tests for the Smart Router health probe and scoring engine."""
+"""Tests for the Smart Router health probe and scoring engine (v1.1)."""
 from __future__ import annotations
+
+import time
 
 import pytest
 
-from scripts.router_health import EwmaLatency, ProbeResult, ScoreBoard, Upstream
+from scripts.router_health import (
+    COOLDOWN_HARD_SEC,
+    COOLDOWN_SOFT_BASE_SEC,
+    FAIL_STREAK_OPEN,
+    EwmaLatency,
+    ProbeResult,
+    ScoreBoard,
+    Upstream,
+)
 
 
 def test_ewma_prefers_recent_values() -> None:
@@ -72,21 +82,28 @@ def test_scoreboard_fail_streak_cools_down() -> None:
     board = ScoreBoard(
         [Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"])]
     )
-    board.update(ProbeResult("a", "grok", "http://x/v1", True, 50, 200, "", 1.0))
+    board.update(ProbeResult("a", "grok", "http://x/v1", True, 50, 200, "", time.time()))
     assert board.score("a") > 0
 
-    for _ in range(4):
-        board.update(ProbeResult("a", "grok", "http://x/v1", False, 0, 503, "", 1.0))
+    now = time.time()
+    for _ in range(FAIL_STREAK_OPEN + 1):
+        board.update(ProbeResult("a", "grok", "http://x/v1", False, 0, 503, "", now))
 
     assert board.score("a") == 0.0
     assert board.best("grok", "grok-4.5") is None
+    # Soft circuit should be open.
+    snap = board.snapshot()
+    assert snap["a"]["cooldown_remaining_sec"] >= COOLDOWN_SOFT_BASE_SEC - 1
 
 
 def test_scoreboard_no_available_upstream_returns_none() -> None:
     board = ScoreBoard(
         [Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"])]
     )
-    assert board.best("grok", "grok-4.5") is None
+    # Unprobed still has tiny score 0.01 so best returns it (cold-start path).
+    best = board.best("grok", "grok-4.5")
+    assert best is not None
+    assert best.name == "a"
     assert board.best("grok", "unknown-model") is None
 
 
@@ -101,3 +118,82 @@ def test_scoreboard_snapshot() -> None:
     assert snap["a"]["score"] > 0
     assert snap["a"]["latency_ms"] == 50.0
     assert snap["a"]["success_streak"] == 1
+    assert "inflight" in snap["a"]
+    assert "cooldown_remaining_sec" in snap["a"]
+
+
+def test_hard_401_opens_long_circuit() -> None:
+    board = ScoreBoard(
+        [Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"])]
+    )
+    now = time.time()
+    board.update(ProbeResult("a", "grok", "http://x/v1", False, 0, 401, "bad key", now))
+    assert board.score("a") == 0.0
+    assert board.should_probe("a", now) is False
+    snap = board.snapshot()
+    assert snap["a"]["cooldown_remaining_sec"] > COOLDOWN_HARD_SEC - 5
+
+
+def test_soft_circuit_half_open_after_cooldown() -> None:
+    board = ScoreBoard(
+        [Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"], max_inflight=2)]
+    )
+    now = time.time()
+    for _ in range(FAIL_STREAK_OPEN + 1):
+        board.update(ProbeResult("a", "grok", "http://x/v1", False, 0, 503, "", now))
+    assert board.should_probe("a", now) is False
+
+    # Jump past soft cooldown.
+    future = now + COOLDOWN_SOFT_BASE_SEC + 1
+    assert board.should_probe("a", future) is True
+    # Half-open: one acquire allowed.
+    assert board.try_acquire("a", now=future) is True
+    # Second acquire while half-open blocked.
+    assert board.try_acquire("a", now=future) is False
+    board.release("a")
+
+
+def test_inflight_cap_blocks_acquire() -> None:
+    board = ScoreBoard(
+        [Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"], max_inflight=2)]
+    )
+    board.update(ProbeResult("a", "grok", "http://x/v1", True, 50, 200, "", time.time()))
+    assert board.try_acquire("a") is True
+    assert board.try_acquire("a") is True
+    assert board.try_acquire("a") is False  # cap 2
+    board.release("a")
+    assert board.try_acquire("a") is True
+    board.release("a")
+    board.release("a")
+
+
+def test_best_acquire_skips_full_upstream() -> None:
+    board = ScoreBoard(
+        [
+            Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"], max_inflight=1),
+            Upstream("b", "grok", "http://y/v1", "key-b", aliases=["grok-4.5"], max_inflight=1),
+        ]
+    )
+    board.update(ProbeResult("a", "grok", "http://x/v1", True, 50, 200, "", time.time()))
+    board.update(ProbeResult("b", "grok", "http://y/v1", True, 200, 200, "", time.time()))
+    # a is faster → preferred, fill it.
+    first = board.best("grok", "grok-4.5", acquire=True)
+    assert first is not None and first.name == "a"
+    # next request should get b because a is at cap.
+    second = board.best("grok", "grok-4.5", acquire=True)
+    assert second is not None and second.name == "b"
+    board.release("a")
+    board.release("b")
+
+
+def test_success_closes_circuit() -> None:
+    board = ScoreBoard(
+        [Upstream("a", "grok", "http://x/v1", "key-a", aliases=["grok-4.5"])]
+    )
+    now = time.time()
+    board.update(ProbeResult("a", "grok", "http://x/v1", False, 0, 401, "", now))
+    assert board.score("a") == 0.0
+    # Success after cool still closes immediately when we force a success update.
+    board.update(ProbeResult("a", "grok", "http://x/v1", True, 40, 200, "", now + 1))
+    assert board.score("a") > 0
+    assert board.snapshot()["a"]["cooldown_remaining_sec"] == 0.0

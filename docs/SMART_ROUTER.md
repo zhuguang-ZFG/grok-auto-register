@@ -90,6 +90,21 @@ curl http://127.0.0.1:8318/v1/models
 curl http://127.0.0.1:8317/v1/models
 ```
 
+## v1.1 限流与熔断（2026-07-17）
+
+社区公益站（如 chuanapi）容易被高并发顶挂。v1.1 在 Smart Router 内落地：
+
+| 机制 | 行为 |
+|------|------|
+| **per-upstream inflight** | 本地 CLIProxy `max_inflight=16`；远端公益站默认 `3`。满了选次优源。 |
+| **chat TTFT 探测** | 探测改用 `POST /v1/chat/completions`（`max_tokens=1`），不再只看 `/models`。 |
+| **硬熔断 401/403** | 冷却 **6 小时**，冷却期内**跳过探测**（省流量）。 |
+| **软熔断 429/5xx** | 连续失败 >3 次后冷却 30s，指数退避至最多 10 分钟；到期 half-open 试探 1 次。 |
+| **负载惩罚** | score 随 `inflight/max_inflight` 下降，流量自动摊开。 |
+
+状态字段见 `GET http://127.0.0.1:8317/router/status`：
+`inflight` / `max_inflight` / `open_until` / `cooldown_remaining_sec` / `half_open`。
+
 ## 安全与约束
 
 - 任何密钥、token 或 bearer 均**不得**硬编码在本文档或 Smart Router 代码中，也不得打印到日志。

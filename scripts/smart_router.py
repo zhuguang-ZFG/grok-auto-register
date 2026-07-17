@@ -83,6 +83,7 @@ def _load_openai_compat(pool: str, channels: list[dict] | None) -> list[Upstream
                         headers=dict(channel_headers),
                         probe_model=model.get("name", ""),
                         aliases=[alias],
+                        max_inflight=3,  # charity remotes: keep low to avoid 429 storms
                     )
                 )
     return upstreams
@@ -137,8 +138,9 @@ def _load_local_cliproxy(pool: str, data: dict) -> Upstream | None:
         base_url=f"http://127.0.0.1:{port}/v1",
         api_key=str(api_keys[0]),
         headers=None,
-        probe_model="",
+        probe_model="grok-4.5",
         aliases=["*"],
+        max_inflight=16,  # local CPA can absorb more than charity remotes
     )
 
 
@@ -221,12 +223,15 @@ class SmartRouter:
             return
         # Only probe Grok pool in this first pass.  Codex/Claude/GLM are still
         # served directly by CLIProxy on their public ports.
+        # Skip upstreams still in hard/soft cooldown (saves bandwidth on 401 graves).
         grok = self.pools.get("grok", {})
         tasks = [
             self._probe_one(upstream)
             for upstream in grok.get("upstreams", [])
+            if self.board.should_probe(upstream.name)
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _probe_one(self, upstream: Upstream) -> None:
         if self.client is None:
@@ -261,20 +266,24 @@ class SmartRouter:
         )
 
     def _fallback_upstream(
-        self, pool: str, model_alias: str, tried: set[str]
+        self, pool: str, model_alias: str, tried: set[str], *, acquire: bool = False
     ) -> Upstream | None:
         """Return any matching upstream that has not been tried yet.
 
         This ensures the router can serve traffic before the first probe round
         completes, and gives exhausted scored-upstreams another chance.
+        Respects circuit breaker + inflight caps when *acquire* is True.
         """
         for upstream in self.board.upstreams():
             if upstream.pool != pool:
                 continue
-            if model_alias and model_alias not in upstream.aliases:
+            if model_alias and model_alias not in upstream.aliases and "*" not in upstream.aliases:
                 continue
             if upstream.name in tried:
                 continue
+            if acquire:
+                if not self.board.try_acquire(upstream.name):
+                    continue
             return upstream
         return None
 
@@ -312,15 +321,15 @@ class SmartRouter:
         For all other responses the body is buffered and the context is
         closed before returning.
         """
+        # Normalize to lowercase keys so content-encoding stripping is reliable
+        # (httpx may surface Content-Encoding / Content-Length in mixed case).
+        # httpx already decompresses the body; re-advertising gzip breaks clients.
         headers = {
-            k: v
+            k.lower(): v
             for k, v in response.headers.items()
             if k.lower() not in _HOP_BY_HOP_HEADERS
+            and k.lower() not in ("content-encoding", "content-length")
         }
-        # Remove content-encoding / content-length when we decode the body
-        # ourselves; otherwise clients try to decompress plain bytes.
-        headers.pop("content-encoding", None)
-        headers.pop("content-length", None)
         content_type = response.headers.get("content-type", "")
         if "text/event-stream" in content_type and stream_ctx is not None:
             async def body_iterator() -> AsyncGenerator[bytes, None]:
@@ -348,7 +357,11 @@ class SmartRouter:
         )
 
     async def proxy(self, request: Request, pool: str) -> Response:
-        """Proxy *request* to the best upstream in *pool* with failover."""
+        """Proxy *request* to the best upstream in *pool* with failover.
+
+        Respects per-upstream inflight caps and circuit-breaker state. Each
+        attempt acquires a slot; release happens in all exit paths.
+        """
         body = await request.body()
         model_alias = self._extract_model_alias(request, body)
         tried: set[str] = set()
@@ -357,12 +370,17 @@ class SmartRouter:
 
         # 1 initial attempt + up to 3 retries = max 4 upstream attempts.
         for _ in range(4):
-            upstream = self.board.best(pool, model_alias)
+            upstream = self.board.best(pool, model_alias, acquire=True)
             if upstream is None or upstream.name in tried:
-                upstream = self._fallback_upstream(pool, model_alias, tried)
+                if upstream is not None and upstream.name in tried:
+                    self.board.release(upstream.name)
+                upstream = self._fallback_upstream(
+                    pool, model_alias, tried, acquire=True
+                )
             if upstream is None:
                 break
             tried.add(upstream.name)
+            acquired_name = upstream.name
 
             url = _join_url(
                 upstream.base_url, request.url.path, request.url.query
@@ -377,35 +395,58 @@ class SmartRouter:
             )
 
             try:
-                response = await stream_ctx.__aenter__()
-            except httpx.TimeoutException as exc:
-                last_error = exc
-                self._mark_failed(upstream, 0, "timeout")
-                continue
-            except httpx.NetworkError as exc:
-                last_error = exc
-                self._mark_failed(upstream, 0, str(exc))
-                continue
-            except Exception as exc:  # pragma: no cover - defensive
-                last_error = exc
-                self._mark_failed(upstream, 0, str(exc))
-                continue
+                try:
+                    response = await stream_ctx.__aenter__()
+                except httpx.TimeoutException as exc:
+                    last_error = exc
+                    self._mark_failed(upstream, 0, "timeout")
+                    continue
+                except httpx.NetworkError as exc:
+                    last_error = exc
+                    self._mark_failed(upstream, 0, str(exc))
+                    continue
+                except Exception as exc:  # pragma: no cover - defensive
+                    last_error = exc
+                    self._mark_failed(upstream, 0, str(exc))
+                    continue
 
-            if response.status_code == 429 or response.status_code >= 500:
-                last_response = response
-                last_error = None
-                self._mark_failed(upstream, response.status_code)
-                # Drain and close the response so we can retry or return it.
-                await response.aread()
-                await stream_ctx.__aexit__(None, None, None)
-                continue
+                if response.status_code == 429 or response.status_code >= 500:
+                    last_response = response
+                    last_error = None
+                    self._mark_failed(upstream, response.status_code)
+                    # Drain and close the response so we can retry or return it.
+                    await response.aread()
+                    await stream_ctx.__aexit__(None, None, None)
+                    continue
 
-            if response.status_code >= 400:
-                # 401/403/404 are hard-disable territory handled by
-                # disable_bad_upstreams.py; return them directly without retry.
+                if response.status_code in (401, 403):
+                    # Hard fail: open long circuit, try next upstream.
+                    last_response = response
+                    self._mark_failed(upstream, response.status_code)
+                    await response.aread()
+                    await stream_ctx.__aexit__(None, None, None)
+                    continue
+
+                if response.status_code >= 400:
+                    # Other 4xx: return directly (not a hop-worthy soft fail).
+                    return await self._build_response(response, stream_ctx)
+
+                # Success: record a healthy sample so score stays warm.
+                self.board.update(
+                    ProbeResult(
+                        name=upstream.name,
+                        pool=upstream.pool,
+                        url=upstream.base_url,
+                        healthy=True,
+                        latency_ms=0.0,  # request path; probe owns latency EWMA
+                        status_code=response.status_code,
+                        error="",
+                        timestamp=time.time(),
+                    )
+                )
                 return await self._build_response(response, stream_ctx)
-
-            return await self._build_response(response, stream_ctx)
+            finally:
+                self.board.release(acquired_name)
 
         if last_response is not None:
             return await self._build_response(last_response, None)
