@@ -101,9 +101,19 @@ curl http://127.0.0.1:8317/v1/models
 | **硬熔断 401/403** | 冷却 **6 小时**，冷却期内**跳过探测**（省流量）。 |
 | **软熔断 429/5xx** | 连续失败 >3 次后冷却 30s，指数退避至最多 10 分钟；到期 half-open 试探 1 次。 |
 | **负载惩罚** | score 随 `inflight/max_inflight` 下降，流量自动摊开。 |
+| **proxy_url 路径一致** | 远端 channel 的 `proxy-url`（通常 Clash `:7897`）在**探测与转发**共用；`local-cliproxy` 直连。避免「探通、请求区 403」。 |
 
 状态字段见 `GET http://127.0.0.1:8317/router/status`：
 `inflight` / `max_inflight` / `open_until` / `cooldown_remaining_sec` / `half_open`。
+
+### 号池测活
+
+```powershell
+# 全量 enabled（CLIProxy 会用的号）AT 测活 + 软禁用坏号
+python scripts/probe_import_batch.py --enabled-only --workers 24 --apply
+```
+
+报告：`logs/probe_import_batch.json`。只测 AT，不刷 RT；401/perm_denied 软摘，network 不误杀。
 
 ## 安全与约束
 

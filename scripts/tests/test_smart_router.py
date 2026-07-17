@@ -196,6 +196,83 @@ def test_load_pools_discovers_grok() -> None:
     assert not any(
         alias.startswith("remote-") for u in upstreams for alias in u.aliases
     )
+    # Local is direct; at least one remote should carry Clash proxy_url when
+    # config has per-key proxy-url (path consistency for probe + request).
+    local = next(u for u in upstreams if "local-cliproxy" in u.name)
+    assert not local.proxy_url
+    remotes = [u for u in upstreams if "local-cliproxy" not in u.name]
+    if remotes:
+        assert any(u.proxy_url for u in remotes)
+
+
+def test_client_for_uses_proxy_url() -> None:
+    async def _run() -> None:
+        router = SmartRouter("D:/cli-proxy-api")
+        await router.setup()
+        try:
+            direct = Upstream(
+                "d", "grok", "http://127.0.0.1:9/v1", "k", aliases=["*"], proxy_url=None
+            )
+            proxied = Upstream(
+                "p",
+                "grok",
+                "http://remote/v1",
+                "k",
+                aliases=["grok-4.5"],
+                proxy_url="http://127.0.0.1:7897",
+            )
+            c1 = router._client_for(direct)
+            c2 = router._client_for(proxied)
+            c3 = router._client_for(proxied)
+            assert c1 is router.client
+            assert c2 is not router.client
+            assert c2 is c3  # shared per proxy endpoint
+            assert getattr(router.client, "trust_env", True) is False
+        finally:
+            await router.close()
+
+    asyncio.run(_run())
+
+
+def test_proxy_request_uses_proxy_client() -> None:
+    """Proxied upstreams must hit the proxy client, not the direct client."""
+
+    async def _run() -> None:
+        seen: list[str] = []
+
+        def proxy_handler(request: httpx.Request) -> httpx.Response:
+            seen.append("proxy")
+            return httpx.Response(200, json={"via": "proxy"})
+
+        def direct_handler(request: httpx.Request) -> httpx.Response:
+            seen.append("direct")
+            return httpx.Response(200, json={"via": "direct"})
+
+        proxied = Upstream(
+            "p",
+            "grok",
+            "http://mock/v1",
+            "key",
+            aliases=["grok-4.5"],
+            proxy_url="http://proxy.local:1",
+        )
+        pools = {"grok": {"port": 8318, "upstreams": [proxied]}}
+        app = build_app(pools)
+        router: SmartRouter = app.state.router
+        router.client = httpx.AsyncClient(transport=httpx.MockTransport(direct_handler))
+        # Seed proxy client map with mock transport (same key as proxy_url).
+        router._proxy_clients["http://proxy.local:1"] = httpx.AsyncClient(
+            transport=httpx.MockTransport(proxy_handler)
+        )
+
+        async with _test_client(app) as c:
+            r = await c.post("/v1/chat/completions", json={"model": "grok-4.5"})
+
+        assert r.status_code == 200
+        assert r.json() == {"via": "proxy"}
+        assert seen == ["proxy"]
+
+    asyncio.run(_run())
 
 
 def test_smart_router_uses_config_dir() -> None:

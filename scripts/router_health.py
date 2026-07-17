@@ -45,6 +45,9 @@ class Upstream:
     aliases: list[str] = field(default_factory=list)
     # Concurrency cap. Local CLIProxy can take more; remote charity stations stay low.
     max_inflight: int = 3
+    # Optional HTTP(S) proxy for this upstream (e.g. Clash http://127.0.0.1:7897).
+    # Empty/None = direct. Local CLIProxy should stay direct.
+    proxy_url: str | None = None
 
 
 class EwmaLatency:
@@ -305,11 +308,19 @@ class ScoreBoard:
         return out
 
 
-async def async_probe(upstream: Upstream, client: httpx.AsyncClient) -> ProbeResult:
+async def async_probe(
+    upstream: Upstream,
+    client: httpx.AsyncClient,
+    *,
+    proxy_client: httpx.AsyncClient | None = None,
+) -> ProbeResult:
     """Probe *upstream* with a tiny chat completion (TTFT), not just /models.
 
     ``/models`` 200 is insufficient — charity stations often list models while
     chat is 401/429.  A 1-token completion measures real first-byte latency.
+
+    *proxy_client* is used when the upstream has a proxy_url so probe path
+    matches request path (Clash egress for remotes, direct for local).
     """
     base = upstream.base_url.rstrip("/")
     url = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
@@ -332,9 +343,10 @@ async def async_probe(upstream: Upstream, client: httpx.AsyncClient) -> ProbeRes
         "stream": False,
     }
 
+    http = proxy_client or client
     start = time.monotonic()
     try:
-        response = await client.post(url, headers=headers, json=body, timeout=15.0)
+        response = await http.post(url, headers=headers, json=body, timeout=15.0)
         latency_ms = (time.monotonic() - start) * 1000.0
         healthy = 200 <= response.status_code < 300
         err = "" if healthy else (response.text or "")[:120]

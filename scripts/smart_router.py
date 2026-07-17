@@ -69,6 +69,11 @@ def _load_openai_compat(pool: str, channels: list[dict] | None) -> list[Upstream
         channel_name = channel.get("name", "unknown")
         for key_index, entry in enumerate(channel.get("api-key-entries", [])):
             api_key = entry.get("api-key", "")
+            # Prefer per-key proxy-url, fall back to channel-level, then empty.
+            proxy_url = (
+                str(entry.get("proxy-url") or channel.get("proxy-url") or "").strip()
+                or None
+            )
             for model in channel.get("models", []):
                 alias = model.get("alias", "")
                 if alias.startswith("remote-"):
@@ -84,6 +89,7 @@ def _load_openai_compat(pool: str, channels: list[dict] | None) -> list[Upstream
                         probe_model=model.get("name", ""),
                         aliases=[alias],
                         max_inflight=3,  # charity remotes: keep low to avoid 429 storms
+                        proxy_url=proxy_url,
                     )
                 )
     return upstreams
@@ -177,7 +183,24 @@ class SmartRouter:
         self.pools: dict[str, dict] = {}
         self.board = ScoreBoard()
         self.client: httpx.AsyncClient | None = None
+        # proxy_url -> AsyncClient (shared per unique proxy endpoint)
+        self._proxy_clients: dict[str, httpx.AsyncClient] = {}
         self._stop_event = asyncio.Event()
+
+    def _client_for(self, upstream: Upstream) -> httpx.AsyncClient:
+        """Return the HTTP client for *upstream* (direct or via its proxy_url)."""
+        assert self.client is not None
+        proxy = (upstream.proxy_url or "").strip()
+        if not proxy:
+            return self.client
+        if proxy not in self._proxy_clients:
+            self._proxy_clients[proxy] = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0),
+                limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+                proxy=proxy,
+                trust_env=False,  # only honor explicit proxy_url
+            )
+        return self._proxy_clients[proxy]
 
     async def setup(self) -> None:
         """Load pool configs and build the ScoreBoard."""
@@ -190,6 +213,7 @@ class SmartRouter:
             self.client = httpx.AsyncClient(
                 timeout=httpx.Timeout(30.0),
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                trust_env=False,  # local CLIProxy must stay direct
             )
 
     async def close(self) -> None:
@@ -197,6 +221,11 @@ class SmartRouter:
         self._stop_event.set()
         if self.client is not None:
             await self.client.aclose()
+            self.client = None
+        for c in self._proxy_clients.values():
+            with contextlib.suppress(Exception):
+                await c.aclose()
+        self._proxy_clients.clear()
 
     async def health_loop(self, interval: float = 30.0) -> None:
         """Probe active upstreams every *interval* seconds.
@@ -205,7 +234,9 @@ class SmartRouter:
         upstreams to avoid wasting bandwidth on Codex/Claude/GLM remotes.
         """
         if self.client is None:
-            self.client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+            self.client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0), trust_env=False
+            )
         while not self._stop_event.is_set():
             try:
                 await self._probe_all()
@@ -236,7 +267,10 @@ class SmartRouter:
     async def _probe_one(self, upstream: Upstream) -> None:
         if self.client is None:
             return
-        result = await async_probe(upstream, self.client)
+        # Match request path: remotes with proxy_url use Clash client.
+        http = self._client_for(upstream)
+        proxy_client = http if http is not self.client else None
+        result = await async_probe(upstream, self.client, proxy_client=proxy_client)
         self.board.update(result)
 
     def _extract_model_alias(self, request: Request, body: bytes) -> str:
@@ -386,7 +420,9 @@ class SmartRouter:
                 upstream.base_url, request.url.path, request.url.query
             )
             headers = self._upstream_headers(request, upstream)
-            stream_ctx = self.client.stream(
+            # Remotes with proxy-url go through Clash; local CLIProxy is direct.
+            http = self._client_for(upstream)
+            stream_ctx = http.stream(
                 request.method,
                 url,
                 headers=headers,
@@ -511,6 +547,7 @@ def build_app(
     router.client = httpx.AsyncClient(
         timeout=httpx.Timeout(30.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        trust_env=False,
     )
 
     kwargs: dict[str, Any] = {
