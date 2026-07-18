@@ -142,6 +142,24 @@ def set_user_env(key: str, value: str | None) -> None:
             pass
 
 
+def _os_replace_with_retry(src: str, dst: str, attempts: int = 40, delay: float = 0.1) -> None:
+    """os.replace with retry on PermissionError.
+
+    Windows: a third party (Defender, search indexer, AV) can briefly hold the
+    destination open, failing os.replace with WinError 5 even when the caller
+    holds the settings lock. Retry with backoff (~4s budget) before giving up.
+    """
+    last: PermissionError | None = None
+    for _ in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(delay)
+    raise last  # type: ignore[misc]
+
+
 def _write_settings_atomic(s: dict) -> None:
     """Atomically write settings.json: write tmp file then os.replace.
     Caller must hold _acquire_lock.
@@ -151,7 +169,7 @@ def _write_settings_atomic(s: dict) -> None:
     try:
         with os.fdopen(fd_tmp, "w", encoding="utf-8") as f:
             f.write(content)
-        os.replace(tmp, str(SETTINGS))
+        _os_replace_with_retry(tmp, str(SETTINGS))
     except Exception:
         try:
             os.unlink(tmp)
@@ -225,7 +243,7 @@ def write_pin(channel_name: str, ttl_s: int = 600) -> None:
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(pin, f, ensure_ascii=False)
-        os.replace(tmp, str(PINFILE))
+        _os_replace_with_retry(tmp, str(PINFILE))
     except Exception:
         try:
             os.unlink(tmp)
