@@ -127,6 +127,8 @@ def disable_account(cpa_file: Path, status: str) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global TIMEOUT
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--workers", type=int, default=6, help="并发线程数 (default: 6)")
     ap.add_argument("--max", type=int, default=0, help="最多探测 N 个 (0=all)")
@@ -135,7 +137,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=float, default=TIMEOUT, help=f"单号超时秒 (default: {TIMEOUT})")
     args = ap.parse_args(argv)
 
-    global TIMEOUT
     TIMEOUT = args.timeout
 
     files = sorted(CPA_AUTH_DIR.glob("xai-*.json"))
